@@ -732,14 +732,12 @@ class Gefen(torch.optim.Optimizer):
             grad_view.shape,
             dtype=torch.uint8,
             device=grad_view.device,
-            memory_format=torch.preserve_format,
         )
 
         state["m_magnitude"] = torch.zeros(
             (grad_view.shape[0], 1),
             dtype=torch.float32,
             device=grad_view.device,
-            memory_format=torch.preserve_format,
         )
 
     def _repair_gefen_state_for_grad_view(
@@ -759,7 +757,6 @@ class Gefen(torch.optim.Optimizer):
                 expected_shape,
                 dtype=torch.uint8,
                 device=device,
-                memory_format=torch.preserve_format,
             )
         state["m_codebook_shape"] = expected_shape
 
@@ -773,7 +770,6 @@ class Gefen(torch.optim.Optimizer):
                 block_shape,
                 dtype=torch.float32,
                 device=device,
-                memory_format=torch.preserve_format,
             )
 
         vmean = state.get("vmean")
@@ -786,7 +782,6 @@ class Gefen(torch.optim.Optimizer):
                 block_shape,
                 dtype=torch.float32,
                 device=device,
-                memory_format=torch.preserve_format,
             )
 
     def _repair_gefen_state_after_load(self) -> None:
