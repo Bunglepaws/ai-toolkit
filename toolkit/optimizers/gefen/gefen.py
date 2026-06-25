@@ -728,15 +728,86 @@ class Gefen(torch.optim.Optimizer):
 
     def _init_gefen_state(self, state, grad_view: torch.Tensor) -> None:
         state["m_codebook_shape"] = tuple(grad_view.shape)
-        state["m_codebook"] = torch.zeros_like(
-            grad_view, dtype=torch.uint8, memory_format=torch.preserve_format
-        )
-
-        state["m_magnitude"] = torch.zeros_like(
-            grad_view[:, 0:1],
-            dtype=torch.float32,
+        state["m_codebook"] = torch.zeros(
+            grad_view.shape,
+            dtype=torch.uint8,
+            device=grad_view.device,
             memory_format=torch.preserve_format,
         )
+
+        state["m_magnitude"] = torch.zeros(
+            (grad_view.shape[0], 1),
+            dtype=torch.float32,
+            device=grad_view.device,
+            memory_format=torch.preserve_format,
+        )
+
+    def _repair_gefen_state_for_grad_view(
+        self, p: torch.Tensor, state: dict, grad_view: torch.Tensor
+    ) -> None:
+        expected_shape = tuple(grad_view.shape)
+        block_shape = (grad_view.shape[0], 1)
+        device = grad_view.device
+
+        m_codebook = state.get("m_codebook")
+        if (
+            not isinstance(m_codebook, torch.Tensor)
+            or m_codebook.dtype != torch.uint8
+            or tuple(m_codebook.shape) != expected_shape
+        ):
+            state["m_codebook"] = torch.zeros(
+                expected_shape,
+                dtype=torch.uint8,
+                device=device,
+                memory_format=torch.preserve_format,
+            )
+        state["m_codebook_shape"] = expected_shape
+
+        m_magnitude = state.get("m_magnitude")
+        if (
+            not isinstance(m_magnitude, torch.Tensor)
+            or m_magnitude.dtype != torch.float32
+            or tuple(m_magnitude.shape) != block_shape
+        ):
+            state["m_magnitude"] = torch.zeros(
+                block_shape,
+                dtype=torch.float32,
+                device=device,
+                memory_format=torch.preserve_format,
+            )
+
+        vmean = state.get("vmean")
+        if (
+            not isinstance(vmean, torch.Tensor)
+            or vmean.dtype != torch.float32
+            or tuple(vmean.shape) != block_shape
+        ):
+            state["vmean"] = torch.zeros(
+                block_shape,
+                dtype=torch.float32,
+                device=device,
+                memory_format=torch.preserve_format,
+            )
+
+    def _repair_gefen_state_after_load(self) -> None:
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state.get(p)
+                if state is None or "step" not in state:
+                    continue
+
+                period = state.get("automatic_period")
+                if period is None or p.numel() % period != 0:
+                    continue
+
+                grad_view_shape = state.get("m_codebook_shape")
+                if grad_view_shape is None:
+                    grad_view_shape = (p.numel() // period, period)
+
+                grad_view = torch.empty(
+                    grad_view_shape, device=p.device, dtype=p.dtype
+                )
+                self._repair_gefen_state_for_grad_view(p, state, grad_view)
 
     def _automatic_gefen_fused_update(
         self, p, state, grad_view, beta1, stepsize, lr
@@ -859,6 +930,7 @@ class Gefen(torch.optim.Optimizer):
 
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
+        self._repair_gefen_state_for_grad_view(p, state, grad_view)
 
         self._automatic_vmean_update(state["vmean"], grad_view, beta2)
 
@@ -913,6 +985,7 @@ class Gefen(torch.optim.Optimizer):
         super().load_state_dict(state_dict)
         self._gefen_global_step = gefen_global_step
         self._gefen_codebook = gefen_codebook
+        self._repair_gefen_state_after_load()
 
     @torch.no_grad()
     def step(self, closure=None):
