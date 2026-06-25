@@ -585,6 +585,7 @@ export default function SimpleJob({
                     { value: 'adamw8bit', label: 'AdamW8Bit' },
                     { value: 'automagic', label: 'Automagic' },
                     { value: 'automagic2', label: 'Automagic v2' },
+                    { value: 'gefen', label: 'Gefen' },
                     { value: 'prodigyopt', label: 'Prodigy' },
                     { value: 'prodigy8bit', label: 'Prodigy8Bit' },
                   ]}
