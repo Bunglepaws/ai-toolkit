@@ -576,6 +576,17 @@ class Gefen(torch.optim.Optimizer):
                 )
             )
 
+    def _param_has_initialized_state(self, p: torch.Tensor) -> bool:
+        state = self.state.get(p)
+        return state is not None and "step" in state
+
+    def _has_initialized_gefen_state(self) -> bool:
+        for group in self.param_groups:
+            for p in group["params"]:
+                if self._param_has_initialized_state(p):
+                    return True
+        return False
+
     def _iter_gefen_grad_periods(self, reuse_existing_periods: bool = False):
 
         for group in self.param_groups:
@@ -592,7 +603,7 @@ class Gefen(torch.optim.Optimizer):
                 if flat.numel() == 0:
                     continue
 
-                if reuse_existing_periods:
+                if reuse_existing_periods or self._param_has_initialized_state(p):
                     state = self.state[p]
                     if "automatic_period" not in state:
                         raise ValueError(
@@ -654,7 +665,9 @@ class Gefen(torch.optim.Optimizer):
 
     def _maybe_refresh_gefen_codebook(self) -> None:
         if self._gefen_codebook is None:
-            self._ensure_gefen_codebook()
+            self._ensure_gefen_codebook(
+                reuse_existing_periods=self._has_initialized_gefen_state()
+            )
 
     def _maybe_save_gefen_grad_histogram(self) -> None:
         if not hasattr(quantization_module, "LIST_STEPS_SAVE_HIST_GRAD"):
@@ -890,12 +903,16 @@ class Gefen(torch.optim.Optimizer):
     def state_dict(self):
         state_dict = super().state_dict()
         state_dict["gefen_global_step"] = self._gefen_global_step
+        if self._gefen_codebook is not None:
+            state_dict["gefen_codebook"] = self._gefen_codebook
         return state_dict
 
     def load_state_dict(self, state_dict):
         gefen_global_step = state_dict.pop("gefen_global_step", 0)
+        gefen_codebook = state_dict.pop("gefen_codebook", None)
         super().load_state_dict(state_dict)
         self._gefen_global_step = gefen_global_step
+        self._gefen_codebook = gefen_codebook
 
     @torch.no_grad()
     def step(self, closure=None):
