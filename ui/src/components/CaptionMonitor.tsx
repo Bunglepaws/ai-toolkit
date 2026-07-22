@@ -108,7 +108,7 @@ export default function CaptionMonitor({ datasetPath, onHeightChange }: CaptionM
             </div>
           )}
           <div className="flex items-center gap-3 flex-shrink-0">
-            {job && <JobActionBar job={job} onRefresh={refreshJob} autoStartQueue={true} menuAnchor="top end" />}
+            {job && <JobActionBar job={job} onRefresh={refreshJob} autoStartQueue={false} menuAnchor="top end" />}
             <button
               onClick={() => setCollapsed(c => !c)}
               className="text-gray-400 hover:text-gray-100"

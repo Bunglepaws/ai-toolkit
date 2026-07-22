@@ -18,7 +18,7 @@ export const defaultCaptionJobConfig: CaptionJobConfig = {
           quantize: true,
           qtype: 'float8',
           low_vram: true,
-          extensions: ['mp3', 'wav', 'flac', 'ogg'],
+          extensions: ['mp3', 'wav', 'flac', 'ogg', 'm4a'],
           path_to_caption: '',
           recaption: false,
           compile: false,

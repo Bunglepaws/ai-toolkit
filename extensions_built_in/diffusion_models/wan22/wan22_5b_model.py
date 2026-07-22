@@ -210,6 +210,10 @@ class Wan225bModel(Wan21):
                 latent_model_input=latents, first_frame=first_frame_n1p1, vae=self.vae
             )
 
+        def _stop_callback(pipe, i, t, callback_kwargs):
+            self.maybe_stop()
+            return callback_kwargs
+
         if self.use_vae_tiling:
             # set vae to tile decode
             pipeline.vae.enable_tiling()
@@ -231,6 +235,7 @@ class Wan225bModel(Wan21):
             return_dict=False,
             output_type="pil",
             noise_mask=noise_mask,
+            callback_on_step_end=_stop_callback,
             **extra,
         )[0]
 

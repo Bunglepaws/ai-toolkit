@@ -48,6 +48,7 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
       status: 'queued',
       stop: false,
       return_to_queue: false,
+      save_now: false,
       info: 'Job queued',
     },
   });

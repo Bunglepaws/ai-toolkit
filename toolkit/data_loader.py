@@ -19,7 +19,7 @@ import albumentations as A
 from toolkit import image_utils
 from toolkit.buckets import get_bucket_for_image_size, BucketResolution
 from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
-from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin
+from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin, read_text_file
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
@@ -307,17 +307,16 @@ class PairedImageDataset(Dataset):
             prompt_path = path_no_ext + '.txt'
 
         if os.path.exists(prompt_path):
-            with open(prompt_path, 'r', encoding='utf-8') as f:
-                prompt = f.read()
-                # remove any newlines
-                prompt = prompt.replace('\n', ', ')
-                # remove new lines for all operating systems
-                prompt = prompt.replace('\r', ', ')
-                prompt_split = prompt.split(',')
-                # remove empty strings
-                prompt_split = [p.strip() for p in prompt_split if p.strip()]
-                # join back together
-                prompt = ', '.join(prompt_split)
+            prompt = read_text_file(prompt_path)
+            # remove any newlines
+            prompt = prompt.replace('\n', ', ')
+            # remove new lines for all operating systems
+            prompt = prompt.replace('\r', ', ')
+            prompt_split = prompt.split(',')
+            # remove empty strings
+            prompt_split = [p.strip() for p in prompt_split if p.strip()]
+            # join back together
+            prompt = ', '.join(prompt_split)
         else:
             prompt = self.default_prompt
         return prompt
@@ -594,15 +593,20 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             # do not call for now
             if self.dataset_config.buckets:
                 # setup buckets
+                print_acc(" - Setting up buckets...")
                 self.setup_buckets()
             if self.is_caching_latents:
+                print_acc(" - Caching latents...")
                 self.cache_latents_all_latents()
             if self.is_caching_clip_vision_to_disk:
+                print_acc(" - Caching CLIP vision...")
                 self.cache_clip_vision_to_disk()
             if self.is_caching_text_embeddings:
+                print_acc(" - Caching text embeddings...")
                 self.cache_text_embeddings()
             if self.is_generating_controls:
                 # always do this last
+                print_acc(" - Setting up controls...")
                 self.setup_controls()
         self.epoch_num += 1
 
@@ -650,6 +654,48 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         else:
             # Dataloader is batching
             return self._get_single_item(item)
+
+
+def validate_control_paths(dataset_configs: list):
+    """Check all control images exist before loading the model."""
+    from toolkit.config_modules import DatasetConfig
+    import os
+    missing = []
+    for config in dataset_configs:
+        if not isinstance(config, DatasetConfig):
+            continue
+        control_path_list = config.control_path
+        if control_path_list is None:
+            continue
+        if not isinstance(control_path_list, list):
+            control_path_list = [control_path_list]
+
+        dataset_path = config.dataset_path or config.folder_path
+        if dataset_path is None or not os.path.isdir(dataset_path):
+            continue
+
+        img_files = [
+            f for root, _, files in os.walk(dataset_path)
+            for f in files
+            if f.lower().endswith(tuple(image_extensions)) and not f.startswith('.')
+        ]
+
+        for img_file in img_files:
+            stem = os.path.splitext(img_file)[0]
+            for ctrl_path in control_path_list:
+                found = any(
+                    os.path.exists(os.path.join(ctrl_path, stem + ext))
+                    for ext in image_extensions
+                )
+                if not found:
+                    missing.append(f"  {img_file} -> {ctrl_path}")
+
+    if missing:
+        lines = "\n".join(missing[:20])
+        extra = f"\n  ... and {len(missing) - 20} more" if len(missing) > 20 else ""
+        raise FileNotFoundError(
+            f"Missing control images for {len(missing)} file(s):\n{lines}{extra}"
+        )
 
 
 def get_dataloader_from_datasets(

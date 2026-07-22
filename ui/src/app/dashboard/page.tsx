@@ -4,15 +4,27 @@ import GpuMonitor from '@/components/GPUMonitor';
 import JobsTable from '@/components/JobsTable';
 import { TopBar, MainContent } from '@/components/layout';
 import Link from 'next/link';
+import { useSessionFilter } from '@/hooks/useSessionFilter';
+import MruTextInput from '@/components/MruTextInput';
 
 export default function Dashboard() {
+  const [filter, setFilter] = useSessionFilter('jobs-filter');
+
   return (
     <>
       <TopBar>
         <div>
           <h1 className="text-base sm:text-lg">Dashboard</h1>
         </div>
-        <div className="flex-1"></div>
+        <div className="flex-1 max-w-xl mx-4">
+          <MruTextInput
+            value={filter}
+            onChange={setFilter}
+            mruKey="jobs-filter-mru"
+            placeholder="Filter by name or model (supports AND, OR)..."
+          />
+        </div>
+        <div className="flex-shrink-0"></div>
       </TopBar>
       <MainContent>
         <GpuMonitor />
@@ -23,7 +35,7 @@ export default function Dashboard() {
               <Link href="/jobs">View All</Link>
             </div>
           </div>
-          <JobsTable onlyActive />
+          <JobsTable onlyActive filter={filter} />
         </div>
       </MainContent>
     </>

@@ -398,6 +398,204 @@ class Krea2Model(BaseModel):
             "last*",
         ]
 
+    # ------------------------------------------------------------------
+    # Sampling LoRAs (merged before preview generation, unmerged after)
+    # Supports up to two LoRAs via sample_lora_path / sample_lora_path_2.
+    # Handles two on-disk formats:
+    #   • lora_A / lora_B (PEFT) or lora_down / lora_up: low-rank decomposition
+    #   • *.diff: direct additive weight delta
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def validate_sample_lora_paths(cls, model_config, *sample_configs):
+        all_configs = [model_config] + list(sample_configs)
+        for cfg in all_configs:
+            if cfg is None:
+                continue
+            for attr in ('sample_lora_path', 'sample_lora_path_2'):
+                path = getattr(cfg, attr, None)
+                if path and not os.path.exists(path):
+                    raise FileNotFoundError(
+                        f"Sample LoRA path not found (check config before training starts): {path}"
+                    )
+
+    def _has_sampling_lora(self):
+        sc = getattr(self, 'sample_config', None)
+        for attr in ('sample_lora_path', 'sample_lora_path_2'):
+            if (sc is not None and getattr(sc, attr, None)) or getattr(self.model_config, attr, None):
+                return True
+        return False
+
+    def _merge_lora_file(self, path, strength, applied):
+        """Load one LoRA/diff file and add its weighted delta to transformer params.
+
+        Appends a (param_name, delta_fp32, strength) tuple to `applied` for each
+        tensor as soon as it is merged, so the caller can reverse a partial merge
+        if an exception is raised partway through.
+        """
+        param_dict = dict(self.model.named_parameters())
+
+        sd = load_file(path)
+        # normalise key prefix — strip diffusion_model. or transformer. so we have bare param paths
+        def _bare(k):
+            k = k.replace("diffusion_model.", "")
+            if k.startswith("transformer."):
+                k = k[len("transformer."):]
+            return k
+
+        sd = {_bare(k): v for k, v in sd.items()}
+
+        # --- .diff format: key path ends in .diff, target param replaces .diff with .weight ---
+        diff_keys = [k for k in sd if k.endswith(".diff")]
+        if diff_keys:
+            for dk in diff_keys:
+                param_name = dk[:-len(".diff")] + ".weight"
+                if param_name not in param_dict:
+                    self.print_and_status_update(f"  skip diff key (no param): {dk}")
+                    continue
+                param = param_dict[param_name]
+                delta = sd[dk].to(param.device, dtype=torch.float32)
+                param.data.add_(delta.to(param.dtype) * strength)
+                applied.append((param_name, delta, strength))
+            return
+
+        # --- lora_A/lora_B (or lora_down/lora_up) format ---
+        bases: dict = {}
+        for k in sd:
+            for marker in (".lora_A.", ".lora_B.", ".lora_down.", ".lora_up.", ".alpha"):
+                if marker in k:
+                    idx = k.index(marker)
+                    base = k[:idx]
+                    part = k[idx + 1:].split(".")[0]  # e.g. "lora_A", "lora_B", "alpha"
+                    bases.setdefault(base, {})[part] = sd[k]
+                    break
+
+        for base, parts in bases.items():
+            down = parts.get("lora_A") if parts.get("lora_A") is not None else parts.get("lora_down")
+            up   = parts.get("lora_B") if parts.get("lora_B") is not None else parts.get("lora_up")
+            if down is None or up is None:
+                continue
+
+            param_name = base + ".weight"
+            if param_name not in param_dict:
+                continue
+
+            rank = down.shape[0]
+            alpha_val = float(parts["alpha"].item()) if "alpha" in parts else float(rank)
+            scale = alpha_val / rank
+
+            if down.dim() == 2 and up.dim() == 2:
+                delta = (up.float() @ down.float()) * scale
+            else:
+                continue
+
+            param = param_dict[param_name]
+            param.data.add_(delta.to(param.device, dtype=param.dtype) * strength)
+            applied.append((param_name, delta, strength))
+
+    def _unmerge_lora(self, applied):
+        """Reverse all deltas from _merge_lora_file."""
+        param_dict = dict(self.model.named_parameters())
+        for param_name, delta, strength in applied:
+            if param_name in param_dict:
+                param = param_dict[param_name]
+                param.data.sub_(delta.to(param.device, dtype=param.dtype) * strength)
+
+    def _prepare_sampling_lora(self, pipeline):
+        sc = getattr(self, 'sample_config', None)
+        slots = [
+            ('sample_lora_path',   'sample_lora_strength',   1.0),
+            ('sample_lora_path_2', 'sample_lora_strength_2', 1.0),
+        ]
+        # Register the applied list before merging anything: _merge_lora_file
+        # appends each delta as it lands, so if it raises partway through,
+        # _after_sample_failure can still unmerge the partial merge instead of
+        # leaving the base weights corrupted for the rest of the run.
+        all_applied = []
+        self._sampling_lora_applied = all_applied
+        self._sampling_lora_ready = True
+        for path_attr, strength_attr, default_s in slots:
+            path = (getattr(sc, path_attr, None) if sc else None) or getattr(self.model_config, path_attr, None)
+            if not path:
+                continue
+            if not os.path.exists(path):
+                self.print_and_status_update(f"Warning: sample LoRA not found: {path}")
+                continue
+            strength = (getattr(sc, strength_attr, None) if sc else None) or getattr(self.model_config, strength_attr, default_s) or default_s
+            self.print_and_status_update(f"Merging sample LoRA: {os.path.basename(path)} (strength={strength})")
+            count_before = len(all_applied)
+            self._merge_lora_file(path, strength, all_applied)
+            self.print_and_status_update(f"  Applied {len(all_applied) - count_before} tensors")
+
+    def _teardown_sampling_lora(self):
+        applied = getattr(self, '_sampling_lora_applied', None)
+        if applied:
+            self._unmerge_lora(applied)
+            self._sampling_lora_applied = None
+        self._sampling_lora_ready = False
+
+    def _validate_sample_config(self, image_configs):
+        if not self._has_sampling_lora():
+            return
+        sc = getattr(self, 'sample_config', None)
+        for attr in ('sample_lora_path', 'sample_lora_path_2'):
+            path = (getattr(sc, attr, None) if sc else None) or getattr(self.model_config, attr, None)
+            if path and not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"Sample LoRA not found — aborting sample to avoid useless inference: {path}"
+                )
+
+    def _before_generate_images_loop(self, pipeline, image_configs):
+        if self._has_sampling_lora():
+            self._prepare_sampling_lora(pipeline)
+
+    def _after_generate_images_loop(self, pipeline):
+        if getattr(self, '_sampling_lora_ready', False):
+            self._teardown_sampling_lora()
+
+    def _after_sample_failure(self):
+        if getattr(self, '_sampling_lora_ready', False):
+            try:
+                self._teardown_sampling_lora()
+            except Exception:
+                pass
+
+    def reload_text_encoder(self):
+        """Reload Qwen3-VL text encoder from disk after it was unloaded into a FakeTextEncoder stub.
+
+        Called by the persistent-process model cache (run_ui.py) when the hot model
+        is reused for a new job but the text encoder was already unloaded by the
+        previous job's embedding-caching step. Tokenizer and processor are already
+        on self.tokenizer / self.processor (unloader never touches them).
+        """
+        _tokenizer, _processor, text_encoder = self._load_text_encoder()
+
+        if self.model_config.quantize_te:
+            self.print_and_status_update("Quantizing text encoder")
+            text_encoder.to(self.device_torch)
+            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
+            freeze(text_encoder)
+            flush()
+
+        if (
+            self.model_config.layer_offloading
+            and self.model_config.layer_offloading_text_encoder_percent > 0
+        ):
+            MemoryManager.attach(
+                text_encoder,
+                self.device_torch,
+                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
+            )
+
+        if self.model_config.low_vram:
+            text_encoder.to("cpu")
+        else:
+            text_encoder.to(self.device_torch)
+        flush()
+
+        self.text_encoder = text_encoder
+        self.pipeline = Krea2Pipeline(self)
+
     def load_model(self):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Krea 2 model")

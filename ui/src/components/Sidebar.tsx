@@ -8,12 +8,14 @@ import { FaXTwitter, FaDiscord, FaYoutube } from 'react-icons/fa6';
 import { createGlobalState } from 'react-global-hooks';
 import ThemeToggle from './ThemeToggle';
 import ThemeLogo from './ThemeLogo';
+import useSettings from '@/hooks/useSettings';
 import ActiveJobWidget from './ActiveJobWidget';
 import OstrisCloudBalance from './OstrisCloudBalance';
 
 export const mobileSidebarState = createGlobalState<boolean>(false);
 
 const Sidebar = () => {
+  const { settings } = useSettings();
   const [isMobileOpen, setIsMobileOpen] = mobileSidebarState.use();
   const pathname = usePathname();
 
@@ -49,9 +51,9 @@ const Sidebar = () => {
   const sidebarContent = (
     <>
       <div className="px-4 py-3 flex items-center justify-between">
-        <h1 className="text-l">
+        <h1 className="text-l flex items-center">
           <ThemeLogo />
-          <span className="font-bold uppercase">Ostris</span>
+          <span className="font-bold uppercase ml-2">Ostris</span>
           <span className="ml-2 uppercase text-gray-300">AI-Toolkit</span>
         </h1>
         <button
@@ -78,42 +80,49 @@ const Sidebar = () => {
           ))}
         </ul>
       </nav>
-      <ActiveJobWidget />
-      <a
-        href="https://ostris.com/support"
-        target="_blank"
-        rel="noreferrer"
-        className="group flex items-center space-x-2 px-4 py-3 text-gray-400 hover:text-gray-200 transition-colors"
-      >
-        <svg
-          height="20"
-          width="20"
-          xmlns="http://www.w3.org/2000/svg"
-          viewBox="0 0 24 24"
-          style={{ overflow: 'visible' }}
+      <div className="mt-auto">
+        <ActiveJobWidget />
+        <div className="px-4 py-2 text-[10px] text-gray-600 uppercase tracking-widest border-t border-gray-800/50">
+          v{settings?.VERSION || '0.0.0'}
+        </div>
+        <a
+          href="https://ostris.com/support"
+          target="_blank"
+          rel="noreferrer"
+          className="group flex items-center space-x-2 px-4 py-3 text-gray-400 hover:text-gray-200 transition-colors border-t border-gray-800/50"
         >
-          <path
-            className="animate-heartbeat"
-            d="m7 3c-1.5355 0-3.0784 0.5-4.25 1.7-2.3431 2.4-2.2788 6.1 0 8.5l9.25 9.8 9.25-9.8c2.279-2.4 2.343-6.1 0-8.5-2.343-2.3-6.157-2.3-8.5 0l-0.75 0.8-0.75-0.8c-1.172-1.2-2.7145-1.7-4.25-1.7z"
-            fill="#c0392b"
-          />
-        </svg>
-        <span className="uppercase text-sm font-medium tracking-wide">Support AI-Toolkit</span>
-      </a>
+          <svg
+            height="20"
+            width="20"
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            style={{ overflow: 'visible' }}
+          >
+            <path
+              className="animate-heartbeat"
+              d="m7 3c-1.5355 0-3.0784 0.5-4.25 1.7-2.3431 2.4-2.2788 6.1 0 8.5l9.25 9.8 9.25-9.8c2.279-2.4 2.343-6.1 0-8.5-2.343-2.3-6.157-2.3-8.5 0l-0.75 0.8-0.75-0.8c-1.172-1.2-2.7145-1.7-4.25-1.7z"
+              fill="#c0392b"
+            />
+          </svg>
+          <span className="uppercase text-sm font-medium tracking-wide">Support AI-Toolkit</span>
+        </a>
 
-      {/* Social links grid */}
-      <div className="px-1 py-1 border-t border-gray-800">
-        <div className="grid grid-cols-4 gap-4">
-          <a href="https://discord.gg/VXmU2f5WEU" target="_blank" rel="noreferrer" className={socialsBoxClass}>
-            <FaDiscord className={socialIconClass} />
-          </a>
-          <a href="https://www.youtube.com/@ostrisai" target="_blank" rel="noreferrer" className={socialsBoxClass}>
-            <FaYoutube className={socialIconClass} />
-          </a>
-          <a href="https://x.com/ostrisai" target="_blank" rel="noreferrer" className={socialsBoxClass}>
-            <FaXTwitter className={socialIconClass} />
-          </a>
-          <ThemeToggle />
+        {/* Social links grid */}
+        <div className="px-2 py-2 border-t border-gray-800">
+          <div className="grid grid-cols-4 gap-2">
+            <a href="https://discord.gg/VXmU2f5WEU" target="_blank" rel="noreferrer" className={socialsBoxClass}>
+              <FaDiscord className={socialIconClass} />
+            </a>
+            <a href="https://www.youtube.com/@ostrisai" target="_blank" rel="noreferrer" className={socialsBoxClass}>
+              <FaYoutube className={socialIconClass} />
+            </a>
+            <a href="https://x.com/ostrisai" target="_blank" rel="noreferrer" className={socialsBoxClass}>
+              <FaXTwitter className={socialIconClass} />
+            </a>
+            <div className="flex items-center justify-center">
+              <ThemeToggle />
+            </div>
+          </div>
         </div>
       </div>
       <div className="text-center text-[10px] text-gray-400 py-1 bg-gray-800">
@@ -125,7 +134,7 @@ const Sidebar = () => {
   return (
     <>
       {/* Desktop sidebar - always visible on md+ */}
-      <div className="hidden md:flex flex-col w-59 bg-gray-900 text-gray-100">{sidebarContent}</div>
+      <div className="hidden md:flex flex-col w-60 bg-gray-900 text-gray-100 h-full overflow-y-auto">{sidebarContent}</div>
 
       {/* Mobile overlay sidebar */}
       <div

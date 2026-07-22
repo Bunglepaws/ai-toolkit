@@ -23,10 +23,61 @@ function all<T = any>(db: sqlite3.Database, sql: string, params: any[] = []) {
   });
 }
 
+function run(db: sqlite3.Database, sql: string, params: any[] = []) {
+  return new Promise<{ changes: number }>((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) reject(err);
+      else resolve({ changes: (this as any).changes });
+    });
+  });
+}
+
 function closeDb(db: sqlite3.Database) {
   return new Promise<void>((resolve, reject) => {
     db.close((err) => (err ? reject(err) : resolve()));
   });
+}
+
+export async function DELETE(request: NextRequest, { params }: { params: { jobID: string } }) {
+  const { jobID } = await params;
+  const job = await prisma.job.findUnique({ where: { id: jobID } });
+  if (!job) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+
+  let body: { trimAfterStep?: unknown };
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
+
+  const trimAfterStep = Number(body?.trimAfterStep);
+  if (!Number.isFinite(trimAfterStep) || trimAfterStep < 0) {
+    return NextResponse.json({ error: 'trimAfterStep must be a non-negative number' }, { status: 400 });
+  }
+
+  const trainingFolder = await getTrainingFolder();
+  const jobFolder = path.join(trainingFolder, job.name);
+  const logPath = path.join(jobFolder, 'loss_log.db');
+
+  if (!fs.existsSync(logPath)) {
+    return NextResponse.json({ error: 'No loss log found' }, { status: 404 });
+  }
+
+  const db = openDb(logPath);
+  try {
+    await run(db, 'PRAGMA foreign_keys = ON');
+    const result = await run(db, 'DELETE FROM steps WHERE step > ?', [trimAfterStep]);
+    await run(
+      db,
+      `UPDATE metric_keys
+       SET last_seen_step = (SELECT MAX(step) FROM metrics WHERE metrics.key = metric_keys.key)
+       WHERE last_seen_step > ?`,
+      [trimAfterStep],
+    );
+    return NextResponse.json({ deleted: result.changes });
+  } finally {
+    await closeDb(db);
+  }
 }
 
 export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {

@@ -28,12 +28,44 @@ export async function POST(request: Request) {
     // Sort server-side so the client doesn't have to sort large lists
     imageFiles.sort((a, b) => a.localeCompare(b));
 
-    // Send a single shared root plus each file's sub-path, rather than repeating the full
-    // absolute path (and an "img_path" key) on every entry. The root carries the trailing
-    // OS separator so the client rebuilds the native path with a plain concat (root + subPath),
-    // keeping correct paths on Windows, macOS, and Linux without any separator logic client-side.
+    // Send a shared root plus per-file objects containing the sub-path and caption data.
+    // Using a shared root prefix keeps the payload small (avoids repeating the dataset folder
+    // on every entry). Caption data is included upfront so the client-side caption filter works
+    // immediately without a second round-trip.
     const root = datasetFolder + path.sep;
-    const result = imageFiles.map(imgPath => imgPath.slice(root.length));
+    const captionExtensions = ['txt', 'json', 'caption'];
+    const result = await Promise.all(imageFiles.map(async imgPath => {
+      const subPath = imgPath.slice(root.length);
+      const base = imgPath.replace(/\.[^/.]+$/, '');
+      const captionExists: Record<string, boolean> = {};
+      const captions: Record<string, string> = {};
+      for (const ext of captionExtensions) {
+        const p = base + '.' + ext;
+        try {
+          await fs.promises.access(p);
+          captionExists[ext] = true;
+          const raw = await fs.promises.readFile(p, 'utf-8');
+          if (ext === 'json') {
+            try {
+              const parsed = JSON.parse(raw);
+              captions[ext] = typeof parsed.caption === 'string' ? parsed.caption : raw;
+            } catch {
+              captions[ext] = raw;
+            }
+          } else {
+            captions[ext] = raw;
+          }
+        } catch {
+          captionExists[ext] = false;
+        }
+      }
+      return {
+        subPath,
+        caption: captions['txt'] ?? '',
+        captions,
+        captionExists,
+      };
+    }));
 
     // Compress the payload explicitly. Even after stripping the shared prefix these lists
     // still gzip/brotli down substantially — a big win on slow connections and huge datasets.
@@ -67,7 +99,7 @@ export async function POST(request: Request) {
  * @returns Array of absolute paths to image files
  */
 async function findImagesRecursively(dir: string): Promise<string[]> {
-  const imageExtensions = ['.png', '.jpg', '.jpeg', '.webp', '.mp4', '.avi', '.mov', '.mkv', '.wmv', '.m4v', '.flv', '.mp3', '.wav', '.flac', '.ogg'];
+  const imageExtensions = ['.png', '.jpg', '.jpeg', '.webp', '.mp4', '.avi', '.mov', '.mkv', '.wmv', '.m4v', '.flv', '.mp3', '.wav', '.flac', '.ogg', '.m4a'];
   let results: string[] = [];
 
   // withFileTypes avoids a separate stat per entry — a big win on large datasets.

@@ -156,6 +156,47 @@ class BooguImageModel(BaseModel):
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
+    def reload_text_encoder(self):
+        """Reload Qwen3-VL instruction encoder from disk after it was unloaded into a FakeTextEncoder stub.
+
+        Called by the persistent-process model cache (run_ui.py) when the hot model
+        is reused for a new job but the text encoder was already unloaded by the
+        previous job's embedding-caching step.
+        """
+        dtype = self.torch_dtype
+        base = self.model_config.name_or_path or self.default_repo
+        te_path = self.model_config.model_kwargs.get("text_encoder_path", base)
+        te_subfolder = self.model_config.model_kwargs.get("text_encoder_subfolder", "mllm")
+
+        self.print_and_status_update("Reloading Qwen3-VL instruction encoder")
+        text_encoder = AutoModel.from_pretrained(
+            te_path, subfolder=te_subfolder, torch_dtype=dtype, token=HF_TOKEN
+        )
+        text_encoder.eval()
+        text_encoder.requires_grad_(False)
+        n_patched = patch_qwen_vl_patch_embed(text_encoder)
+        if n_patched:
+            self.print_and_status_update(
+                f"  - patched {n_patched} Qwen-VL Conv3d patch_embed -> linear"
+            )
+        flush()
+
+        if self.model_config.quantize_te:
+            self.print_and_status_update("Quantizing instruction encoder")
+            text_encoder.to(self.device_torch)
+            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
+            freeze(text_encoder)
+            flush()
+
+        if self.model_config.low_vram:
+            text_encoder.to("cpu")
+        else:
+            text_encoder.to(self.device_torch)
+        flush()
+
+        self.text_encoder = text_encoder
+        self.pipeline = BooguImagePipeline(self)
+
     def load_model(self):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Boogu-Image model")

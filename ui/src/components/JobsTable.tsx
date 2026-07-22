@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import useJobsList from '@/hooks/useJobsList';
+import { JobConfig } from '@/types';
 import Link from 'next/link';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
 import { GpuInfo } from '@/types';
@@ -10,27 +11,35 @@ import classNames from 'classnames';
 import { startQueue, stopQueue } from '@/utils/queue';
 import { CgSpinner } from 'react-icons/cg';
 import useGPUInfo from '@/hooks/useGPUInfo';
+import { ChevronUp, ChevronDown, ChevronsUp, GripVertical, Trash2 } from 'lucide-react';
 import { openConfirm } from '@/components/ConfirmModal';
-import { deleteJob, getTotalSteps, stopJob } from '@/utils/jobs';
-import { Trash2 } from 'lucide-react';
+import { deleteJob, getTotalSteps, reorderJob, reorderJobToIndex, stopJob } from '@/utils/jobs';
+import JobAlertsPanel, { JobAlert } from '@/components/JobAlertsPanel';
 
 interface JobsTableProps {
   autoStartQueue?: boolean;
   onlyActive?: boolean;
+  filter?: string;
   job_type?: string | null;
 }
 
-export default function JobsTable({ onlyActive = false, job_type = null }: JobsTableProps) {
-  const { jobs, status, refreshJobs } = useJobsList({ onlyActive, reloadInterval: 5000, job_type });
+export default function JobsTable({ onlyActive = false, filter = '', job_type = null }: JobsTableProps) {
+  const { jobs, setJobs, status, refreshJobs } = useJobsList({ onlyActive, reloadInterval: 5000, job_type });
   const { queues, status: queueStatus, refreshQueues } = useQueueList();
   const { gpuList, isGPUInfoLoaded } = useGPUInfo();
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [deleteProgress, setDeleteProgress] = useState<{ done: number; total: number } | null>(null);
+
+  const isAnyJobRunning = jobs.some(j => j.status === 'running');
 
   const refresh = () => {
     refreshJobs();
     refreshQueues();
   };
+
+  const [draggedJobId, setDraggedJobId] = useState<string | null>(null);
+  const [dragOverJobId, setDragOverJobId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [deleteProgress, setDeleteProgress] = useState<{ done: number; total: number } | null>(null);
+  const [openAlertsPanelId, setOpenAlertsPanelId] = useState<string | null>(null);
 
   const isDeleting = deleteProgress !== null;
   const allSelected = jobs.length > 0 && jobs.every(job => selectedIds.has(job.id));
@@ -38,11 +47,8 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
   const toggleRow = (id: string) => {
     setSelectedIds(prev => {
       const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
   };
@@ -74,18 +80,10 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
           const job = jobsToDelete[i];
           try {
             if (job.status === 'running') {
-              try {
-                await stopJob(job.id);
-              } catch (e) {
-                console.error('Error stopping job before deleting:', e);
-              }
+              try { await stopJob(job.id); } catch (e) { console.error('Error stopping job before deleting:', e); }
             }
             await deleteJob(job.id);
-            setSelectedIds(prev => {
-              const next = new Set(prev);
-              next.delete(job.id);
-              return next;
-            });
+            setSelectedIds(prev => { const next = new Set(prev); next.delete(job.id); return next; });
           } catch (e) {
             console.error('Error deleting job:', job.name, e);
           }
@@ -96,6 +94,126 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
         refresh();
       },
     });
+  };
+
+  const handleDragStart = (e: React.DragEvent, jobId: string) => {
+    e.dataTransfer.effectAllowed = 'move';
+    setDraggedJobId(jobId);
+  };
+
+  const handleDragOver = (e: React.DragEvent, jobId: string) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (dragOverJobId !== jobId) setDragOverJobId(jobId);
+  };
+
+  const handleDrop = async (e: React.DragEvent, targetJobId: string, queuedJobs: Job[]) => {
+    e.preventDefault();
+    if (!draggedJobId || draggedJobId === targetJobId) {
+      setDraggedJobId(null);
+      setDragOverJobId(null);
+      return;
+    }
+    const targetIndex = queuedJobs.findIndex(j => j.id === targetJobId);
+    if (targetIndex === -1) return;
+    try {
+      await reorderJobToIndex(draggedJobId, targetIndex);
+      refresh();
+    } catch (err) {
+      console.error('Failed to reorder job:', err);
+    } finally {
+      setDraggedJobId(null);
+      setDragOverJobId(null);
+    }
+  };
+
+  const handleDragEnd = () => {
+    setDraggedJobId(null);
+    setDragOverJobId(null);
+  };
+
+  const filteredJobs = useMemo(() => {
+    if (!filter) return jobs;
+
+    const escapeRegExp = (string: string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    const matchesTerm = (job: Job, term: string) => {
+      term = term.trim();
+      if (!term) return true;
+      let modelName = '';
+      try {
+        const jobConfig: JobConfig = JSON.parse(job.job_config);
+        modelName = jobConfig?.config?.process?.[0]?.model?.name_or_path || '';
+      } catch { /* malformed config */ }
+      const jobRef = job.job_ref || '';
+      const searchableText = `${job.name} ${modelName} ${jobRef}`.toLowerCase();
+      if (term.startsWith('"') && term.endsWith('"')) {
+        const exactTerm = term.slice(1, -1);
+        if (!exactTerm) return true;
+        return new RegExp(`(^|[^a-zA-Z0-9_])${escapeRegExp(exactTerm)}([^a-zA-Z0-9_]|$)`, 'i').test(searchableText);
+      }
+      return searchableText.includes(term.toLowerCase());
+    };
+
+    const splitByOperator = (input: string, operator: 'and' | 'or') => {
+      const regex = new RegExp(`\\s+${operator}\\s+`, 'gi');
+      const parts: string[] = [];
+      let lastIndex = 0;
+      let match;
+      while ((match = regex.exec(input)) !== null) {
+        const part = input.slice(lastIndex, match.index).trim();
+        if ((part.match(/"/g) || []).length % 2 === 0) { parts.push(part); lastIndex = regex.lastIndex; }
+      }
+      parts.push(input.slice(lastIndex).trim());
+      return parts.filter(p => p !== '');
+    };
+
+    const orParts = splitByOperator(filter, 'or');
+    if (orParts.length > 1) {
+      return jobs.filter(job => orParts.some(part => {
+        const andParts = splitByOperator(part, 'and');
+        return andParts.length > 1 ? andParts.every(sub => matchesTerm(job, sub)) : matchesTerm(job, part);
+      }));
+    }
+    const andParts = splitByOperator(filter, 'and');
+    if (andParts.length > 1) return jobs.filter(job => andParts.every(part => matchesTerm(job, part)));
+    return jobs.filter(job => matchesTerm(job, filter));
+  }, [jobs, filter]);
+
+  const handleReorder = async (jobID: string, direction: 'up' | 'down') => {
+    setJobs(prev => {
+      const job = prev.find(j => j.id === jobID);
+      if (!job) return prev;
+      const queueJobs = prev.filter(j => j.status === 'queued' && j.gpu_ids === job.gpu_ids)
+        .sort((a, b) => (a.queue_position ?? 0) - (b.queue_position ?? 0));
+      const idx = queueJobs.findIndex(j => j.id === jobID);
+      const swapIdx = direction === 'up' ? idx - 1 : idx + 1;
+      if (swapIdx < 0 || swapIdx >= queueJobs.length) return prev;
+      const neighbour = queueJobs[swapIdx];
+      return prev.map(j => {
+        if (j.id === jobID) return { ...j, queue_position: neighbour.queue_position };
+        if (j.id === neighbour.id) return { ...j, queue_position: job.queue_position };
+        return j;
+      });
+    });
+    try { await reorderJob(jobID, direction); } catch (e) { console.error('Failed to reorder job:', e); }
+    refresh();
+  };
+
+  const handleMoveToTop = async (jobID: string) => {
+    setJobs(prev => {
+      const job = prev.find(j => j.id === jobID);
+      if (!job) return prev;
+      const queueJobs = prev.filter(j => j.status === 'queued' && j.gpu_ids === job.gpu_ids)
+        .sort((a, b) => (a.queue_position ?? 0) - (b.queue_position ?? 0));
+      if (queueJobs[0]?.id === jobID) return prev;
+      const reordered = [job, ...queueJobs.filter(j => j.id !== jobID)];
+      const basePos = Math.min(...queueJobs.map(j => j.queue_position ?? 0));
+      const updated = new Map(reordered.map((j, i) => [j.id, { ...j, queue_position: basePos + i }]));
+      return prev.map(j => updated.get(j.id) ?? j);
+    });
+    try { await reorderJobToIndex(jobID, 0); } catch (e) { console.error('Failed to move job to top:', e); }
+    refresh();
   };
 
   const columns: TableColumn[] = [
@@ -125,26 +243,72 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
       title: 'Name',
       key: 'name',
       render: row => {
-        let title = row.name;
+        let title: React.ReactNode = row.name;
         let href = `/jobs/${row.id}`;
         // if (row.job_type === 'train') title = `Train: ${title}`;
         if (row.job_type === 'caption') {
-          let splits = row.job_ref.split(/[/\\]/);
-          const datasetPath = `${splits[splits.length - 1]}`;
-          href = `/datasets/${datasetPath}`;
+          let paths: string[] = [];
+          try {
+            const jobConfig: JobConfig = JSON.parse(row.job_config);
+            const pathToCaption = (jobConfig as any)?.config?.process?.[0]?.caption?.path_to_caption;
+            if (Array.isArray(pathToCaption)) {
+              paths = pathToCaption;
+            } else if (typeof pathToCaption === 'string') {
+              paths = pathToCaption.split('|');
+            }
+          } catch { /* malformed config */ }
+          paths = paths.map(p => p.trim()).filter(Boolean);
+          if (paths.length === 0) paths = [row.job_ref || ''];
+          const names = paths.map(p => {
+            const splits = p.split(/[/\\]/);
+            return splits[splits.length - 1];
+          });
+          href = `/datasets/${names[0]}`;
           title = (
             <>
-              <small className="opacity-50">CAPTION: </small> {datasetPath}
+              <small className="opacity-50">CAPTION: </small> {names.join(', ')}
             </>
           );
         }
         return (
-          <Link href={href} className="font-medium whitespace-nowrap">
-            {['running', 'stopping'].includes(row.status) ? (
-              <CgSpinner className="inline animate-spin mr-2 text-blue-400" />
-            ) : null}
-            {title}
-          </Link>
+          <div className="flex items-center">
+            {row.status === 'queued' && (
+              <>
+                <div className="mr-1 text-gray-600 cursor-grab" title="Drag to reorder">
+                  <GripVertical size={16} />
+                </div>
+                <div className="flex flex-col mr-3 text-gray-500">
+                  <button
+                    onClick={() => handleMoveToTop(row.id)}
+                    className="hover:text-white transition-colors"
+                    title="Move to Top"
+                  >
+                    <ChevronsUp size={16} />
+                  </button>
+                  <button
+                    onClick={() => handleReorder(row.id, 'up')}
+                    className="hover:text-white transition-colors"
+                    title="Move Up"
+                  >
+                    <ChevronUp size={16} />
+                  </button>
+                  <button
+                    onClick={() => handleReorder(row.id, 'down')}
+                    className="hover:text-white transition-colors"
+                    title="Move Down"
+                  >
+                    <ChevronDown size={16} />
+                  </button>
+                </div>
+              </>
+            )}
+            <Link href={href} className="font-medium whitespace-nowrap">
+              {['running', 'stopping'].includes(row.status) ? (
+                <CgSpinner className="inline animate-spin mr-2 text-blue-400" />
+              ) : null}
+              {title}
+            </Link>
+          </div>
         );
       },
     },
@@ -185,7 +349,28 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
         if (row.status === 'failed') statusClass = 'text-red-400';
         if (row.status === 'running') statusClass = 'text-blue-400';
 
-        return <span className={statusClass}>{row.status}</span>;
+        let alerts: JobAlert[] = [];
+        try {
+          alerts = JSON.parse((row as any).alerts || '[]');
+        } catch { /* ignore */ }
+
+        return (
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className={statusClass}>{row.status}</span>
+            {alerts.length > 0 && (
+              <button
+                onClick={e => {
+                  e.stopPropagation();
+                  setOpenAlertsPanelId(prev => prev === row.id ? null : row.id);
+                }}
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-semibold bg-amber-900/40 text-amber-400 border border-amber-500/40 hover:bg-amber-900/60 transition-colors"
+                title="View training alerts"
+              >
+                ⚠ {alerts.length}
+              </button>
+            )}
+          </div>
+        );
       },
     },
     {
@@ -198,20 +383,27 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
       key: 'actions',
       className: 'text-right',
       render: row => {
-        return <JobActionBar job={row} onRefresh={refreshJobs} autoStartQueue={false} />;
+        return (
+          <JobActionBar
+            job={row}
+            onRefresh={refreshJobs}
+            autoStartQueue={false}
+            isAnyJobRunning={isAnyJobRunning}
+          />
+        );
       },
     },
   ];
 
   const jobsDict = useMemo(() => {
     if (!isGPUInfoLoaded) return {};
-    if (jobs.length === 0) return {};
+    if (filteredJobs.length === 0) return {};
     let jd: { [key: string]: { name: string; jobs: Job[] } } = {};
     gpuList.forEach(gpu => {
       jd[`${gpu.index}`] = { name: `${gpu.name}`, jobs: [] };
     });
     jd['Idle'] = { name: 'Idle', jobs: [] };
-    jobs.forEach(job => {
+    filteredJobs.forEach(job => {
       const gpu = gpuList.find(gpu => job.gpu_ids?.split(',').includes(gpu.index.toString())) as GpuInfo;
       const key = `${gpu?.index || '0'}`;
       if (['queued', 'running', 'stopping'].includes(job.status) && key in jd) {
@@ -229,6 +421,10 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
         });
       } else {
         jd[key].jobs.sort((a, b) => {
+          const aIsActive = ['running', 'stopping'].includes(a.status);
+          const bIsActive = ['running', 'stopping'].includes(b.status);
+          if (aIsActive && !bIsActive) return -1;
+          if (!aIsActive && bIsActive) return 1;
           if (a.queue_position === null) return 1;
           if (b.queue_position === null) return -1;
           return a.queue_position - b.queue_position;
@@ -236,7 +432,7 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
       }
     });
     return jd;
-  }, [jobs, queues, isGPUInfoLoaded]);
+  }, [filteredJobs, queues, isGPUInfoLoaded]);
 
   let isLoading = status === 'loading' || queueStatus === 'loading' || !isGPUInfoLoaded;
 
@@ -336,6 +532,36 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
                     ? 'bg-green-700 dark:bg-green-950 text-white dark:text-gray-400'
                     : 'bg-red-700 dark:bg-red-950 text-white dark:text-gray-400'
                 }
+                rowProps={(row) => {
+                  if (row.status !== 'queued') return {};
+                  const queuedJobs = jobsDict[gpuKey].jobs.filter((j: Job) => j.status === 'queued');
+                  const isDragging = row.id === draggedJobId;
+                  const isDragOver = row.id === dragOverJobId && row.id !== draggedJobId;
+                  return {
+                    draggable: true,
+                    onDragStart: (e: React.DragEvent<HTMLTableRowElement>) => handleDragStart(e, row.id),
+                    onDragOver: (e: React.DragEvent<HTMLTableRowElement>) => handleDragOver(e, row.id),
+                    onDrop: (e: React.DragEvent<HTMLTableRowElement>) => handleDrop(e, row.id, queuedJobs),
+                    onDragEnd: handleDragEnd,
+                    className: classNames(
+                      isDragging && 'opacity-40',
+                      isDragOver && 'border-t-2 border-blue-400',
+                    ),
+                  };
+                }}
+                afterRow={(row) => {
+                  if (openAlertsPanelId !== row.id) return null;
+                  let alerts: JobAlert[] = [];
+                  try { alerts = JSON.parse((row as any).alerts || '[]'); } catch { /* ignore */ }
+                  return (
+                    <JobAlertsPanel
+                      jobID={row.id}
+                      alerts={alerts}
+                      onClose={() => setOpenAlertsPanelId(null)}
+                      onCleared={() => { setOpenAlertsPanelId(null); refresh(); }}
+                    />
+                  );
+                }}
               />
             </div>
           );
@@ -347,7 +573,25 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
               <h2 className="font-semibold text-gray-100">Idle</h2>
             </div>
           </div>
-          <UniversalTable columns={columns} rows={jobsDict['Idle'].jobs} isLoading={isLoading} onRefresh={refresh} />
+          <UniversalTable
+            columns={columns}
+            rows={jobsDict['Idle'].jobs}
+            isLoading={isLoading}
+            onRefresh={refresh}
+            afterRow={(row) => {
+              if (openAlertsPanelId !== row.id) return null;
+              let alerts: JobAlert[] = [];
+              try { alerts = JSON.parse((row as any).alerts || '[]'); } catch { /* ignore */ }
+              return (
+                <JobAlertsPanel
+                  jobID={row.id}
+                  alerts={alerts}
+                  onClose={() => setOpenAlertsPanelId(null)}
+                  onCleared={() => { setOpenAlertsPanelId(null); refresh(); }}
+                />
+              );
+            }}
+          />
         </div>
       )}
     </div>

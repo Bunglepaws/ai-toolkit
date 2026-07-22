@@ -202,6 +202,7 @@ class StableDiffusion:
         self.invert_assistant_lora = False
         self._after_sample_img_hooks = []
         self._status_update_hooks = []
+        self._maybe_stop_hooks = []
         # todo update this based on the model
         self.is_transformer = False
         
@@ -267,7 +268,19 @@ class StableDiffusion:
     @property
     def is_flux(self):
         return self.arch == 'flux'
-    
+
+    @property
+    def is_ltx2(self):
+        return self.arch == 'ltx2'
+
+    @property
+    def is_wan21(self):
+        return self.arch == 'wan21'
+
+    @property
+    def is_z_image(self):
+        return self.arch == 'z_image'
+
     @property
     def is_lumina2(self):
         return self.arch == 'lumina2'
@@ -1132,6 +1145,13 @@ class StableDiffusion:
     def add_status_update_hook(self, func):
         self._status_update_hooks.append(func)
 
+    def add_maybe_stop_hook(self, func):
+        self._maybe_stop_hooks.append(func)
+
+    def maybe_stop(self):
+        for hook in self._maybe_stop_hooks:
+            hook()
+
     @torch.no_grad()
     def generate_images(
             self,
@@ -1379,6 +1399,7 @@ class StableDiffusion:
                     assert network.is_active
 
                 for i in tqdm(range(len(image_configs)), desc=f"Generating Images", leave=False):
+                    self.maybe_stop()
                     gen_config = image_configs[i]
 
                     extra = {}
@@ -1458,10 +1479,19 @@ class StableDiffusion:
                             quad_count=4
                         )
 
-                    if self.sample_prompts_cache is not None:
+                    # Cache is indexed by position; if it's short (e.g. re-cache failed
+                    # after the text encoder was unloaded, or prompts changed mid-run),
+                    # fall back to live encoding instead of raising IndexError.
+                    use_cache = self.sample_prompts_cache is not None and i < len(self.sample_prompts_cache)
+                    if self.sample_prompts_cache is not None and not use_cache:
+                        print(
+                            f"Warning: sample prompt cache missing entry {i} "
+                            f"(have {len(self.sample_prompts_cache)}); encoding this prompt live."
+                        )
+                    if use_cache:
                         conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
                         unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
-                    else: 
+                    else:
                         # encode the prompt ourselves so we can do fun stuff with embeddings
                         if isinstance(self.adapter, CustomAdapter):
                             self.adapter.is_unconditional_run = False
@@ -2793,6 +2823,30 @@ class StableDiffusion:
                     save_directory=os.path.join(output_file, 'transformer'),
                     safe_serialization=True,
                 )
+            elif self.is_ltx2:
+                # only save the unet
+                from extensions_built_in.diffusion_models.ltx2.ltx2_video_transformer import LTX2VideoTransformer
+                transformer: LTX2VideoTransformer = unwrap_model(self.unet)
+                transformer.save_pretrained(
+                    save_directory=os.path.join(output_file, 'transformer'),
+                    safe_serialization=True,
+                )
+            elif self.is_wan21:
+                # only save the unet
+                from toolkit.models.wan21.wan21_transformer import WanTransformer3DModel
+                transformer: WanTransformer3DModel = unwrap_model(self.unet)
+                transformer.save_pretrained(
+                    save_directory=os.path.join(output_file, 'transformer'),
+                    safe_serialization=True,
+                )
+            elif self.is_z_image:
+                # only save the unet
+                from extensions_built_in.diffusion_models.z_image.z_image_transformer import ZImageTransformer2DModel
+                transformer: ZImageTransformer2DModel = unwrap_model(self.unet)
+                transformer.save_pretrained(
+                    save_directory=os.path.join(output_file, 'transformer'),
+                    safe_serialization=True,
+                )
             elif self.is_lumina2:
                 # only save the unet
                 transformer: Lumina2Transformer2DModel = unwrap_model(self.unet)
@@ -2857,7 +2911,7 @@ class StableDiffusion:
             named_params = self.named_parameters(vae=False, unet=unet, text_encoder=False, state_dict_keys=True)
             unet_lr = unet_lr if unet_lr is not None else default_lr
             params = []
-            if self.is_pixart or self.is_auraflow or self.is_flux or self.is_v3 or self.is_lumina2:
+            if self.is_pixart or self.is_auraflow or self.is_flux or self.is_ltx2 or self.is_wan21 or self.is_z_image or self.is_v3 or self.is_lumina2:
                 for param in named_params.values():
                     if param.requires_grad:
                         params.append(param)
@@ -3153,6 +3207,12 @@ class StableDiffusion:
             return 'auraflow'
         if self.is_flux:
             return 'flux.1'
+        if self.is_ltx2:
+            return 'ltx2'
+        if self.is_wan21:
+            return 'wan21'
+        if self.is_z_image:
+            return 'z_image'
         if self.is_lumina2:
             return 'lumina2'
         if self.is_ssd:

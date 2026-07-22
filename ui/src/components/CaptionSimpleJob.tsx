@@ -58,6 +58,20 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
         )}
       </div>
       <div className="mt-4">
+        <TextInput
+          label="Dataset Path(s)"
+          value={
+            Array.isArray(jobConfig.config.process[0].caption.path_to_caption)
+              ? jobConfig.config.process[0].caption.path_to_caption.join('|')
+              : jobConfig.config.process[0].caption.path_to_caption
+          }
+          onChange={value => {
+            setJobConfig(value, 'config.process[0].caption.path_to_caption');
+          }}
+          placeholder="Separate multiple folders with |"
+        />
+      </div>
+      <div className="mt-4">
         <CreatableSelectInput
           label="Name or Path"
           value={jobConfig.config.process[0].caption.model_name_or_path}

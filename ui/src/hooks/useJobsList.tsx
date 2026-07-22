@@ -52,7 +52,18 @@ export default function useJobsList({
         isFetchingRef.current = false;
       });
   };
-  usePollLoop(refreshJobs, reloadInterval);
+
+  useEffect(() => {
+    refreshJobs();
+
+    if (reloadInterval) {
+      const interval = setInterval(() => {
+        refreshJobs();
+      }, reloadInterval);
+      return () => clearInterval(interval);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return { jobs, setJobs, status, refreshJobs };
 }

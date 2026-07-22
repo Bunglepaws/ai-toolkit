@@ -28,8 +28,8 @@ export default function Settings() {
   };
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const { name, value } = e.target;
-    setSettings(prev => ({ ...prev, [name]: value }));
+    const { name, value, type, checked } = e.target;
+    setSettings(prev => ({ ...prev, [name]: type === 'checkbox' ? (checked ? 'true' : 'false') : value }));
   };
 
   return (
@@ -65,6 +65,29 @@ export default function Settings() {
                     onChange={handleChange}
                     className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
                     placeholder="Enter your Hugging Face token"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="GEMMA_API_KEY" className="block text-sm font-medium mb-2">
+                    Lightricks Gemma Text Encoding API Key
+                    <div className="text-gray-500 text-sm ml-1">
+                      For LTX-2.3 training. Lets you encode text prompts via the cloud API instead
+                      of loading the 12B Gemma model locally, saving ~24 GB of VRAM.{' '}
+                      <a href="https://console.ltx.video" target="_blank" rel="noreferrer">
+                        Get a free key at console.ltx.video
+                      </a>
+                      {' '}(sign up → API section).
+                    </div>
+                  </label>
+                  <input
+                    type="password"
+                    id="GEMMA_API_KEY"
+                    name="GEMMA_API_KEY"
+                    value={settings.GEMMA_API_KEY}
+                    onChange={handleChange}
+                    className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
+                    placeholder="Enter your Lightricks Gemma API key"
                   />
                 </div>
 
@@ -108,6 +131,111 @@ export default function Settings() {
                     placeholder="Enter datasets folder path"
                   />
                 </div>
+
+                <div>
+                  <label htmlFor="QUANTIZATION_CACHE_DIR" className="block text-sm font-medium mb-2">
+                    Quantization Cache Directory
+                    <div className="text-gray-500 text-sm ml-1">
+                      Where pre-quantized models are stored so the slow quantization step can be skipped
+                      on subsequent runs. Must be an absolute path. If blank, defaults to{' '}
+                      <code className="text-gray-300">quantized/</code> inside the Training Folder.
+                    </div>
+                  </label>
+                  <input
+                    type="text"
+                    id="QUANTIZATION_CACHE_DIR"
+                    name="QUANTIZATION_CACHE_DIR"
+                    value={settings.QUANTIZATION_CACHE_DIR}
+                    onChange={handleChange}
+                    className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
+                    placeholder="Leave blank to use Training Folder/quantized"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="border-t border-gray-700 pt-6">
+            <h2 className="text-base font-semibold mb-4">AI Config Check</h2>
+            <div className="space-y-4">
+              <div>
+                <label htmlFor="CHECK_CONFIG_API_BASE_URL" className="block text-sm font-medium mb-2">
+                  API Base URL
+                  <div className="text-gray-500 text-sm ml-1">
+                    OpenAI-compatible endpoint. Use{' '}
+                    <code className="text-gray-300">https://api.anthropic.com/v1</code> for Claude,
+                    or your local Ollama address (e.g. <code className="text-gray-300">http://192.168.1.x:11434/v1</code>).
+                    Leave blank to disable the Check Config button.
+                  </div>
+                </label>
+                <input
+                  type="text"
+                  id="CHECK_CONFIG_API_BASE_URL"
+                  name="CHECK_CONFIG_API_BASE_URL"
+                  value={settings.CHECK_CONFIG_API_BASE_URL}
+                  onChange={handleChange}
+                  className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
+                  placeholder="https://api.anthropic.com/v1"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="CHECK_CONFIG_API_KEY" className="block text-sm font-medium mb-2">
+                  API Key
+                  <div className="text-gray-500 text-sm ml-1">
+                    Your Anthropic or provider API key. Leave blank for Ollama (no auth required).
+                  </div>
+                </label>
+                <input
+                  type="password"
+                  id="CHECK_CONFIG_API_KEY"
+                  name="CHECK_CONFIG_API_KEY"
+                  value={settings.CHECK_CONFIG_API_KEY}
+                  onChange={handleChange}
+                  className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
+                  placeholder="sk-ant-..."
+                />
+              </div>
+
+              <div>
+                <label htmlFor="CHECK_CONFIG_MODEL" className="block text-sm font-medium mb-2">
+                  Model
+                  <div className="text-gray-500 text-sm ml-1">
+                    Model to use for config analysis. Defaults to{' '}
+                    <code className="text-gray-300">claude-sonnet-5</code>. For visual analysis of
+                    sample images, a vision-capable model is required (e.g. Qwen2.5-VL via Ollama).
+                  </div>
+                </label>
+                <input
+                  type="text"
+                  id="CHECK_CONFIG_MODEL"
+                  name="CHECK_CONFIG_MODEL"
+                  value={settings.CHECK_CONFIG_MODEL}
+                  onChange={handleChange}
+                  className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
+                  placeholder="claude-sonnet-5"
+                />
+              </div>
+
+              <div>
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    name="CHECK_CONFIG_ENABLE_WEB_SEARCH"
+                    checked={settings.CHECK_CONFIG_ENABLE_WEB_SEARCH === 'true'}
+                    onChange={handleChange}
+                    className="mt-1 h-4 w-4 rounded border-gray-600 bg-gray-800 text-blue-500 focus:ring-blue-500"
+                  />
+                  <span className="text-sm font-medium">
+                    Enable Ollama Web Search
+                    <div className="text-gray-500 text-sm font-normal mt-1">
+                      When using an Ollama endpoint, perform a web search before the LLM call and
+                      inject the results as additional context. Requires the Ollama server to have
+                      web search enabled (Bearer token via the API Key field above if required).
+                      Has no effect when using Anthropic or other non-Ollama providers.
+                    </div>
+                  </span>
+                </label>
               </div>
             </div>
           </div>

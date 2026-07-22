@@ -16,7 +16,7 @@ import BoundingBoxOverlay, { parseBoundingBoxes } from './BoundingBoxOverlay';
 interface Props {
   imgPath: string | null; // current image path
   numSamples: number; // number of samples per row
-  sampleImages: string[]; // all sample images
+  sampleImages: (string | null)[]; // all sample images (can contain null for gaps)
   sampleConfig: SampleConfig | null;
   onChange: (nextPath: string | null) => void; // parent setter
   refreshSampleImages?: () => void;
@@ -33,7 +33,10 @@ export default function SampleImageViewer({
   const [mounted, setMounted] = useState(false);
   const [isOpen, setIsOpen] = useState(Boolean(imgPath));
   const [showingControlIdx, setShowingControlIdx] = useState<number | null>(null);
+  const [promptExpanded, setPromptExpanded] = useState(false);
   const [showBoxes, setShowBoxes] = useState<boolean>(false);
+  const [imgBlobUrl, setImgBlobUrl] = useState<string | null>(null);
+  const [imgLoadError, setImgLoadError] = useState<string | null>(null);
 
   useEffect(() => setMounted(true), []);
 
@@ -76,9 +79,9 @@ export default function SampleImageViewer({
         .split('.')[0]
         .split('_')
         .filter(p => p !== '');
-      if (parts.length === 3) {
-        ii.step = parseInt(parts[1]);
-        ii.promptIdx = parseInt(parts[2]);
+      if (parts.length >= 2) {
+        ii.promptIdx = parseInt(parts[parts.length - 1]);
+        ii.step = parseInt(parts[parts.length - 2]);
       } else {
         console.error('Unexpected filename format for sample image:', filename);
       }
@@ -89,10 +92,12 @@ export default function SampleImageViewer({
   const setImageAtIndex = useCallback(
     (idx: number) => {
       if (idx < 0 || idx >= sampleImages.length) return;
+      const nextPath = sampleImages[idx];
+      if (!nextPath) return; // skip if null
       setShowingControlIdx(null);
-      onChange(sampleImages[idx]);
+      onChange(nextPath);
     },
-    [sampleImages, numSamples, onChange],
+    [sampleImages, onChange],
   );
 
   const currentIndex = useMemo(() => {
@@ -117,7 +122,7 @@ export default function SampleImageViewer({
     const nextIdx = currentIndex - 1;
     if (nextIdx < minIdx) return;
     setImageAtIndex(nextIdx);
-  }, [sampleImages, currentIndex, imgInfo.promptIdx, setImageAtIndex]);
+  }, [currentIndex, imgInfo.promptIdx, setImageAtIndex]);
 
   const handleArrowRight = useCallback(() => {
     if (currentIndex === -1) return;
@@ -126,7 +131,7 @@ export default function SampleImageViewer({
     const nextIdx = currentIndex + 1;
     if (nextIdx > maxIdx) return;
     setImageAtIndex(nextIdx);
-  }, [sampleImages, currentIndex, imgInfo.promptIdx, setImageAtIndex]);
+  }, [numSamples, currentIndex, imgInfo.promptIdx, setImageAtIndex]);
 
   const handleDelete = useCallback(() => {
     if (!imgPath) return;
@@ -159,6 +164,52 @@ export default function SampleImageViewer({
     return sampleConfig.samples[imgInfo.promptIdx];
   }, [sampleConfig, imgInfo.promptIdx]);
 
+  const [metadataPrompt, setMetadataPrompt] = useState<string | null>(null);
+  const [metadataSeed, setMetadataSeed] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!imgPath) {
+      setMetadataPrompt(null);
+      setMetadataSeed(null);
+      return;
+    }
+    setMetadataPrompt(null);
+    setMetadataSeed(null);
+    let cancelled = false;
+    apiClient
+      .post('/api/img/metadata', { imgPath })
+      .then(res => {
+        if (cancelled) return;
+        if (res.data?.prompt) setMetadataPrompt(res.data.prompt);
+        if (res.data?.seed != null) setMetadataSeed(res.data.seed);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [imgPath]);
+
+  const displayedPrompt = useMemo(() => {
+    // Prefer metadata (embedded in image file), fall back to sample config prompt.
+    // For Ideogram bbox-JSON, extract the human-readable high_level_description
+    // rather than dumping the full JSON blob into the caption area.
+    const candidates = [metadataPrompt, sampleItem?.prompt ?? null];
+    for (const raw of candidates) {
+      if (!raw) continue;
+      const trimmed = raw.trim();
+      if (trimmed.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (typeof parsed?.high_level_description === 'string') return parsed.high_level_description;
+        } catch {}
+        // Incomplete / unparseable JSON (e.g. metadata contains only the first line) — skip
+        continue;
+      }
+      return raw; // plain-text prompt, use as-is
+    }
+    return null;
+  }, [metadataPrompt, sampleItem?.prompt]);
+
   const controlImages = useMemo<string[]>(() => {
     if (!imgPath) return [];
     let controlImageArr: string[] = [];
@@ -184,13 +235,14 @@ export default function SampleImageViewer({
   }, [sampleItem, imgPath]);
 
   const seed = useMemo(() => {
+    if (metadataSeed != null) return metadataSeed;
     if (!sampleItem) return '?';
     if (sampleItem.seed !== undefined) return sampleItem.seed;
     if (sampleConfig?.walk_seed) {
-      return sampleConfig.seed + imgInfo.promptIdx;
+      return (sampleConfig.seed || 0) + imgInfo.promptIdx;
     }
     return sampleConfig?.seed ?? '?';
-  }, [sampleItem, sampleConfig]);
+  }, [metadataSeed, sampleItem, sampleConfig, imgInfo.promptIdx]);
 
   const displayedImgPath = useMemo(() => {
     if (showingControlIdx !== null && controlImages[showingControlIdx]) {
@@ -199,8 +251,47 @@ export default function SampleImageViewer({
     return imgPath;
   }, [showingControlIdx, controlImages, imgPath]);
 
-  // The sample's prompt is what generated it; if it's an Ideogram bbox-JSON we can
-  // overlay the boxes on the generated image. Only on the main image (not controls).
+  // Load the displayed image via fetch → blob URL, mirroring SampleImageCard behavior.
+  // This avoids the silent-failure mode where <img src> collapses to 0×0 on error,
+  // making the image area invisible (user sees "just the caption").
+  useEffect(() => {
+    if (!displayedImgPath || isAudio(displayedImgPath) || isVideo(displayedImgPath)) {
+      setImgBlobUrl(null);
+      setImgLoadError(null);
+      return;
+    }
+
+    setImgBlobUrl(null);
+    setImgLoadError(null);
+
+    let cancelled = false;
+    let objectUrl: string | null = null;
+
+    const controller = new AbortController();
+    fetch(`/api/img/${encodeURIComponent(displayedImgPath)}`, { signal: controller.signal })
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.blob();
+      })
+      .then(blob => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setImgBlobUrl(objectUrl);
+      })
+      .catch(err => {
+        if (cancelled || err?.name === 'AbortError') return;
+        console.error('SampleImageViewer: image load failed:', displayedImgPath, err);
+        setImgLoadError(err?.message ?? 'Failed to load');
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      setImgBlobUrl(null);
+    };
+  }, [displayedImgPath]);
+
   const boundingBoxes = useMemo(
     () => (sampleItem?.prompt ? parseBoundingBoxes(sampleItem.prompt) : null),
     [sampleItem],
@@ -307,12 +398,12 @@ export default function SampleImageViewer({
             transition
             onTouchStart={onTouchStart}
             onTouchEnd={onTouchEnd}
-            className="relative transform rounded-none sm:rounded-lg bg-gray-800 text-left shadow-xl transition-all data-closed:translate-y-4 data-closed:opacity-0 data-enter:duration-300 data-enter:ease-out data-leave:duration-200 data-leave:ease-in w-full sm:w-auto sm:max-w-[95%] sm:max-h-[95vh] data-closed:sm:translate-y-0 data-closed:sm:scale-95 flex flex-col overflow-hidden touch-pan-y"
+            className="relative transform rounded-none sm:rounded-lg bg-gray-800 text-left shadow-xl transition-all data-closed:translate-y-4 data-closed:opacity-0 data-enter:duration-300 data-enter:ease-out data-leave:duration-200 data-leave:ease-in w-full sm:w-auto sm:max-w-[95%] max-h-[95vh] data-closed:sm:translate-y-0 data-closed:sm:scale-95 flex flex-col overflow-hidden touch-pan-y"
           >
-            <div className="overflow-hidden flex items-center justify-center">
+            <div className="flex-1 min-h-0 overflow-hidden flex items-center justify-center">
               {displayedImgPath &&
                 (isAudio(displayedImgPath) ? (
-                  <div className="w-[500px] h-[500px] max-w-full sm:max-w-[95vw] max-h-[82vh]">
+                  <div className="w-[500px] h-[260px] max-w-full sm:max-w-[95vw] max-h-[55vh] self-stretch">
                     <AudioPlayer
                       src={`/api/img/${encodeURIComponent(displayedImgPath)}`}
                       title={displayedImgPath.replace(/^.*[\\/]/, '')}
@@ -329,6 +420,17 @@ export default function SampleImageViewer({
                     autoPlay
                     controls={true}
                   />
+                ) : imgLoadError ? (
+                  <div className="w-full sm:max-w-[95vw] max-h-[82vh] flex items-center justify-center p-8 text-red-400 text-sm text-center">
+                    <div>
+                      <div className="font-semibold mb-1">Failed to load image</div>
+                      <div className="text-xs text-gray-500">{imgLoadError}</div>
+                    </div>
+                  </div>
+                ) : !imgBlobUrl ? (
+                  <div className="w-64 h-64 sm:max-w-[95vw] max-h-[82vh] flex items-center justify-center">
+                    <div className="animate-pulse bg-gray-700 w-48 h-48 rounded" />
+                  </div>
                 ) : (
                   <TransformWrapper
                     key={displayedImgPath}
@@ -345,7 +447,7 @@ export default function SampleImageViewer({
                     <TransformComponent>
                       <div className="relative">
                         <img
-                          src={`/api/img/${encodeURIComponent(displayedImgPath)}`}
+                          src={imgBlobUrl}
                           alt="Sample Image"
                           draggable={false}
                           className="w-auto h-auto max-w-full sm:max-w-[95vw] max-h-[82vh] object-contain select-none !pointer-events-auto"
@@ -357,14 +459,22 @@ export default function SampleImageViewer({
                 ))}
             </div>
             {/* # make full width */}
-            <div className="bg-gray-950 text-sm flex justify-between items-center px-4 py-2">
-              <div className="flex-1 relative h-10 min-w-0">
-                {sampleItem?.prompt && (
-                  <div className="absolute inset-0 grid place-items-center overflow-auto mr-4">
-                    <div className="w-full">
-                      <span className="text-gray-400 mr-1">Prompt:</span>
-                      <span className="whitespace-pre-wrap break-words">{sampleItem.prompt}</span>
-                    </div>
+            <div className="bg-gray-950 text-sm flex justify-between items-start px-4 py-2 flex-shrink-0 max-h-[35vh] overflow-y-auto">
+              <div className="flex-1 min-w-0 mr-4">
+                {displayedPrompt && (
+                  <div>
+                    <span className="text-gray-400 mr-1">Prompt:</span>
+                    <span
+                      className={`whitespace-pre-wrap break-words cursor-pointer select-text block overflow-hidden transition-all duration-200 ${
+                        promptExpanded ? '' : 'line-clamp-3'
+                      }`}
+                      onClick={() => setPromptExpanded(true)}
+                      onBlur={() => setPromptExpanded(false)}
+                      tabIndex={0}
+                      title={promptExpanded ? 'Click outside to collapse' : 'Click to expand'}
+                    >
+                      {displayedPrompt}
+                    </span>
                   </div>
                 )}
               </div>

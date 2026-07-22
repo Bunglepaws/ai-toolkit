@@ -128,5 +128,14 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
 
   usePollLoop(refreshLoss, reloadInterval, [jobID]);
 
-  return { series, keys, lossKeys, status, refreshLoss, setSeries };
+  const fullReset = useCallback(() => {
+    didInitialLoadRef.current = false;
+    lastStepByKeyRef.current = {};
+    setSeries({});
+    setKeys([]);
+    setStatus('idle');
+    refreshLoss();
+  }, [refreshLoss]);
+
+  return { series, keys, lossKeys, status, refreshLoss, fullReset, setSeries };
 }

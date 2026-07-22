@@ -1,0 +1,2730 @@
+diff --git a/.gitignore b/.gitignore
+index 95ccd9e..ea1a2f2 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -182,4 +182,6 @@ cython_debug/
+ aitk_db.db
+ /notes.md
+ /data
+-.claude
+\ No newline at end of file
++.claude
++/aitk_db.zip
++/marcbateFeatures.patch
+diff --git a/.run/build_and_start DEBUG.run.xml b/.run/build_and_start DEBUG.run.xml
+new file mode 100644
+index 0000000..a533994
+--- /dev/null
++++ b/.run/build_and_start DEBUG.run.xml	
+@@ -0,0 +1,15 @@
++<component name="ProjectRunConfigurationManager">
++  <configuration default="false" name="build_and_start DEBUG" type="js.build_tools.npm">
++    <package-json value="$PROJECT_DIR$/ui/package.json" />
++    <command value="run" />
++    <scripts>
++      <script value="build_and_start" />
++    </scripts>
++    <node-interpreter value="project" />
++    <envs />
++    <EXTENSION ID="com.intellij.lang.javascript.buildTools.npm.rc.StartBrowserRunConfigurationExtension">
++      <browser start="true" with-js-debugger="true" url="http://localhost:8675/" />
++    </EXTENSION>
++    <method v="2" />
++  </configuration>
++</component>
+\ No newline at end of file
+diff --git a/.vscode/launch.json b/.vscode/launch.json
+index abbc2f3..86c3745 100644
+--- a/.vscode/launch.json
++++ b/.vscode/launch.json
+@@ -51,6 +51,6 @@
+                 "CUDA_VISIBLE_DEVICES": "1"
+             },
+             "justMyCode": false
+-        },
++        }
+     ]
+-}
+\ No newline at end of file
++}
+diff --git a/extensions_built_in/sd_trainer/DiffusionTrainer.py b/extensions_built_in/sd_trainer/DiffusionTrainer.py
+index f39611b..066851e 100644
+--- a/extensions_built_in/sd_trainer/DiffusionTrainer.py
++++ b/extensions_built_in/sd_trainer/DiffusionTrainer.py
+@@ -137,6 +137,42 @@ class DiffusionTrainer(SDTrainer):
+ 
+         return _check_return_to_queue()
+ 
++    def should_save(self):
++        if not self.is_ui_trainer:
++            return False
++
++        def _check_save():
++            with self._db_connect() as conn:
++                cursor = conn.cursor()
++                cursor.execute(
++                    "SELECT save FROM Job WHERE id = ?", (self.job_id,))
++                save = cursor.fetchone()
++                return False if save is None else save[0] == 1
++
++        return _check_save()
++
++    def reset_save(self):
++        if self.accelerator.is_main_process and self.is_ui_trainer:
++            self.update_db_key("save", False)
++
++    def should_sample(self):
++        if not self.is_ui_trainer:
++            return False
++
++        def _check_sample():
++            with self._db_connect() as conn:
++                cursor = conn.cursor()
++                cursor.execute(
++                    "SELECT sample FROM Job WHERE id = ?", (self.job_id,))
++                sample = cursor.fetchone()
++                return False if sample is None else sample[0] == 1
++
++        return _check_sample()
++
++    def reset_sample(self):
++        if self.accelerator.is_main_process and self.is_ui_trainer:
++            self.update_db_key("sample", False)
++
+     def maybe_stop(self):
+         if not self.is_ui_trainer:
+             return
+@@ -151,6 +187,23 @@ class DiffusionTrainer(SDTrainer):
+             self.is_stopping = True
+             raise Exception("Job returning to queue")
+ 
++    def maybe_save(self):
++        if not self.is_ui_trainer:
++            return
++        if self.should_save():
++            self.reset_save()
++            self.save(self.step_num)
++
++    def maybe_sample(self):
++        if not self.is_ui_trainer:
++            return
++        if self.should_sample():
++            self.reset_sample()
++            # save model and optimizer first as requested
++            self.save(self.step_num)
++            # then sample
++            self.sample(self.step_num)
++
+     async def _update_key(self, key, value):
+         if not self.accelerator.is_main_process:
+             return
+@@ -160,8 +213,10 @@ class DiffusionTrainer(SDTrainer):
+                 cursor = conn.cursor()
+                 cursor.execute("BEGIN IMMEDIATE")
+                 try:
+-                    # Convert the value to string if it's not already
+-                    if isinstance(value, str):
++                    # Convert the value to appropriate SQLite type
++                    if isinstance(value, bool):
++                        value_to_insert = 1 if value else 0
++                    elif isinstance(value, (int, float, str)) or value is None:
+                         value_to_insert = value
+                     else:
+                         value_to_insert = str(value)
+@@ -261,6 +316,8 @@ class DiffusionTrainer(SDTrainer):
+         super(DiffusionTrainer, self).end_step_hook()
+         if self.is_ui_trainer:
+             self.update_step()
++            self.maybe_save()
++            self.maybe_sample()
+             self.maybe_stop()
+ 
+     def hook_before_model_load(self):
+@@ -305,7 +362,11 @@ class DiffusionTrainer(SDTrainer):
+         self.update_status("running", f"Generating images - 0/{total_imgs}")
+         super().sample(step, is_first)
+         self.maybe_stop()
+-        self.update_status("running", "Training")
++        if self.sample_only:
++            # reset sample flag in DB
++            self.update_db_key("sample", False)
++        else:
++            self.update_status("running", "Training")
+ 
+     def save(self, step=None):
+         self.maybe_stop()
+diff --git a/extensions_built_in/sd_trainer/UITrainer.py b/extensions_built_in/sd_trainer/UITrainer.py
+index 8b5fa79..98ce1a3 100644
+--- a/extensions_built_in/sd_trainer/UITrainer.py
++++ b/extensions_built_in/sd_trainer/UITrainer.py
+@@ -148,8 +148,10 @@ class UITrainer(SDTrainer):
+                 cursor = conn.cursor()
+                 cursor.execute("BEGIN IMMEDIATE")
+                 try:
+-                    # Convert the value to string if it's not already
+-                    if isinstance(value, str):
++                    # Convert the value to appropriate SQLite type
++                    if isinstance(value, bool):
++                        value_to_insert = 1 if value else 0
++                    elif isinstance(value, (int, float, str)) or value is None:
+                         value_to_insert = value
+                     else:
+                         value_to_insert = str(value)
+diff --git a/jobs/BaseJob.py b/jobs/BaseJob.py
+index 5b339eb..832eaf4 100644
+--- a/jobs/BaseJob.py
++++ b/jobs/BaseJob.py
+@@ -10,12 +10,13 @@ class BaseJob:
+     def __init__(self, config: OrderedDict):
+         if not config:
+             raise ValueError('config is required')
+-        self.process: List[BaseProcess]
++        self.process: List[BaseProcess] = []
+ 
+         self.config = config['config']
+         self.raw_config = config
+         self.job = config['job']
+         self.name = self.get_conf('name', required=True)
++        self.sample_only = False
+         if 'meta' in config:
+             self.meta = config['meta']
+         else:
+diff --git a/jobs/process/BaseProcess.py b/jobs/process/BaseProcess.py
+index c58724c..8640c27 100644
+--- a/jobs/process/BaseProcess.py
++++ b/jobs/process/BaseProcess.py
+@@ -16,6 +16,7 @@ class BaseProcess(object):
+         self.process_id = process_id
+         self.meta: OrderedDict
+         self.job = job
++        self.sample_only = getattr(self.job, 'sample_only', False)
+         self.config = config
+         self.raw_process_config = config
+         self.name = self.get_conf('name', self.job.name)
+diff --git a/jobs/process/BaseSDTrainProcess.py b/jobs/process/BaseSDTrainProcess.py
+index 5d130fc..1c6403f 100644
+--- a/jobs/process/BaseSDTrainProcess.py
++++ b/jobs/process/BaseSDTrainProcess.py
+@@ -270,7 +270,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
+         return generate_image_config_list
+ 
+     def sample(self, step=None, is_first=False):
+-        if not self.accelerator.is_main_process:
++        if not self.accelerator.is_main_process and not self.sample_only:
+             return
+         flush()
+         sample_folder = os.path.join(self.save_root, 'samples')
+@@ -430,21 +430,35 @@ class BaseSDTrainProcess(BaseTrainProcess):
+             critic_pattern = f"CRITIC_{self.job.name}_*"
+             critic_items = glob.glob(os.path.join(self.save_root, critic_pattern))
+ 
+-            # Sort the lists by creation time if they are not empty
++            def get_step_num(p):
++                try:
++                    # matches digits after last underscore before extension
++                    f_name = os.path.basename(p)
++                    # remove extension if present
++                    f_name = os.path.splitext(f_name)[0]
++                    # match last digits
++                    match = re.search(r'_(\d+)$', f_name)
++                    if match:
++                        return int(match.group(1))
++                except Exception:
++                    pass
++                return -1
++
++            # Sort the lists by step number, then by creation time if step number is the same
+             if safetensors_files:
+-                safetensors_files.sort(key=os.path.getctime)
++                safetensors_files.sort(key=lambda p: (get_step_num(p), os.path.getctime(p)))
+             if pt_files:
+-                pt_files.sort(key=os.path.getctime)
++                pt_files.sort(key=lambda p: (get_step_num(p), os.path.getctime(p)))
+             if directories:
+-                directories.sort(key=os.path.getctime)
++                directories.sort(key=lambda p: (get_step_num(p), os.path.getctime(p)))
+             if embed_files:
+-                embed_files.sort(key=os.path.getctime)
++                embed_files.sort(key=lambda p: (get_step_num(p), os.path.getctime(p)))
+             if critic_items:
+-                critic_items.sort(key=os.path.getctime)
++                critic_items.sort(key=lambda p: (get_step_num(p), os.path.getctime(p)))
+ 
+             # Combine and sort the lists
+             combined_items = safetensors_files + directories + pt_files
+-            combined_items.sort(key=os.path.getctime)
++            combined_items.sort(key=lambda p: (get_step_num(p), os.path.getctime(p)))
+             
+             num_saves_to_keep = self.save_config.max_step_saves_to_keep
+             
+@@ -473,6 +487,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
+                     shutil.rmtree(item)
+                 else:
+                     os.remove(item)
++                    # if it's a safetensors file, see if we have an optimizer to remove
++                    if item.endswith('.safetensors'):
++                        # Matches digits after the last underscore (e.g., 'my_model_000001000.safetensors')
++                        match = re.search(r'_(\d+)\.safetensors$', item)
++                        if match:
++                            step_num_str = match.group(1)
++                            optimizer_to_remove = os.path.join(self.save_root, f"optimizer_{step_num_str}.pt")
++                            if os.path.exists(optimizer_to_remove):
++                                print_acc(f"Removing old optimizer: {optimizer_to_remove}")
++                                os.remove(optimizer_to_remove)
++
+                 # see if a yaml file with same name exists
+                 yaml_file = os.path.splitext(item)[0] + ".yaml"
+                 if os.path.exists(yaml_file):
+@@ -487,7 +512,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
+     
+     def done_hook(self):
+         pass
+-    
++
++    def should_save(self):
++        return False
++
++    def reset_save(self):
++        pass
++
+     def end_step_hook(self):
+         pass
+ 
+@@ -502,11 +533,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
+         if not os.path.exists(self.save_root):
+             os.makedirs(self.save_root, exist_ok=True)
+ 
++        previous_save_step = self.last_save_step
+         step_num = ''
+         if step is not None:
+             self.last_save_step = step
+             # zeropad 9 digits
+             step_num = f"_{str(step).zfill(9)}"
++        elif self.save_config.save_with_step_num:
++            # if step is None, use current step
++            step_num = f"_{str(self.step_num).zfill(9)}"
+ 
+         self.update_training_metadata()
+         filename = f'{self.job.name}{step_num}.safetensors'
+@@ -522,7 +557,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
+ 
+         # prepare meta
+         save_meta = get_meta_for_safetensors(save_meta, self.job.name)
+-        if not self.is_fine_tuning and not self.train_config.merge_network_on_save:
++
++        # set filename again just in case it was changed above (eg. lora, adapter)
++        # but only if it's not fine tuning as that has its own logic
++        if not self.is_fine_tuning:
++            # check if we have a filename already (from lora or adapter)
++            # if not, use the default one
++            if 'filename' not in locals():
++                filename = f'{self.job.name}{step_num}.safetensors'
++                file_path = os.path.join(self.save_root, filename)
++            else:
++                # filename was set by lora or adapter, but we might need to ensure step_num is there
++                # actually lora and adapter logic above already uses step_num
++                pass
++        else:
++            # for fine tuning, we use the original filename and file_path
++            pass
++
++        if not self.is_fine_tuning:
+             if self.network is not None:
+                 lora_name = self.job.name
+                 if self.named_lora:
+@@ -632,16 +684,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
+                 # merge the network weights into a full model and save that
+                 if not self.network.can_merge_in:
+                     raise ValueError("Network cannot merge in weights. Cannot save full model.")
+-                
++
+                 print_acc("Merging network weights into full model for saving...")
+-                
++
+                 self.network.merge_in(merge_weight=1.0)
+                 # reset weights to zero
+                 self.network.reset_weights()
+                 self.network.is_merged_in = False
+-                
++
+                 print_acc("Done merging network weights.")
+-                
++
+             if self.save_config.save_format == "diffusers":
+                 # saving as a folder path
+                 file_path = file_path.replace('.safetensors', '')
+@@ -681,15 +733,29 @@ class BaseSDTrainProcess(BaseTrainProcess):
+ 
+         # save optimizer
+         if self.optimizer is not None:
++            optimizer_path = os.path.join(self.save_root, 'optimizer.pt')
++            if self.save_config.archive_optimizer:
++                try:
++                    if os.path.exists(optimizer_path):
++                        # Archive the existing optimizer.pt (which belongs to the previous save)
++                        archive_name = f"optimizer_{previous_save_step:09d}.pt"
++                        archive_path = os.path.join(self.save_root, archive_name)
++
++                        # Archive the existing optimizer if not already archived
++                        if not os.path.exists(archive_path):
++                            print_acc(f"Archiving optimizer to {archive_name}")
++                            os.rename(optimizer_path, archive_path)
++                except Exception as e:
++                    print_acc(f"Error archiving optimizer: {e}")
++
++            # 4. Save the new optimizer.pt (this will be the 'latest' for next time)
+             try:
+-                filename = f'optimizer.pt'
+-                file_path = os.path.join(self.save_root, filename)
+                 try:
+                     state_dict = unwrap_model(self.optimizer).state_dict()
+                 except Exception as e:
+                     state_dict = self.optimizer.state_dict()
+-                torch.save(state_dict, file_path)
+-                print_acc(f"Saved optimizer to {file_path}")
++                torch.save(state_dict, optimizer_path)
++                print_acc(f"Saved optimizer to {optimizer_path}")
+             except Exception as e:
+                 print_acc(e)
+                 print_acc("Could not save optimizer")
+@@ -752,7 +818,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
+             self.modules_being_trained.append(self.adapter)
+         
+         # prepare other things
+-        self.optimizer = self.accelerator.prepare(self.optimizer)
++        if self.optimizer is not None:
++            self.optimizer = self.accelerator.prepare(self.optimizer)
+         if self.lr_scheduler is not None:
+             self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
+         # self.data_loader = self.accelerator.prepare(self.data_loader)
+@@ -829,7 +896,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
+                     paths = [p for p in paths if '_cn' not in p]
+ 
+                 if len(paths) > 0:
+-                    latest_path = max(paths, key=os.path.getctime)
++                    def get_step_num(p):
++                        try:
++                            # matches digits after last underscore before extension
++                            f_name = os.path.basename(p)
++                            # remove extension if present
++                            f_name = os.path.splitext(f_name)[0]
++                            # match last digits
++                            match = re.search(r'_(\d+)$', f_name)
++                            if match:
++                                return int(match.group(1))
++                        except Exception:
++                            pass
++                        return -1
++
++                    latest_path = max(paths, key=lambda p: (get_step_num(p), os.path.getctime(p)))
+         
+         if latest_path is None and self.network_config is not None and self.network_config.pretrained_lora_path is not None:
+             # set pretrained lora path as load path if we do not have a checkpoint to resume from
+@@ -843,8 +924,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
+         return latest_path
+ 
+     def load_training_state_from_metadata(self, path):
+-        if not self.accelerator.is_main_process:
+-            return
+         if path is not None and self.network_config is not None and path == self.network_config.pretrained_lora_path:
+             # dont load metadata from pretrained lora
+             return
+@@ -864,6 +943,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
+             if 'epoch' in meta['training_info']:
+                 self.epoch_num = meta['training_info']['epoch']
+             self.start_step = self.step_num
++            self.last_save_step = self.step_num
+             print_acc(f"Found step {self.step_num} in metadata, starting from there")
+ 
+     def load_weights(self, path):
+@@ -1317,19 +1397,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
+                 if len(noise.shape) == 5:
+                     # if we have a 5d tensor, then we need to do it on a per batch item, per channel basis, per frame
+                     s = (noise.shape[0], noise.shape[1], noise.shape[2], 1, 1)
+-                
++
+                 noise = noise * noise_multiplier
+                 
+                 if self.train_config.do_signal_correction_noise:
+                     batch_noise = latents.clone().to(noise.device, dtype=noise.dtype)
+                     scn_scale = torch.randn(
+                         batch_noise.shape[0], batch_noise.shape[1], 1, 1,
+-                        device=batch_noise.device, 
++                        device=batch_noise.device,
+                         dtype=batch_noise.dtype
+                     ) * self.train_config.signal_correction_noise_scale
+                     batch_noise = batch_noise * scn_scale
+-                    noise = noise + batch_noise 
+-                
++                    noise = noise + batch_noise
++
+                 if self.train_config.do_batch_noise_correction:
+                     if latents.shape[0] == 1:
+                         # if we only have a batch size of 1, then we cant do batch noise correction, so we skip it
+@@ -1344,7 +1424,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
+                         ) * self.train_config.batch_noise_correction_scale
+                         batch_noise = batch_noise * batch_noise_scale
+                         noise = noise + batch_noise
+-                
++
+                 if self.train_config.random_noise_shift > 0.0:
+                     # get random noise -1 to 1
+                     noise_shift = torch.randn(
+@@ -1354,7 +1434,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
+                     ) * self.train_config.random_noise_shift
+                     # add to noise
+                     noise += noise_shift
+-                
++
+                 if self.train_config.random_noise_multiplier > 0.0:
+                     sigma = self.train_config.random_noise_multiplier
+                     noise_multiplier = torch.exp(torch.randn(s, device=noise.device, dtype=noise.dtype) * sigma)
+@@ -1370,14 +1450,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
+                     latent_multiplier = normalizer
+ 
+                 latents = latents * latent_multiplier
+-                
++
+                 if self.train_config.do_blank_stabilization:
+                     # zero out latents with blank prompts
+                     blank_latent = torch.zeros_like(latents)
+                     for i, prompt in enumerate(conditioned_prompts):
+                         if prompt.strip() == '':
+                             latents[i] = blank_latent[i]
+-                
++
+                 batch.latents = latents
+ 
+                 # normalize latents to a mean of 0 and an std of 1
+@@ -1865,6 +1945,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
+                     print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
+                     print_acc(f"Loading from {latest_save_path}")
+                     extra_weights = self.load_weights(latest_save_path)
++                    self.load_training_state_from_metadata(latest_save_path)
+                     self.network.multiplier = 1.0
+                 
+                 if self.network_config.layer_offloading:
+@@ -1883,6 +1964,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
+                 # load last saved weights
+                 if latest_save_path is not None:
+                     self.embedding.load_embedding_from_file(latest_save_path, self.device_torch)
++                    self.load_training_state_from_metadata(latest_save_path)
+                     if self.embedding.step > 1:
+                         self.step_num = self.embedding.step
+                         self.start_step = self.step_num
+@@ -1963,6 +2045,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
+                 self.setup_adapter()
+         flush()
+         ### HOOK ###
++        if self.sample_only:
++            self.hook_before_train_loop()
++            print_acc("#### RUNNING IN SAMPLE ONLY MODE ####")
++            # explicit status update for UI if it has update_status method
++            if hasattr(self, "update_status"):
++                self.update_status("running", "Generating samples")
++            self.sample(self.step_num, is_first=True)
++            print_acc("#### SAMPLE ONLY MODE COMPLETE ####")
++            self.done_hook()
++            return
++
+         params = self.hook_add_extra_train_params(params)
+         self.params = params
+         # self.params = []
+@@ -1993,6 +2086,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
+         # check if it exists
+         optimizer_state_filename = f'optimizer.pt'
+         optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
++
+         if os.path.exists(optimizer_state_file_path):
+             # try to load
+             # previous param groups
+@@ -2045,9 +2139,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
+         ### HOOk ###
+         self.before_dataset_load()
+         # load datasets if passed in the root process
+-        if self.datasets is not None:
++        if self.datasets is not None and not self.sample_only:
+             self.data_loader = get_dataloader_from_datasets(self.datasets, self.train_config.batch_size, self.sd)
+-        if self.datasets_reg is not None:
++        if self.datasets_reg is not None and not self.sample_only:
+             self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, self.train_config.batch_size,
+                                                                 self.sd)
+ 
+@@ -2378,6 +2472,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
+ 
+                 # update various steps
+                 self.step_num = step + 1
++                self.step = self.step_num
+                 self.grad_accumulation_step += 1
+                 self.end_step_hook()
+ 
+diff --git a/jobs/process/TrainESRGANProcess.py b/jobs/process/TrainESRGANProcess.py
+index 4ff3a69..6358f19 100644
+--- a/jobs/process/TrainESRGANProcess.py
++++ b/jobs/process/TrainESRGANProcess.py
+@@ -247,10 +247,14 @@ class TrainESRGANProcess(BaseTrainProcess):
+         if step is not None:
+             # zeropad 9 digits
+             step_num = f"_{str(step).zfill(9)}"
++        elif hasattr(self, 'save_config') and self.save_config.save_with_step_num:
++            # if step is None, use current step
++            step_num = f"_{str(self.step_num).zfill(9)}"
+ 
+         self.update_training_metadata()
+         # filename = f'{self.job.name}{step_num}.safetensors'
+         filename = f'{self.job.name}{step_num}.pth'
++        file_path = os.path.join(self.save_root, filename)
+         # prepare meta
+         save_meta = get_meta_for_safetensors(self.meta, self.job.name)
+ 
+@@ -266,9 +270,9 @@ class TrainESRGANProcess(BaseTrainProcess):
+ 
+         # most things wont use safetensors, save as torch
+         # save_file(save_state_dict, os.path.join(self.save_root, filename), save_meta)
+-        torch.save(save_state_dict, os.path.join(self.save_root, filename))
++        torch.save(save_state_dict, file_path)
+ 
+-        self.print(f"Saved to {os.path.join(self.save_root, filename)}")
++        self.print(f"Saved to {file_path}")
+ 
+         if self.use_critic:
+             self.critic.save(step)
+diff --git a/jobs/process/TrainVAEProcess.py b/jobs/process/TrainVAEProcess.py
+index 95c38b4..f8d430c 100644
+--- a/jobs/process/TrainVAEProcess.py
++++ b/jobs/process/TrainVAEProcess.py
+@@ -477,17 +477,21 @@ class TrainVAEProcess(BaseTrainProcess):
+         if step is not None:
+             # zeropad 9 digits
+             step_num = f"_{str(step).zfill(9)}"
++        elif hasattr(self, 'save_config') and self.save_config.save_with_step_num:
++            # if step is None, use current step
++            step_num = f"_{str(self.step_num).zfill(9)}"
+ 
+         self.update_training_metadata()
+         filename = f'{self.job.name}{step_num}_diffusers'
++        file_path = os.path.join(self.save_root, filename)
+ 
+         self.vae = self.vae.to("cpu", dtype=torch.float16)
+         self.vae.save_pretrained(
+-            save_directory=os.path.join(self.save_root, filename)
++            save_directory=file_path
+         )
+         self.vae = self.vae.to(self.device, dtype=self.torch_dtype)
+ 
+-        self.print(f"Saved to {os.path.join(self.save_root, filename)}")
++        self.print(f"Saved to {file_path}")
+ 
+         if self.use_critic:
+             self.critic.save(step)
+diff --git a/output b/output
+new file mode 100644
+index 0000000..886adc1
+--- /dev/null
++++ b/output
+@@ -0,0 +1 @@
++/mnt/c/Data/AIToolkit-StagingArea/output
+\ No newline at end of file
+diff --git a/output/.gitkeep b/output/.gitkeep
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/run.py b/run.py
+index e3cbdef..60e7a51 100644
+--- a/run.py
++++ b/run.py
+@@ -92,7 +92,8 @@ def main():
+ 
+     for config_file in config_file_list:
+         try:
+-            job = get_job(config_file, args.name)
++            sample_only = os.environ.get("AITK_SAMPLE_ONLY", "0") == "1"
++            job = get_job(config_file, args.name, sample_only=sample_only)
+             job.run()
+             job.cleanup()
+             jobs_completed += 1
+diff --git a/toolkit/config_modules.py b/toolkit/config_modules.py
+index a581417..0f2313e 100644
+--- a/toolkit/config_modules.py
++++ b/toolkit/config_modules.py
+@@ -29,6 +29,8 @@ class SaveConfig:
+         self.push_to_hub: bool = kwargs.get("push_to_hub", False)
+         self.hf_repo_id: Optional[str] = kwargs.get("hf_repo_id", None)
+         self.hf_private: Optional[str] = kwargs.get("hf_private", False)
++        self.archive_optimizer: bool = kwargs.get("archive_optimizer", False)
++        self.save_with_step_num: bool = kwargs.get("save_with_step_num", True)
+ 
+ class LoggingConfig:
+     def __init__(self, **kwargs):
+@@ -588,6 +590,9 @@ class ModelConfig:
+         self.is_auraflow: bool = kwargs.get('is_auraflow', False)
+         self.is_v3: bool = kwargs.get('is_v3', False)
+         self.is_flux: bool = kwargs.get('is_flux', False)
++        self.is_ltx2: bool = kwargs.get('is_ltx2', False)
++        self.is_wan21: bool = kwargs.get('is_wan21', False)
++        self.is_z_image: bool = kwargs.get('is_z_image', False)
+         self.is_lumina2: bool = kwargs.get('is_lumina2', False)
+         if self.is_pixart_sigma:
+             self.is_pixart = True
+@@ -718,6 +723,12 @@ class ModelConfig:
+                 self.is_auraflow = True
+             elif self.arch == 'flux':
+                 self.is_flux = True
++            elif self.arch == 'ltx2':
++                self.is_ltx2 = True
++            elif self.arch == 'wan21':
++                self.is_wan21 = True
++            elif self.arch == 'z_image':
++                self.is_z_image = True
+             elif self.arch == 'lumina2':
+                 self.is_lumina2 = True
+             elif self.arch == 'vega':
+@@ -741,6 +752,12 @@ class ModelConfig:
+                 self.arch = 'auraflow'
+             elif kwargs.get('is_flux', False):
+                 self.arch = 'flux'
++            elif kwargs.get('is_ltx2', False):
++                self.arch = 'ltx2'
++            elif kwargs.get('is_wan21', False):
++                self.arch = 'wan21'
++            elif kwargs.get('is_z_image', False):
++                self.arch = 'z_image'
+             elif kwargs.get('is_lumina2', False):
+                 self.arch = 'lumina2'
+             elif kwargs.get('is_vega', False):
+diff --git a/toolkit/job.py b/toolkit/job.py
+index dc274fb..950b5d1 100644
+--- a/toolkit/job.py
++++ b/toolkit/job.py
+@@ -5,34 +5,37 @@ from toolkit.config import get_config
+ 
+ def get_job(
+         config_path: Union[str, dict, OrderedDict],
+-        name=None
++        name=None,
++        sample_only=False
+ ):
+     config = get_config(config_path, name)
+     if not config['job']:
+         raise ValueError('config file is invalid. Missing "job" key')
+ 
+-    job = config['job']
+-    if job == 'extract':
++    job_type = config['job']
++    job = None
++    if job_type == 'extract':
+         from jobs import ExtractJob
+-        return ExtractJob(config)
+-    if job == 'train':
++        job = ExtractJob(config)
++    elif job_type == 'train':
+         from jobs import TrainJob
+-        return TrainJob(config)
+-    if job == 'mod':
++        job = TrainJob(config)
++    elif job_type == 'mod':
+         from jobs import ModJob
+-        return ModJob(config)
+-    if job == 'generate':
++        job = ModJob(config)
++    elif job_type == 'generate':
+         from jobs import GenerateJob
+-        return GenerateJob(config)
+-    if job == 'extension':
++        job = GenerateJob(config)
++    elif job_type == 'extension':
+         from jobs import ExtensionJob
+-        return ExtensionJob(config)
+-
+-    # elif job == 'train':
+-    #     from jobs import TrainJob
+-    #     return TrainJob(config)
++        job = ExtensionJob(config)
+     else:
+-        raise ValueError(f'Unknown job type {job}')
++        raise ValueError(f'Unknown job type {job_type}')
++
++    if job is not None:
++        job.sample_only = sample_only
++
++    return job
+ 
+ 
+ def run_job(
+diff --git a/toolkit/models/base_model.py b/toolkit/models/base_model.py
+index 938649b..7c2e28a 100644
+--- a/toolkit/models/base_model.py
++++ b/toolkit/models/base_model.py
+@@ -256,6 +256,18 @@ class BaseModel:
+     def is_flux(self):
+         return self.arch == 'flux'
+ 
++    @property
++    def is_ltx2(self):
++        return self.arch == 'ltx2'
++
++    @property
++    def is_wan21(self):
++        return self.arch == 'wan21'
++
++    @property
++    def is_z_image(self):
++        return self.arch == 'z_image'
++
+     @property
+     def is_lumina2(self):
+         return self.arch == 'lumina2'
+diff --git a/toolkit/stable_diffusion_model.py b/toolkit/stable_diffusion_model.py
+index d0b5488..8f0b59d 100644
+--- a/toolkit/stable_diffusion_model.py
++++ b/toolkit/stable_diffusion_model.py
+@@ -268,7 +268,19 @@ class StableDiffusion:
+     @property
+     def is_flux(self):
+         return self.arch == 'flux'
+-    
++
++    @property
++    def is_ltx2(self):
++        return self.arch == 'ltx2'
++
++    @property
++    def is_wan21(self):
++        return self.arch == 'wan21'
++
++    @property
++    def is_z_image(self):
++        return self.arch == 'z_image'
++
+     @property
+     def is_lumina2(self):
+         return self.arch == 'lumina2'
+@@ -2790,6 +2802,30 @@ class StableDiffusion:
+                     save_directory=os.path.join(output_file, 'transformer'),
+                     safe_serialization=True,
+                 )
++            elif self.is_ltx2:
++                # only save the unet
++                from extensions_built_in.diffusion_models.ltx2.ltx2_video_transformer import LTX2VideoTransformer
++                transformer: LTX2VideoTransformer = unwrap_model(self.unet)
++                transformer.save_pretrained(
++                    save_directory=os.path.join(output_file, 'transformer'),
++                    safe_serialization=True,
++                )
++            elif self.is_wan21:
++                # only save the unet
++                from toolkit.models.wan21.wan21_transformer import WanTransformer3DModel
++                transformer: WanTransformer3DModel = unwrap_model(self.unet)
++                transformer.save_pretrained(
++                    save_directory=os.path.join(output_file, 'transformer'),
++                    safe_serialization=True,
++                )
++            elif self.is_z_image:
++                # only save the unet
++                from extensions_built_in.diffusion_models.z_image.z_image_transformer import ZImageTransformer2DModel
++                transformer: ZImageTransformer2DModel = unwrap_model(self.unet)
++                transformer.save_pretrained(
++                    save_directory=os.path.join(output_file, 'transformer'),
++                    safe_serialization=True,
++                )
+             elif self.is_lumina2:
+                 # only save the unet
+                 transformer: Lumina2Transformer2DModel = unwrap_model(self.unet)
+@@ -2854,7 +2890,7 @@ class StableDiffusion:
+             named_params = self.named_parameters(vae=False, unet=unet, text_encoder=False, state_dict_keys=True)
+             unet_lr = unet_lr if unet_lr is not None else default_lr
+             params = []
+-            if self.is_pixart or self.is_auraflow or self.is_flux or self.is_v3 or self.is_lumina2:
++            if self.is_pixart or self.is_auraflow or self.is_flux or self.is_ltx2 or self.is_wan21 or self.is_z_image or self.is_v3 or self.is_lumina2:
+                 for param in named_params.values():
+                     if param.requires_grad:
+                         params.append(param)
+@@ -3144,6 +3180,12 @@ class StableDiffusion:
+             return 'auraflow'
+         if self.is_flux:
+             return 'flux.1'
++        if self.is_ltx2:
++            return 'ltx2'
++        if self.is_wan21:
++            return 'wan21'
++        if self.is_z_image:
++            return 'z_image'
+         if self.is_lumina2:
+             return 'lumina2'
+         if self.is_ssd:
+diff --git a/ui/cron/actions/processQueue.ts b/ui/cron/actions/processQueue.ts
+index 175f613..f4d171d 100644
+--- a/ui/cron/actions/processQueue.ts
++++ b/ui/cron/actions/processQueue.ts
+@@ -58,12 +58,25 @@ export default async function processQueue() {
+           console.log(`Starting job ${nextJob.id} on GPU(s) ${nextJob.gpu_ids}`);
+           await startJob(nextJob.id);
+         } else {
+-          // no more jobs, stop the queue
+-          console.log(`No more jobs in queue for GPU(s) ${queue.gpu_ids}, stopping queue`);
+-          await prisma.queue.update({
+-            where: { id: queue.id },
+-            data: { is_running: false },
++          // find any job that needs sampling
++          const sampleJobToRun: Job | null = await prisma.job.findFirst({
++            where: {
++              sample: true,
++              gpu_ids: queue.gpu_ids,
++              status: { notIn: ['running', 'stopping'] },
++            },
+           });
++          if (sampleJobToRun) {
++            console.log(`Starting sample-only job ${sampleJobToRun.id} on GPU(s) ${sampleJobToRun.gpu_ids}`);
++            await startJob(sampleJobToRun.id, true);
++          } else {
++            // no more jobs, stop the queue
++            console.log(`No more jobs in queue for GPU(s) ${queue.gpu_ids}, stopping queue`);
++            await prisma.queue.update({
++              where: { id: queue.id },
++              data: { is_running: false },
++            });
++          }
+         }
+       }
+     }
+diff --git a/ui/cron/actions/startJob.ts b/ui/cron/actions/startJob.ts
+index a6e3983..c5f5b3e 100644
+--- a/ui/cron/actions/startJob.ts
++++ b/ui/cron/actions/startJob.ts
+@@ -6,9 +6,9 @@ import fs from 'fs';
+ import { TOOLKIT_ROOT, getTrainingFolder, getHFToken } from '../paths';
+ const isWindows = process.platform === 'win32';
+ 
+-const startAndWatchJob = (job: Job) => {
++const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
+   // starts and watches the job asynchronously
+-  return new Promise<void>(async (resolve, reject) => {
++  return new Promise<void>(async resolve => {
+     const jobID = job.id;
+ 
+     // setup the training
+@@ -34,12 +34,53 @@ const startAndWatchJob = (job: Job) => {
+           fs.mkdirSync(logsFolder, { recursive: true });
+         }
+ 
+-        let num = 0;
+-        while (fs.existsSync(path.join(logsFolder, `${num}_log.txt`))) {
+-          num++;
+-        }
+-
+-        fs.renameSync(logPath, path.join(logsFolder, `${num}_log.txt`));
++        // safe move helper: try rename, then copy+unlink, then timestamped copy; never throw
++        const safeMoveLog = (src: string, destDir: string) => {
++          try {
++            let num = 0;
++            let destPath = path.join(destDir, `${num}_log.txt`);
++            while (fs.existsSync(destPath)) {
++              num++;
++              destPath = path.join(destDir, `${num}_log.txt`);
++            }
++            try {
++              fs.renameSync(src, destPath);
++              return;
++            } catch (err: any) {
++              // If rename fails (common on Windows when file is locked), try copy + unlink
++              console.warn('rename failed when moving log file, attempting copy+unlink', err?.code);
++              try {
++                fs.copyFileSync(src, destPath);
++                try {
++                  fs.unlinkSync(src);
++                } catch (unlinkErr: any) {
++                  // couldn't remove original (probably locked) — that's fine, we left a copy
++                  console.warn('Could not unlink original log after copy, leaving original in place', unlinkErr?.code);
++                }
++                return;
++              } catch (copyErr: any) {
++                // If copy also fails, try a timestamped fallback copy name
++                console.warn('copy failed when moving log file, attempting timestamped copy', copyErr?.code);
++                try {
++                  const tsName = `${Date.now()}_log.txt`;
++                  const fallback = path.join(destDir, tsName);
++                  fs.copyFileSync(src, fallback);
++                  return;
++                } catch (fallbackErr: any) {
++                  // Give up — log the error and continue; we don't want to block job startup for a log file
++                  console.error('Failed to move or copy log file; skipping move. Errors:', err, copyErr, fallbackErr);
++                  return;
++                }
++              }
++            }
++          } catch (e) {
++            console.error('Unexpected error while attempting to move log file:', e);
++            return;
++          }
++        };
++
++        // perform safe move
++        safeMoveLog(logPath, logsFolder);
+       }
+     } catch (e) {
+       console.error('Error moving log file:', e);
+@@ -88,6 +129,10 @@ const startAndWatchJob = (job: Job) => {
+       IS_AI_TOOLKIT_UI: '1',
+     };
+ 
++    if (sampleOnly) {
++      additionalEnv.AITK_SAMPLE_ONLY = '1';
++    }
++
+     // HF_TOKEN
+     const hfToken = await getHFToken();
+     if (hfToken && hfToken.trim() !== '') {
+@@ -164,7 +209,7 @@ const startAndWatchJob = (job: Job) => {
+   });
+ };
+ 
+-export default async function startJob(jobID: string) {
++export default async function startJob(jobID: string, sampleOnly: boolean = false) {
+   const job: Job | null = await prisma.job.findUnique({
+     where: { id: jobID },
+   });
+@@ -178,9 +223,9 @@ export default async function startJob(jobID: string) {
+     data: {
+       status: 'running',
+       stop: false,
+-      info: 'Starting job...',
++      info: sampleOnly ? 'Generating samples...' : 'Starting job...',
+     },
+   });
+   // start and watch the job asynchronously so the cron can continue
+-  startAndWatchJob(job);
++  startAndWatchJob(job, sampleOnly);
+ }
+diff --git a/ui/prisma/schema.prisma b/ui/prisma/schema.prisma
+index 95c2ea1..3530e24 100644
+--- a/ui/prisma/schema.prisma
++++ b/ui/prisma/schema.prisma
+@@ -30,6 +30,8 @@ model Job {
+   updated_at      DateTime @updatedAt
+   status          String   @default("stopped")
+   stop            Boolean  @default(false)
++  save            Boolean  @default(false)
++  sample          Boolean  @default(false)
+   return_to_queue Boolean  @default(false) // same as stop, but will be set to 'queued' when stopped
+   step            Int      @default(0)
+   info            String   @default("")
+diff --git a/ui/src/app/api/datasets/listImages/route.ts b/ui/src/app/api/datasets/listImages/route.ts
+index 1887e42..937428e 100644
+--- a/ui/src/app/api/datasets/listImages/route.ts
++++ b/ui/src/app/api/datasets/listImages/route.ts
+@@ -19,9 +19,21 @@ export async function POST(request: Request) {
+     const imageFiles = findImagesRecursively(datasetFolder);
+ 
+     // Format response
+-    const result = imageFiles.map(imgPath => ({
+-      img_path: imgPath,
+-    }));
++    const result = imageFiles.map(imgPath => {
++      const captionPath = imgPath.replace(/\.[^/.]+$/, '') + '.txt';
++      let caption = '';
++      if (fs.existsSync(captionPath)) {
++        try {
++          caption = fs.readFileSync(captionPath, 'utf-8');
++        } catch (e) {
++          console.error(`Error reading caption file: ${captionPath}`, e);
++        }
++      }
++      return {
++        img_path: imgPath,
++        caption: caption
++      };
++    });
+ 
+     return NextResponse.json({ images: result });
+   } catch (error) {
+diff --git a/ui/src/app/api/jobs/[jobID]/sample/route.ts b/ui/src/app/api/jobs/[jobID]/sample/route.ts
+new file mode 100644
+index 0000000..93fba2b
+--- /dev/null
++++ b/ui/src/app/api/jobs/[jobID]/sample/route.ts
+@@ -0,0 +1,26 @@
++import { NextRequest, NextResponse } from 'next/server';
++import { PrismaClient } from '@prisma/client';
++
++const prisma = new PrismaClient();
++
++export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
++  const { jobID } = await params;
++
++  const job = await prisma.job.findUnique({
++    where: { id: jobID },
++  });
++
++  if (!job) {
++    return NextResponse.json({ error: 'Job not found' }, { status: 404 });
++  }
++
++  // update job status to request sample
++  await prisma.job.update({
++    where: { id: jobID },
++    data: {
++      sample: true,
++    },
++  });
++
++  return NextResponse.json(job);
++}
+diff --git a/ui/src/app/api/jobs/[jobID]/save/route.ts b/ui/src/app/api/jobs/[jobID]/save/route.ts
+new file mode 100644
+index 0000000..a14b721
+--- /dev/null
++++ b/ui/src/app/api/jobs/[jobID]/save/route.ts
+@@ -0,0 +1,26 @@
++import { NextRequest, NextResponse } from 'next/server';
++import { PrismaClient } from '@prisma/client';
++
++const prisma = new PrismaClient();
++
++export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
++  const { jobID } = await params;
++
++  const job = await prisma.job.findUnique({
++    where: { id: jobID },
++  });
++
++  if (!job) {
++    return NextResponse.json({ error: 'Job not found' }, { status: 404 });
++  }
++
++  // update job status to request save
++  await prisma.job.update({
++    where: { id: jobID },
++    data: {
++      save: true,
++    },
++  });
++
++  return NextResponse.json(job);
++}
+diff --git a/ui/src/app/api/settings/route.ts b/ui/src/app/api/settings/route.ts
+index 62528cd..26c1e43 100644
+--- a/ui/src/app/api/settings/route.ts
++++ b/ui/src/app/api/settings/route.ts
+@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
+ import { PrismaClient } from '@prisma/client';
+ import { defaultTrainFolder, defaultDatasetsFolder } from '@/paths';
+ import { flushCache } from '@/server/settings';
++import fs from 'fs';
++import path from 'path';
+ 
+ const prisma = new PrismaClient();
+ 
+@@ -20,6 +22,21 @@ export async function GET() {
+     if (!settingsObject.DATASETS_FOLDER || settingsObject.DATASETS_FOLDER === '') {
+       settingsObject.DATASETS_FOLDER = defaultDatasetsFolder;
+     }
++
++    // Read version from version.py in root
++    let version = 'unknown';
++    try {
++      const versionPath = path.join(process.cwd(), '..', 'version.py');
++      const versionContent = fs.readFileSync(versionPath, 'utf8');
++      const match = versionContent.match(/VERSION = ["']([^"']+)["']/);
++      if (match) {
++        version = match[1];
++      }
++    } catch (e) {
++      console.error('Error reading version.py:', e);
++    }
++    settingsObject.VERSION = version;
++
+     return NextResponse.json(settingsObject);
+   } catch (error) {
+     return NextResponse.json({ error: 'Failed to fetch settings' }, { status: 500 });
+diff --git a/ui/src/app/datasets/[datasetName]/page.tsx b/ui/src/app/datasets/[datasetName]/page.tsx
+index dcba473..110d4c9 100644
+--- a/ui/src/app/datasets/[datasetName]/page.tsx
++++ b/ui/src/app/datasets/[datasetName]/page.tsx
+@@ -1,7 +1,7 @@
+ 'use client';
+ 
+-import { useEffect, useState, use, useMemo } from 'react';
+-import { LuImageOff, LuLoader, LuBan } from 'react-icons/lu';
++import { useEffect, useState, use, useMemo, useRef } from 'react';
++import { LuImageOff, LuLoader, LuBan, LuSearch } from 'react-icons/lu';
+ import { FaChevronLeft } from 'react-icons/fa';
+ import DatasetImageCard from '@/components/DatasetImageCard';
+ import { Button } from '@headlessui/react';
+@@ -9,12 +9,47 @@ import AddImagesModal, { openImagesModal } from '@/components/AddImagesModal';
+ import { TopBar, MainContent } from '@/components/layout';
+ import { apiClient } from '@/utils/api';
+ import FullscreenDropOverlay from '@/components/FullscreenDropOverlay';
++import { Modal } from '@/components/Modal';
++import { FloatingWindow } from '@/components/FloatingWindow';
++import { TextInput, Checkbox } from '@/components/formInputs';
++import classNames from 'classnames';
+ 
+ export default function DatasetPage({ params }: { params: { datasetName: string } }) {
+-  const [imgList, setImgList] = useState<{ img_path: string }[]>([]);
++  const [imgList, setImgList] = useState<{ img_path: string; caption: string }[]>([]);
+   const usableParams = use(params as any) as { datasetName: string };
+   const datasetName = usableParams.datasetName;
+   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
++  const [filter, setFilter] = useState('');
++  const [filterHistory, setFilterHistory] = useState<string[]>([]);
++  const [showHistory, setShowHistory] = useState(false);
++  const [isFindReplaceOpen, setIsFindReplaceOpen] = useState(false);
++  const [findText, setFindText] = useState('');
++  const [replaceText, setReplaceText] = useState('');
++  const [wholeWord, setWholeWord] = useState(false);
++  const [matchCase, setMatchCase] = useState(false);
++  const [findNextIndex, setFindNextIndex] = useState(-1);
++  const findInputRef = useRef<HTMLInputElement>(null);
++
++  useEffect(() => {
++    const savedHistory = localStorage.getItem('filterHistory');
++    if (savedHistory) {
++      try {
++        setFilterHistory(JSON.parse(savedHistory));
++      } catch (e) {
++        console.error('Error parsing filter history:', e);
++      }
++    }
++  }, []);
++
++  const addToHistory = (value: string) => {
++    const trimmed = value.trim();
++    if (!trimmed) return;
++    setFilterHistory(prev => {
++      const newHistory = [trimmed, ...prev.filter(item => item !== trimmed)].slice(0, 10);
++      localStorage.setItem('filterHistory', JSON.stringify(newHistory));
++      return newHistory;
++    });
++  };
+ 
+   const refreshImageList = (dbName: string) => {
+     setStatus('loading');
+@@ -34,12 +69,225 @@ export default function DatasetPage({ params }: { params: { datasetName: string
+         setStatus('error');
+       });
+   };
++
++  const { captionCount, totalCount } = useMemo(() => {
++    return {
++      captionCount: imgList.filter(img => img.caption && img.caption.trim().length > 0).length,
++      totalCount: imgList.length,
++    };
++  }, [imgList]);
++
++  const filteredImgList = useMemo(() => {
++    if (!filter) return imgList;
++
++    const lowerFilter = filter.toLowerCase();
++
++    // Helper to escape regex special characters
++    const escapeRegExp = (string: string) => {
++      return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++    };
++
++    const matchesTerm = (caption: string, term: string) => {
++      term = term.trim();
++      if (!term) return true;
++
++      // Check if term is quoted
++      if (term.startsWith('"') && term.endsWith('"')) {
++        const exactTerm = term.slice(1, -1);
++        if (!exactTerm) return true;
++        // Whole word search using regex with word boundaries
++        // Ensure we support Unicode word boundaries if needed, 
++        // but for "he" standard \b should work unless there are punctuation issues
++        const regex = new RegExp(`(^|[^a-zA-Z0-9_])${escapeRegExp(exactTerm)}([^a-zA-Z0-9_]|$)`, 'i');
++        return regex.test(caption);
++      }
++
++      // Default partial match
++      return caption.toLowerCase().includes(term.toLowerCase());
++    };
++
++    // Function to split by operator while respecting quotes
++    const splitByOperator = (input: string, operator: 'and' | 'or') => {
++      const regex = new RegExp(`\\s+${operator}\\s+`, 'gi');
++      const parts: string[] = [];
++      let lastIndex = 0;
++      let match;
++
++      while ((match = regex.exec(input)) !== null) {
++        const part = input.slice(lastIndex, match.index).trim();
++        // Only split if we're not inside quotes
++        const quoteCount = (part.match(/"/g) || []).length;
++        if (quoteCount % 2 === 0) {
++          parts.push(part);
++          lastIndex = regex.lastIndex;
++        }
++      }
++      parts.push(input.slice(lastIndex).trim());
++      return parts.filter(p => p !== '');
++    };
++
++    // support OR and AND
++    // if there is an OR, split by OR and check if any part matches
++    const orParts = splitByOperator(filter, 'or');
++    if (orParts.length > 1) {
++      return imgList.filter(img => {
++        const caption = img.caption || '';
++        return orParts.some(part => {
++          // even in OR parts, there might be ANDs
++          const andParts = splitByOperator(part, 'and');
++          if (andParts.length > 1) {
++            return andParts.every(subPart => matchesTerm(caption, subPart));
++          }
++          return matchesTerm(caption, part);
++        });
++      });
++    }
++
++    // if there is an AND, split by AND and check if all parts match
++    const andParts = splitByOperator(filter, 'and');
++    if (andParts.length > 1) {
++      return imgList.filter(img => {
++        const caption = img.caption || '';
++        return andParts.every(part => matchesTerm(caption, part));
++      });
++    }
++
++    // default simple search
++    return imgList.filter(img => matchesTerm(img.caption || '', filter));
++  }, [imgList, filter]);
+   useEffect(() => {
+     if (datasetName) {
+       refreshImageList(datasetName);
+     }
+   }, [datasetName]);
+ 
++  const escapeRegExp = (string: string) => {
++    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++  };
++
++  const getSearchRegex = (text: string, isWholeWord: boolean, isMatchCase: boolean, global: boolean = false) => {
++    if (!text) return null;
++    let pattern = escapeRegExp(text);
++    if (isWholeWord) {
++      pattern = `(^|[^a-zA-Z0-9_])${pattern}([^a-zA-Z0-9_]|$)`;
++    }
++    return new RegExp(pattern, (isMatchCase ? '' : 'i') + (global ? 'g' : ''));
++  };
++
++  const handleFind = (startIndex: number = 0, isNext: boolean = false) => {
++    if (!findText) return;
++
++    const regex = getSearchRegex(findText, wholeWord, matchCase);
++    if (!regex) return;
++
++    let searchIdx = isNext ? (findNextIndex + 1) % imgList.length : startIndex;
++    let found = false;
++
++    // Search from searchIdx to end
++    for (let i = 0; i < imgList.length; i++) {
++      const idx = (searchIdx + i) % imgList.length;
++      if (regex.test(imgList[idx].caption || '')) {
++        setFindNextIndex(idx);
++        found = true;
++        // Scroll to the image
++        const element = document.getElementById(`image-card-${idx}`);
++        if (element) {
++          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
++        }
++        break;
++      }
++    }
++
++    if (!found && isNext) {
++      // If not found and we were looking for next, maybe we are already at the only match
++      // or no matches at all.
++    }
++  };
++
++  const handleReplace = (moveNext: boolean = false) => {
++    if (findNextIndex === -1 || !findText) return;
++
++    const currentImg = imgList[findNextIndex];
++    const regex = getSearchRegex(findText, wholeWord, matchCase, true); // Replace all in this caption
++    if (!regex) return;
++
++    const oldCaption = currentImg.caption || '';
++    let newCaption = oldCaption;
++
++    if (wholeWord) {
++      // For whole word replacement with regex that has captures, we need to be careful
++      // to preserve the boundaries.
++      newCaption = oldCaption.replace(regex, (match, p1, p2) => {
++        // match might include boundaries if wholeWord is true
++        // My pattern for wholeWord: (^|[^a-zA-Z0-9_])PATTERN([^a-zA-Z0-9_]|$)
++        return (p1 || '') + replaceText + (p2 || '');
++      });
++    } else {
++      newCaption = oldCaption.replace(regex, replaceText);
++    }
++
++    if (newCaption !== oldCaption) {
++      // Save to backend
++      apiClient
++        .post('/api/img/caption', { imgPath: currentImg.img_path, caption: newCaption })
++        .then(() => {
++          setImgList(prev =>
++            prev.map((item, idx) => (idx === findNextIndex ? { ...item, caption: newCaption } : item)),
++          );
++        })
++        .catch(err => console.error('Error replacing caption:', err));
++    }
++
++    if (moveNext) {
++      handleFind(findNextIndex + 1, true);
++    }
++  };
++
++  const handleReplaceAll = () => {
++    if (!findText) return;
++
++    const regex = getSearchRegex(findText, wholeWord, matchCase, true);
++    if (!regex) return;
++
++    const updates: { img_path: string; caption: string }[] = [];
++    const newList = imgList.map(img => {
++      const oldCaption = img.caption || '';
++      let newCaption = oldCaption;
++
++      if (wholeWord) {
++        newCaption = oldCaption.replace(regex, (match, p1, p2) => {
++          return (p1 || '') + replaceText + (p2 || '');
++        });
++      } else {
++        newCaption = oldCaption.replace(regex, replaceText);
++      }
++
++      if (newCaption !== oldCaption) {
++        updates.push({ img_path: img.img_path, caption: newCaption });
++        return { ...img, caption: newCaption };
++      }
++      return img;
++    });
++
++    if (updates.length === 0) return;
++
++    // Send all updates to backend
++    // Assuming backend can handle multiple or we do them in sequence
++    // For now, let's do them in sequence or check if there's a bulk API
++    // Since there isn't a known bulk API, we'll do them one by one but update UI immediately
++    setImgList(newList);
++
++    Promise.all(
++      updates.map(update =>
++        apiClient.post('/api/img/caption', { imgPath: update.img_path, caption: update.caption }),
++      ),
++    ).catch(err => {
++      console.error('Error during replace all:', err);
++      // Optional: refresh list if something failed to be sure UI is in sync
++      refreshImageList(datasetName);
++    });
++  };
++
+   const PageInfoContent = useMemo(() => {
+     let icon = null;
+     let text = '';
+@@ -77,6 +325,16 @@ export default function DatasetPage({ params }: { params: { datasetName: string
+       iconColor = 'text-gray-500 dark:text-gray-400';
+     }
+ 
++    if (status == 'success' && imgList.length > 0 && filteredImgList.length === 0) {
++      icon = <LuImageOff className="w-8 h-8" />;
++      text = 'No Matches';
++      subtitle = `No images match your filter: "${filter}"`;
++      showIt = true;
++      bgColor = 'bg-gray-50 dark:bg-gray-800/50';
++      textColor = 'text-gray-900 dark:text-gray-100';
++      iconColor = 'text-gray-500 dark:text-gray-400';
++    }
++
+     if (!showIt) return null;
+ 
+     return (
+@@ -88,7 +346,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string
+         <p className="text-sm opacity-75 leading-relaxed">{subtitle}</p>
+       </div>
+     );
+-  }, [status, imgList.length]);
++  }, [status, imgList.length, filteredImgList.length, filter]);
+ 
+   return (
+     <>
+@@ -102,7 +360,57 @@ export default function DatasetPage({ params }: { params: { datasetName: string
+         <div>
+           <h1 className="text-lg">Dataset: {datasetName}</h1>
+         </div>
++        <div className="flex-1 max-w-xl mx-4 relative">
++          <input
++            type="text"
++            className="w-full bg-slate-800 border border-slate-700 rounded-md px-3 py-1 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-slate-500"
++            placeholder="Filter by caption (supports AND, OR)..."
++            value={filter}
++            onChange={e => setFilter(e.target.value)}
++            onFocus={() => setShowHistory(true)}
++            onBlur={() => {
++              // Delay hiding to allow clicking on history items
++              setTimeout(() => setShowHistory(false), 200);
++              addToHistory(filter);
++            }}
++            onKeyDown={e => {
++              if (e.key === 'Enter') {
++                addToHistory(filter);
++                (e.target as HTMLInputElement).blur();
++              }
++            }}
++          />
++          {showHistory && filterHistory.length > 0 && (
++            <div className="absolute top-full left-0 w-full mt-1 bg-slate-800 border border-slate-700 rounded-md shadow-lg z-50 max-h-60 overflow-y-auto">
++              {filterHistory.map((item, index) => (
++                <div
++                  key={index}
++                  className="px-3 py-2 text-sm text-gray-200 hover:bg-slate-700 cursor-pointer"
++                  onClick={() => {
++                    setFilter(item);
++                    setShowHistory(false);
++                  }}
++                >
++                  {item}
++                </div>
++              ))}
++            </div>
++          )}
++        </div>
++        <div>
++          <Button
++            className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md mr-2 flex items-center gap-2"
++            onClick={() => setIsFindReplaceOpen(true)}
++          >
++            <LuSearch size={16} /> Find/Replace
++          </Button>
++        </div>
+         <div className="flex-1"></div>
++        {status === 'success' && totalCount > 0 && (
++          <div className="text-sm text-gray-400 mr-4">
++            Caption count: {captionCount}/{totalCount}
++          </div>
++        )}
+         <div>
+           <Button
+             className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md"
+@@ -114,16 +422,30 @@ export default function DatasetPage({ params }: { params: { datasetName: string
+       </TopBar>
+       <MainContent>
+         {PageInfoContent}
+-        {status === 'success' && imgList.length > 0 && (
++        {status === 'success' && filteredImgList.length > 0 && (
+           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+-            {imgList.map(img => (
+-              <DatasetImageCard
+-                key={img.img_path}
+-                alt="image"
+-                imageUrl={img.img_path}
+-                onDelete={() => refreshImageList(datasetName)}
+-              />
+-            ))}
++            {filteredImgList.map((img, index) => {
++              const globalIndex = imgList.findIndex(i => i.img_path === img.img_path);
++              return (
++                <div key={img.img_path} id={`image-card-${globalIndex}`}>
++                  <DatasetImageCard
++                    alt="image"
++                    imageUrl={img.img_path}
++                    className={classNames({
++                      'ring-4 ring-blue-500 rounded-lg': globalIndex === findNextIndex,
++                    })}
++                    isHighlighted={globalIndex === findNextIndex}
++                    onDelete={() => refreshImageList(datasetName)}
++                    onCaptionSave={(newCaption, imgPath) => {
++                      setImgList(prev =>
++                        prev.map(item => (item.img_path === imgPath ? { ...item, caption: newCaption } : item)),
++                      );
++                    }}
++                    initialCaption={img.caption}
++                  />
++                </div>
++              );
++            })}
+           </div>
+         )}
+       </MainContent>
+@@ -132,6 +454,64 @@ export default function DatasetPage({ params }: { params: { datasetName: string
+         datasetName={datasetName}
+         onComplete={() => refreshImageList(datasetName)}
+       />
++
++      <FloatingWindow
++        isOpen={isFindReplaceOpen}
++        onClose={() => setIsFindReplaceOpen(false)}
++        title="Find and Replace"
++      >
++        <div className="space-y-4">
++          <TextInput
++            label="Find"
++            value={findText}
++            onChange={setFindText}
++            placeholder="Text to find..."
++            ref={findInputRef}
++          />
++          <TextInput
++            label="Replace"
++            value={replaceText}
++            onChange={setReplaceText}
++            placeholder="Replacement text..."
++          />
++
++          <div className="flex gap-4">
++            <Checkbox label="Whole Word" checked={wholeWord} onChange={setWholeWord} />
++            <Checkbox label="Match Case" checked={matchCase} onChange={setMatchCase} />
++          </div>
++
++          <div className="flex flex-wrap gap-2 pt-4">
++            <Button
++              className="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded-md transition-colors"
++              onClick={() => handleFind(0)}
++            >
++              Find
++            </Button>
++            <Button
++              className="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded-md transition-colors"
++              onClick={() => handleFind(findNextIndex, true)}
++            >
++              Find Next
++            </Button>
++            {replaceText !== '' && (
++              <>
++                <Button
++                  className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-md transition-colors"
++                  onClick={() => handleReplace(true)}
++                >
++                  Replace
++                </Button>
++                <Button
++                  className="bg-blue-700 hover:bg-blue-600 text-white px-4 py-2 rounded-md transition-colors"
++                  onClick={() => handleReplaceAll()}
++                >
++                  Replace All
++                </Button>
++              </>
++            )}
++          </div>
++        </div>
++      </FloatingWindow>
+     </>
+   );
+ }
+diff --git a/ui/src/app/globals.css b/ui/src/app/globals.css
+index 890dc5b..8764b5e 100644
+--- a/ui/src/app/globals.css
++++ b/ui/src/app/globals.css
+@@ -66,6 +66,10 @@ body {
+   .aitk-react-select-container .aitk-react-select__placeholder {
+     @apply text-sm text-neutral-200;
+   }
++
++  .fill-height {
++      height: 85vh;
++  }
+ }
+ 
+ 
+diff --git a/ui/src/app/jobs/[jobID]/page.tsx b/ui/src/app/jobs/[jobID]/page.tsx
+index e50acea..789d4b2 100644
+--- a/ui/src/app/jobs/[jobID]/page.tsx
++++ b/ui/src/app/jobs/[jobID]/page.tsx
+@@ -5,6 +5,8 @@ import { FaChevronLeft } from 'react-icons/fa';
+ import { Button } from '@headlessui/react';
+ import { TopBar, MainContent } from '@/components/layout';
+ import useJob from '@/hooks/useJob';
++import useJobsList from '@/hooks/useJobsList';
++import useSampleImages from '@/hooks/useSampleImages';
+ import SampleImages, { SampleImagesMenu } from '@/components/SampleImages';
+ import JobOverview from '@/components/JobOverview';
+ import { redirect } from 'next/navigation';
+@@ -19,7 +21,7 @@ interface Page {
+   name: string;
+   value: PageKey;
+   component: React.ComponentType<{ job: Job }>;
+-  menuItem?: React.ComponentType<{ job?: Job | null }> | null;
++  menuItem?: React.ComponentType<{ job: Job; onRefresh?: () => void }> | null;
+   mainCss?: string;
+ }
+ 
+@@ -55,8 +57,13 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
+   const usableParams = use(params as any) as { jobID: string };
+   const jobID = usableParams.jobID;
+   const { job, status, refreshJob } = useJob(jobID, 5000);
++  const { jobs } = useJobsList(true, 5000); // Only active jobs
++  const { sampleImages } = useSampleImages(jobID, 5000);
+   const [pageKey, setPageKey] = useState<PageKey>('overview');
+ 
++  const isAnyJobRunning = jobs.some(j => j.status === 'running');
++  const hasSamples = sampleImages.length > 0;
++
+   const page = pages.find(p => p.value === pageKey);
+ 
+   return (
+@@ -81,6 +88,8 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
+               redirect('/jobs');
+             }}
+             autoStartQueue={true}
++            isAnyJobRunning={isAnyJobRunning}
++            hasSamples={hasSamples}
+           />
+         )}
+       </TopBar>
+@@ -106,10 +115,10 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
+             {page.name}
+           </Button>
+         ))}
+-        {page?.menuItem && (
++        {page?.menuItem && job && (
+           <>
+             <div className="flex-grow"></div>
+-            <page.menuItem job={job} />
++            <page.menuItem job={job} onRefresh={refreshJob} hasSamples={hasSamples} isAnyJobRunning={isAnyJobRunning} />
+           </>
+         )}
+       </div>
+diff --git a/ui/src/app/jobs/[jobID]/save/route.ts b/ui/src/app/jobs/[jobID]/save/route.ts
+new file mode 100644
+index 0000000..a14b721
+--- /dev/null
++++ b/ui/src/app/jobs/[jobID]/save/route.ts
+@@ -0,0 +1,26 @@
++import { NextRequest, NextResponse } from 'next/server';
++import { PrismaClient } from '@prisma/client';
++
++const prisma = new PrismaClient();
++
++export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
++  const { jobID } = await params;
++
++  const job = await prisma.job.findUnique({
++    where: { id: jobID },
++  });
++
++  if (!job) {
++    return NextResponse.json({ error: 'Job not found' }, { status: 404 });
++  }
++
++  // update job status to request save
++  await prisma.job.update({
++    where: { id: jobID },
++    data: {
++      save: true,
++    },
++  });
++
++  return NextResponse.json(job);
++}
+diff --git a/ui/src/app/jobs/new/SimpleJob.tsx b/ui/src/app/jobs/new/SimpleJob.tsx
+index 901a36a..df0b39c 100644
+--- a/ui/src/app/jobs/new/SimpleJob.tsx
++++ b/ui/src/app/jobs/new/SimpleJob.tsx
+@@ -461,6 +461,13 @@ export default function SimpleJob({
+               min={1}
+               required
+             />
++            <FormGroup label="Options">
++              <Checkbox
++                label="Archive Optimizer"
++                checked={jobConfig.config.process[0].save.archive_optimizer || false}
++                onChange={value => setJobConfig(value, 'config.process[0].save.archive_optimizer')}
++              />
++            </FormGroup>
+           </Card>
+         </div>
+         <div>
+@@ -767,7 +774,7 @@ export default function SimpleJob({
+                         label="Target Dataset"
+                         value={dataset.folder_path}
+                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].folder_path`)}
+-                        options={datasetOptions}
++                        options={[{ value: defaultDatasetConfig.folder_path, label: 'Please select...' }, ...datasetOptions]}
+                       />
+                       {modelArch?.additionalSections?.includes('datasets.control_path') && (
+                         <SelectInput
+@@ -778,7 +785,7 @@ export default function SimpleJob({
+                           onChange={value =>
+                             setJobConfig(value == '' ? null : value, `config.process[0].datasets[${i}].control_path`)
+                           }
+-                          options={[{ value: '', label: <>&nbsp;</> }, ...datasetOptions]}
++                          options={[{ value: '', label: 'None' }, ...datasetOptions]}
+                         />
+                       )}
+                       {modelArch?.additionalSections?.includes('datasets.multi_control_paths') && (
+@@ -794,7 +801,7 @@ export default function SimpleJob({
+                                 `config.process[0].datasets[${i}].control_path_1`,
+                               )
+                             }
+-                            options={[{ value: '', label: <>&nbsp;</> }, ...datasetOptions]}
++                            options={[{ value: '', label: 'None' }, ...datasetOptions]}
+                           />
+                           <SelectInput
+                             label="Control Dataset 2"
+@@ -807,7 +814,7 @@ export default function SimpleJob({
+                                 `config.process[0].datasets[${i}].control_path_2`,
+                               )
+                             }
+-                            options={[{ value: '', label: <>&nbsp;</> }, ...datasetOptions]}
++                            options={[{ value: '', label: 'None' }, ...datasetOptions]}
+                           />
+                           <SelectInput
+                             label="Control Dataset 3"
+@@ -820,7 +827,7 @@ export default function SimpleJob({
+                                 `config.process[0].datasets[${i}].control_path_3`,
+                               )
+                             }
+-                            options={[{ value: '', label: <>&nbsp;</> }, ...datasetOptions]}
++                            options={[{ value: '', label: 'None' }, ...datasetOptions]}
+                           />
+                         </>
+                       )}
+diff --git a/ui/src/app/jobs/new/jobConfig.ts b/ui/src/app/jobs/new/jobConfig.ts
+index 66ff196..ebba049 100644
+--- a/ui/src/app/jobs/new/jobConfig.ts
++++ b/ui/src/app/jobs/new/jobConfig.ts
+@@ -58,6 +58,7 @@ export const defaultJobConfig: JobConfig = {
+           max_step_saves_to_keep: 4,
+           save_format: 'diffusers',
+           push_to_hub: false,
++          archive_optimizer: false,
+         },
+         datasets: [defaultDatasetConfig],
+         train: {
+diff --git a/ui/src/app/jobs/page.tsx b/ui/src/app/jobs/page.tsx
+index d34e5bc..3073080 100644
+--- a/ui/src/app/jobs/page.tsx
++++ b/ui/src/app/jobs/page.tsx
+@@ -1,17 +1,28 @@
+ 'use client';
+ 
++import { useState } from 'react';
+ import JobsTable from '@/components/JobsTable';
+ import { TopBar, MainContent } from '@/components/layout';
+ import Link from 'next/link';
+ 
+ export default function Dashboard() {
++  const [filter, setFilter] = useState('');
++
+   return (
+     <>
+       <TopBar>
+         <div>
+           <h1 className="text-lg">Training Queue</h1>
+         </div>
+-        <div className="flex-1"></div>
++        <div className="flex-1 max-w-xl mx-4">
++          <input
++            type="text"
++            className="w-full bg-slate-800 border border-slate-700 rounded-md px-3 py-1 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-slate-500"
++            placeholder="Filter by name or model (supports AND, OR)..."
++            value={filter}
++            onChange={e => setFilter(e.target.value)}
++          />
++        </div>
+         <div>
+           <Link href="/jobs/new" className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md">
+             New Training Job
+@@ -19,7 +30,7 @@ export default function Dashboard() {
+         </div>
+       </TopBar>
+       <MainContent>
+-        <JobsTable />
++        <JobsTable filter={filter} />
+       </MainContent>
+     </>
+   );
+diff --git a/ui/src/components/DatasetImageCard.tsx b/ui/src/components/DatasetImageCard.tsx
+index 5d16f60..5497a21 100644
+--- a/ui/src/components/DatasetImageCard.tsx
++++ b/ui/src/components/DatasetImageCard.tsx
+@@ -12,6 +12,9 @@ interface DatasetImageCardProps {
+   children?: ReactNode;
+   className?: string;
+   onDelete?: () => void;
++  onCaptionSave?: (newCaption: string, imageUrl: string) => void;
++  initialCaption?: string;
++  isHighlighted?: boolean;
+ }
+ 
+ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
+@@ -20,18 +23,28 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
+   children,
+   className = '',
+   onDelete = () => {},
++  onCaptionSave = () => {},
++  initialCaption = '',
++  isHighlighted = false,
+ }) => {
+   const cardRef = useRef<HTMLDivElement>(null);
+   const [isVisible, setIsVisible] = useState<boolean>(false);
+   const [inViewport, setInViewport] = useState<boolean>(false);
+   const [loaded, setLoaded] = useState<boolean>(false);
+-  const [isCaptionLoaded, setIsCaptionLoaded] = useState<boolean>(false);
+-  const [caption, setCaption] = useState<string>('');
+-  const [savedCaption, setSavedCaption] = useState<string>('');
++  const [isCaptionLoaded, setIsCaptionLoaded] = useState<boolean>(!!initialCaption);
++  const [caption, setCaption] = useState<string>(initialCaption);
++  const [savedCaption, setSavedCaption] = useState<string>(initialCaption);
++  const [isEditing, setIsEditing] = useState<boolean>(false);
+   const isGettingCaption = useRef<boolean>(false);
+ 
++  useEffect(() => {
++    setCaption(initialCaption);
++    setSavedCaption(initialCaption);
++    setIsCaptionLoaded(!!initialCaption);
++  }, [initialCaption]);
++
+   const fetchCaption = async () => {
+-    if (isGettingCaption.current || isCaptionLoaded) return;
++    if (isGettingCaption.current || (isCaptionLoaded && caption)) return;
+     isGettingCaption.current = true;
+     apiClient
+       .post(`/api/caption/get`, { imgPath: imageUrl })
+@@ -54,18 +67,24 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
+       });
+   };
+ 
+-  const saveCaption = () => {
+-    const trimmedCaption = caption.trim();
+-    if (trimmedCaption === savedCaption) return;
++  const saveCaption = (valueToSave?: string) => {
++    const targetCaption = (valueToSave !== undefined ? valueToSave : caption).trim();
++    if (targetCaption === savedCaption) return;
++    
++    // update savedCaption immediately to prevent duplicate calls
++    setSavedCaption(targetCaption);
++    
+     apiClient
+-      .post('/api/img/caption', { imgPath: imageUrl, caption: trimmedCaption })
++      .post('/api/img/caption', { imgPath: imageUrl, caption: targetCaption })
+       .then(res => res.data)
+       .then(data => {
+         console.log('Caption saved:', data);
+-        setSavedCaption(trimmedCaption);
++        onCaptionSave(targetCaption, imageUrl);
+       })
+       .catch(error => {
+         console.error('Error saving caption:', error);
++        // revert savedCaption on error to allow retry
++        setSavedCaption(prev => prev === targetCaption ? caption.trim() : prev);
+       });
+   };
+ 
+@@ -117,7 +136,9 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
+     // If Enter is pressed without Shift, prevent default behavior and save
+     if (e.key === 'Enter' && !e.shiftKey) {
+       e.preventDefault();
+-      saveCaption();
++      saveCaption(e.currentTarget.value);
++      setIsEditing(false);
++      (e.target as HTMLTextAreaElement).blur();
+     }
+   };
+ 
+@@ -127,6 +148,8 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
+   const isItAudio = isAudio(imageUrl);
+   const isItImage = !isItAVideo && !isItAudio;
+ 
++  const effectivelyEditing = isEditing || isHighlighted;
++
+   return (
+     <div className={`flex flex-col ${className}`}>
+       {/* Square image container */}
+@@ -206,9 +229,11 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
+         )}
+       </div>
+       <div
+-        className={classNames('w-full p-2 bg-gray-800 text-white text-sm rounded-b-lg h-[75px]', {
++        className={classNames('w-full p-2 bg-gray-800 text-white text-sm rounded-b-lg', {
+           'border-blue-500 border-2': !isCaptionCurrent,
+           'border-transparent border-2': isCaptionCurrent,
++          'h-[75px] overflow-hidden': !effectivelyEditing,
++          'min-h-[75px] z-10': effectivelyEditing,
+         })}
+       >
+         {inViewport && isVisible && isCaptionLoaded && (
+@@ -217,14 +242,19 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
+               e.preventDefault();
+               saveCaption();
+             }}
+-            onBlur={saveCaption}
++            onBlur={e => {
++              saveCaption(e.currentTarget.querySelector('textarea')?.value);
++              setIsEditing(false);
++            }}
+           >
+             <textarea
+               className="w-full bg-transparent resize-none outline-none focus:ring-0 focus:outline-none"
++              style={effectivelyEditing ? { fieldSizing: 'content' } as any : {}}
+               value={caption}
+-              rows={3}
++              rows={effectivelyEditing ? undefined : 3}
+               onChange={e => setCaption(e.target.value)}
+               onKeyDown={handleKeyDown}
++              onFocus={() => setIsEditing(true)}
+             />
+           </form>
+         )}
+diff --git a/ui/src/components/FilesWidget.tsx b/ui/src/components/FilesWidget.tsx
+index b73dabf..82354b0 100644
+--- a/ui/src/components/FilesWidget.tsx
++++ b/ui/src/components/FilesWidget.tsx
+@@ -19,8 +19,8 @@ export default function FilesWidget({ jobID }: { jobID: string }) {
+   };
+ 
+   return (
+-    <div className="col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden hover:shadow-2xl transition-all duration-300 border border-gray-800">
+-      <div className="bg-gray-800 px-4 py-3 flex items-center justify-between">
++    <div className="col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden hover:shadow-2xl transition-all duration-300 border border-gray-800 flex flex-col max-h-[400px]">
++      <div className="bg-gray-800 px-4 py-3 flex items-center justify-between flex-shrink-0">
+         <div className="flex items-center space-x-2">
+           <Brain className="w-5 h-5 text-purple-400" />
+           <h2 className="font-semibold text-gray-100">Checkpoints</h2>
+@@ -28,7 +28,7 @@ export default function FilesWidget({ jobID }: { jobID: string }) {
+         </div>
+       </div>
+ 
+-      <div className="p-2">
++      <div className="p-2 overflow-y-auto flex-grow scrollbar-thin scrollbar-thumb-gray-700 scrollbar-track-transparent">
+         {status === 'loading' && (
+           <div className="flex items-center justify-center py-4">
+             <Loader2 className="w-5 h-5 text-gray-400 animate-spin" />
+@@ -45,7 +45,7 @@ export default function FilesWidget({ jobID }: { jobID: string }) {
+         {['success', 'refreshing'].includes(status) && (
+           <div className="space-y-1">
+             {files.map((file, index) => {
+-              const fileName = file.path.split('/').pop() || '';
++              const fileName = (file.path || '').split(/[/\\]/).pop() || '';
+               const nameWithoutExt = fileName.replace('.safetensors', '');
+               return (
+                 <a
+diff --git a/ui/src/components/FloatingWindow.tsx b/ui/src/components/FloatingWindow.tsx
+new file mode 100644
+index 0000000..d61761d
+--- /dev/null
++++ b/ui/src/components/FloatingWindow.tsx
+@@ -0,0 +1,142 @@
++import React, { useEffect, useRef, useState } from 'react';
++
++interface FloatingWindowProps {
++  isOpen: boolean;
++  onClose: () => void;
++  title?: string;
++  children: React.ReactNode;
++  showCloseButton?: boolean;
++  width?: string;
++  initialPosition?: { x: number; y: number };
++}
++
++export const FloatingWindow: React.FC<FloatingWindowProps> = ({
++  isOpen,
++  onClose,
++  title,
++  children,
++  showCloseButton = true,
++  width = 'max-w-md',
++  initialPosition = { x: 20, y: 80 },
++}) => {
++  const [position, setPosition] = useState(initialPosition);
++  const [isDragging, setIsDragging] = useState(false);
++  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
++  const windowRef = useRef<HTMLDivElement>(null);
++
++  useEffect(() => {
++    const handleEscKey = (e: KeyboardEvent) => {
++      if (e.key === 'Escape' && isOpen) {
++        onClose();
++      }
++    };
++
++    if (isOpen) {
++      document.addEventListener('keydown', handleEscKey);
++    }
++
++    return () => {
++      document.removeEventListener('keydown', handleEscKey);
++    };
++  }, [isOpen, onClose]);
++
++  const handleMouseDown = (e: React.MouseEvent) => {
++    if (windowRef.current) {
++      setIsDragging(true);
++      setDragOffset({
++        x: e.clientX - position.x,
++        y: e.clientY - position.y,
++      });
++    }
++  };
++
++  useEffect(() => {
++    const handleMouseMove = (e: MouseEvent) => {
++      if (isDragging && windowRef.current) {
++        const newX = e.clientX - dragOffset.x;
++        const newY = e.clientY - dragOffset.y;
++
++        // Get window dimensions
++        const rect = windowRef.current.getBoundingClientRect();
++        const windowWidth = rect.width;
++        const windowHeight = rect.height;
++
++        // Get viewport dimensions
++        const viewportWidth = window.innerWidth;
++        const viewportHeight = window.innerHeight;
++
++        // Calculate bounded position
++        // Keep at least some part of the header visible (top >= 0)
++        // and prevent the window from being moved completely out of view
++        const boundedX = Math.max(-windowWidth + 50, Math.min(newX, viewportWidth - 50));
++        const boundedY = Math.max(0, Math.min(newY, viewportHeight - 50));
++
++        setPosition({
++          x: boundedX,
++          y: boundedY,
++        });
++      }
++    };
++
++    const handleMouseUp = () => {
++      setIsDragging(false);
++    };
++
++    if (isDragging) {
++      document.addEventListener('mousemove', handleMouseMove);
++      document.addEventListener('mouseup', handleMouseUp);
++    }
++
++    return () => {
++      document.removeEventListener('mousemove', handleMouseMove);
++      document.removeEventListener('mouseup', handleMouseUp);
++    };
++  }, [isDragging, dragOffset]);
++
++  if (!isOpen) return null;
++
++  return (
++    <div
++      ref={windowRef}
++      className={`fixed z-[60] ${width} rounded-lg bg-gray-800 border border-gray-700 shadow-2xl transition-shadow ${
++        isDragging ? 'shadow-blue-900/20' : ''
++      }`}
++      style={{
++        left: `${position.x}px`,
++        top: `${position.y}px`,
++      }}
++    >
++      {/* Window header */}
++      {(title || showCloseButton) && (
++        <div
++          className="flex items-center justify-between rounded-t-lg border-b border-gray-700 bg-gray-850 px-4 py-2 cursor-move select-none"
++          onMouseDown={handleMouseDown}
++        >
++          {title && <h3 className="text-sm font-semibold text-gray-100">{title}</h3>}
++
++          {showCloseButton && (
++            <button
++              type="button"
++              className="ml-auto inline-flex items-center justify-center rounded-md p-1 text-gray-400 hover:bg-gray-700 hover:text-gray-200 focus:outline-none"
++              onClick={onClose}
++              aria-label="Close window"
++            >
++              <svg
++                className="h-4 w-4"
++                xmlns="http://www.w3.org/2000/svg"
++                fill="none"
++                viewBox="0 0 24 24"
++                stroke="currentColor"
++              >
++                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
++              </svg>
++            </button>
++          )}
++        </div>
++      )}
++
++      {/* Window content */}
++      <div className="px-4 py-3">{children}</div>
++    </div>
++  );
++};
+diff --git a/ui/src/components/JobActionBar.tsx b/ui/src/components/JobActionBar.tsx
+index 7917459..10772d1 100644
+--- a/ui/src/components/JobActionBar.tsx
++++ b/ui/src/components/JobActionBar.tsx
+@@ -1,9 +1,17 @@
+ import Link from 'next/link';
+-import { Eye, Trash2, Pen, Play, Pause, Cog, X } from 'lucide-react';
++import { Eye, Trash2, Pen, Play, Pause, Cog, X, Camera, Image } from 'lucide-react';
+ import { Button } from '@headlessui/react';
+ import { openConfirm } from '@/components/ConfirmModal';
+ import { Job } from '@prisma/client';
+-import { startJob, stopJob, deleteJob, getAvaliableJobActions, markJobAsStopped } from '@/utils/jobs';
++import {
++  startJob,
++  stopJob,
++  deleteJob,
++  getAvaliableJobActions,
++  markJobAsStopped,
++  saveJob,
++  sampleJob,
++} from '@/utils/jobs';
+ import { startQueue } from '@/utils/queue';
+ import { Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
+ import { redirect } from 'next/navigation';
+@@ -15,6 +23,8 @@ interface JobActionBarProps {
+   hideView?: boolean;
+   className?: string;
+   autoStartQueue?: boolean;
++  isAnyJobRunning?: boolean;
++  hasSamples?: boolean;
+ }
+ 
+ export default function JobActionBar({
+@@ -24,8 +34,14 @@ export default function JobActionBar({
+   className,
+   hideView,
+   autoStartQueue = false,
++  isAnyJobRunning = false,
++  hasSamples = false,
+ }: JobActionBarProps) {
+-  const { canStart, canStop, canDelete, canEdit, canRemoveFromQueue } = getAvaliableJobActions(job);
++  const { canStart, canStop, canDelete, canEdit, canRemoveFromQueue, canSave, canSample } = getAvaliableJobActions(
++    job,
++    isAnyJobRunning,
++    hasSamples,
++  );
+ 
+   if (!afterDelete) afterDelete = onRefresh;
+ 
+@@ -43,6 +59,7 @@ export default function JobActionBar({
+             if (onRefresh) onRefresh();
+           }}
+           className={`ml-2 opacity-100`}
++          title="Start Job"
+         >
+           <Play />
+         </Button>
+@@ -55,37 +72,71 @@ export default function JobActionBar({
+             if (onRefresh) onRefresh();
+           }}
+           className={`ml-2 opacity-100`}
++          title="Remove from Queue"
+         >
+           <X />
+         </Button>
+       )}
++      {canSave && (
++        <Button
++          onClick={async () => {
++            if (!canSave) return;
++            await saveJob(job.id);
++            if (onRefresh) onRefresh();
++          }}
++          className={`ml-2 opacity-100`}
++          title="Save Snapshot"
++        >
++          <Camera />
++        </Button>
++      )}
++      {canSample && (
++        <Button
++          onClick={async () => {
++            if (!canSample) return;
++            await sampleJob(job.id);
++            if (onRefresh) onRefresh();
++          }}
++          className={`ml-2 opacity-100`}
++          title="Generate Samples Now"
++        >
++          <Image />
++        </Button>
++      )}
+       {canStop && (
+         <Button
+           onClick={() => {
+             if (!canStop) return;
+             openConfirm({
+               title: 'Stop Job',
+-              message: `Are you sure you want to stop the job "${job.name}"? You CAN resume later.`,
++              message: `Are you sure you want to stop the job "${job.name}"? This will save a snapshot and stop. You CAN resume later.`,
+               type: 'info',
+               confirmText: 'Stop',
+               onConfirm: async () => {
++                try {
++                  // Save snapshot before stopping
++                  await saveJob(job.id);
++                } catch (e) {
++                  console.error('Error saving snapshot before stopping:', e);
++                }
+                 await stopJob(job.id);
+                 if (onRefresh) onRefresh();
+               },
+             });
+           }}
+           className={`ml-2 opacity-100`}
++          title="Stop Job"
+         >
+           <Pause />
+         </Button>
+       )}
+       {!hideView && (
+-        <Link href={`/jobs/${job.id}`} className="ml-2 text-gray-200 hover:text-gray-100 inline-block">
++        <Link href={`/jobs/${job.id}`} className="ml-2 text-gray-200 hover:text-gray-100 inline-block" title="View Job Details">
+           <Eye />
+         </Link>
+       )}
+       {canEdit && (
+-        <Link href={`/jobs/new?id=${job.id}`} className="ml-2 hover:text-gray-100 inline-block">
++        <Link href={`/jobs/new?id=${job.id}`} className="ml-2 hover:text-gray-100 inline-block" title="Edit Job Config">
+           <Pen />
+         </Link>
+       )}
+@@ -114,12 +165,13 @@ export default function JobActionBar({
+           });
+         }}
+         className={`ml-2 opacity-100`}
++        title="Delete Job"
+       >
+         <Trash2 />
+       </Button>
+       <div className="border-r border-1 border-gray-700 ml-2 inline"></div>
+       <Menu>
+-        <MenuButton className={'ml-2'}>
++        <MenuButton className={'ml-2'} title="More Actions">
+           <Cog />
+         </MenuButton>
+         <MenuItems anchor="bottom" className="bg-gray-900 border border-gray-700 rounded shadow-lg w-48 px-2 py-2 mt-4">
+diff --git a/ui/src/components/JobOverview.tsx b/ui/src/components/JobOverview.tsx
+index df3c645..d3006f9 100644
+--- a/ui/src/components/JobOverview.tsx
++++ b/ui/src/components/JobOverview.tsx
+@@ -85,7 +85,7 @@ export default function JobOverview({ job }: JobOverviewProps) {
+   return (
+     <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+       {/* Job Information Panel */}
+-      <div className="col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col">
++      <div className="col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col fill-height">
+         <div className="bg-gray-800 px-4 py-3 flex items-center justify-between">
+           <h2 className="text-gray-100">
+             <Info className="w-5 h-5 mr-2 -mt-1 text-amber-400 inline-block" /> {job.info}
+diff --git a/ui/src/components/JobsTable.tsx b/ui/src/components/JobsTable.tsx
+index e7ae398..4942364 100644
+--- a/ui/src/components/JobsTable.tsx
++++ b/ui/src/components/JobsTable.tsx
+@@ -14,18 +14,89 @@ import useGPUInfo from '@/hooks/useGPUInfo';
+ interface JobsTableProps {
+   autoStartQueue?: boolean;
+   onlyActive?: boolean;
++  filter?: string;
+ }
+ 
+-export default function JobsTable({ onlyActive = false }: JobsTableProps) {
++export default function JobsTable({ onlyActive = false, filter = '' }: JobsTableProps) {
+   const { jobs, status, refreshJobs } = useJobsList(onlyActive, 5000);
+   const { queues, status: queueStatus, refreshQueues } = useQueueList();
+   const { gpuList, isGPUInfoLoaded } = useGPUInfo();
+ 
++  const isAnyJobRunning = jobs.some(j => j.status === 'running');
++
+   const refresh = () => {
+     refreshJobs();
+     refreshQueues();
+   };
+ 
++  const filteredJobs = useMemo(() => {
++    if (!filter) return jobs;
++
++    const escapeRegExp = (string: string) => {
++      return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++    };
++
++    const matchesTerm = (job: Job, term: string) => {
++      term = term.trim();
++      if (!term) return true;
++
++      const jobConfig: JobConfig = JSON.parse(job.job_config);
++      const modelName = jobConfig.config.process[0].model.name_or_path || '';
++      const searchableText = `${job.name} ${modelName}`.toLowerCase();
++
++      // Check if term is quoted
++      if (term.startsWith('"') && term.endsWith('"')) {
++        const exactTerm = term.slice(1, -1);
++        if (!exactTerm) return true;
++        const regex = new RegExp(`(^|[^a-zA-Z0-9_])${escapeRegExp(exactTerm)}([^a-zA-Z0-9_]|$)`, 'i');
++        return regex.test(searchableText);
++      }
++
++      // Default partial match
++      return searchableText.includes(term.toLowerCase());
++    };
++
++    const splitByOperator = (input: string, operator: 'and' | 'or') => {
++      const regex = new RegExp(`\\s+${operator}\\s+`, 'gi');
++      const parts: string[] = [];
++      let lastIndex = 0;
++      let match;
++
++      while ((match = regex.exec(input)) !== null) {
++        const part = input.slice(lastIndex, match.index).trim();
++        const quoteCount = (part.match(/"/g) || []).length;
++        if (quoteCount % 2 === 0) {
++          parts.push(part);
++          lastIndex = regex.lastIndex;
++        }
++      }
++      parts.push(input.slice(lastIndex).trim());
++      return parts.filter(p => p !== '');
++    };
++
++    const orParts = splitByOperator(filter, 'or');
++    if (orParts.length > 1) {
++      return jobs.filter(job => {
++        return orParts.some(part => {
++          const andParts = splitByOperator(part, 'and');
++          if (andParts.length > 1) {
++            return andParts.every(subPart => matchesTerm(job, subPart));
++          }
++          return matchesTerm(job, part);
++        });
++      });
++    }
++
++    const andParts = splitByOperator(filter, 'and');
++    if (andParts.length > 1) {
++      return jobs.filter(job => {
++        return andParts.every(part => matchesTerm(job, part));
++      });
++    }
++
++    return jobs.filter(job => matchesTerm(job, filter));
++  }, [jobs, filter]);
++
+   const columns: TableColumn[] = [
+     {
+       title: 'Name',
+@@ -87,20 +158,27 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
+       key: 'actions',
+       className: 'text-right',
+       render: row => {
+-        return <JobActionBar job={row} onRefresh={refreshJobs} autoStartQueue={false} />;
++        return (
++          <JobActionBar
++            job={row}
++            onRefresh={refreshJobs}
++            autoStartQueue={false}
++            isAnyJobRunning={isAnyJobRunning}
++          />
++        );
+       },
+     },
+   ];
+ 
+   const jobsDict = useMemo(() => {
+     if (!isGPUInfoLoaded) return {};
+-    if (jobs.length === 0) return {};
++    if (filteredJobs.length === 0) return {};
+     let jd: { [key: string]: { name: string; jobs: Job[] } } = {};
+     gpuList.forEach(gpu => {
+       jd[`${gpu.index}`] = { name: `${gpu.name}`, jobs: [] };
+     });
+     jd['Idle'] = { name: 'Idle', jobs: [] };
+-    jobs.forEach(job => {
++    filteredJobs.forEach(job => {
+       const gpu = gpuList.find(gpu => job.gpu_ids?.split(',').includes(gpu.index.toString())) as GpuInfo;
+       const key = `${gpu?.index || '0'}`;
+       if (['queued', 'running', 'stopping'].includes(job.status) && key in jd) {
+@@ -125,7 +203,7 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
+       }
+     });
+     return jd;
+-  }, [jobs, queues, isGPUInfoLoaded]);
++  }, [filteredJobs, queues, isGPUInfoLoaded]);
+ 
+   let isLoading = status === 'loading' || queueStatus === 'loading' || !isGPUInfoLoaded;
+ 
+diff --git a/ui/src/components/SampleImages.tsx b/ui/src/components/SampleImages.tsx
+index a587e75..1758da8 100644
+--- a/ui/src/components/SampleImages.tsx
++++ b/ui/src/components/SampleImages.tsx
+@@ -3,20 +3,25 @@ import useSampleImages from '@/hooks/useSampleImages';
+ import SampleImageCard from './SampleImageCard';
+ import { Job } from '@prisma/client';
+ import { JobConfig } from '@/types';
+-import { LuImageOff, LuLoader, LuBan } from 'react-icons/lu';
++import { LuImageOff, LuLoader, LuBan, LuCamera } from 'react-icons/lu';
+ import { Button } from '@headlessui/react';
+ import { FaDownload } from 'react-icons/fa';
+ import { apiClient } from '@/utils/api';
+ import classNames from 'classnames';
+ import { FaCaretDown, FaCaretUp } from 'react-icons/fa';
+ import SampleImageViewer from './SampleImageViewer';
++import { getAvaliableJobActions, sampleJob } from '@/utils/jobs';
+ 
+ interface SampleImagesMenuProps {
+-  job?: Job | null;
++  job: Job;
++  onRefresh?: () => void;
++  hasSamples?: boolean;
++  isAnyJobRunning?: boolean;
+ }
+ 
+-export const SampleImagesMenu = ({ job }: SampleImagesMenuProps) => {
++export const SampleImagesMenu = ({ job, onRefresh, hasSamples, isAnyJobRunning }: SampleImagesMenuProps) => {
+   const [isZipping, setIsZipping] = useState(false);
++  const { canSample } = getAvaliableJobActions(job, isAnyJobRunning, hasSamples);
+ 
+   const downloadZip = async () => {
+     if (isZipping) return;
+@@ -46,19 +51,34 @@ export const SampleImagesMenu = ({ job }: SampleImagesMenuProps) => {
+     }
+   };
+   return (
+-    <Button
+-      onClick={downloadZip}
+-      className={classNames(`px-4 py-1 h-8 hover:bg-gray-200 dark:hover:bg-gray-700`, {
+-        'opacity-50 cursor-not-allowed': isZipping,
+-      })}
+-    >
+-      {isZipping ? (
+-        <LuLoader className="animate-spin inline-block mr-2" />
+-      ) : (
+-        <FaDownload className="inline-block mr-2" />
++    <div className="flex items-center">
++      {canSample && (
++        <Button
++          onClick={async () => {
++            if (!canSample) return;
++            await sampleJob(job.id);
++            if (onRefresh) onRefresh();
++          }}
++          className={classNames(`px-4 py-1 h-8 hover:bg-gray-200 dark:hover:bg-gray-700 mr-2`)}
++        >
++          <LuCamera className="inline-block mr-2" />
++          Generate Samples Now
++        </Button>
+       )}
+-      {isZipping ? 'Preparing' : 'Download'}
+-    </Button>
++      <Button
++        onClick={downloadZip}
++        className={classNames(`px-4 py-1 h-8 hover:bg-gray-200 dark:hover:bg-gray-700`, {
++          'opacity-50 cursor-not-allowed': isZipping,
++        })}
++      >
++        {isZipping ? (
++          <LuLoader className="animate-spin inline-block mr-2" />
++        ) : (
++          <FaDownload className="inline-block mr-2" />
++        )}
++        {isZipping ? 'Preparing' : 'Download'}
++      </Button>
++    </div>
+   );
+ };
+ 
+diff --git a/ui/src/components/Sidebar.tsx b/ui/src/components/Sidebar.tsx
+index ca6a21c..10df935 100644
+--- a/ui/src/components/Sidebar.tsx
++++ b/ui/src/components/Sidebar.tsx
+@@ -1,8 +1,10 @@
+ import Link from 'next/link';
+ import { Home, Settings, BrainCircuit, Images, Plus } from 'lucide-react';
+ import { FaXTwitter, FaDiscord, FaYoutube } from 'react-icons/fa6';
++import useSettings from '@/hooks/useSettings';
+ 
+ const Sidebar = () => {
++  const { settings } = useSettings();
+   const navigation = [
+     { name: 'Dashboard', href: '/dashboard', icon: Home },
+     { name: 'New Job', href: '/jobs/new', icon: Plus },
+@@ -39,40 +41,45 @@ const Sidebar = () => {
+           ))}
+         </ul>
+       </nav>
+-      <a
+-        href="https://ostris.com/support"
+-        target="_blank"
+-        rel="noreferrer"
+-        className="flex items-center space-x-2 px-4 py-3"
+-      >
+-        <div className="min-w-[26px] min-h-[26px]">
+-          <svg height="24" version="1.1" width="24" xmlns="http://www.w3.org/2000/svg">
+-            <g transform="translate(0 -1028.4)">
+-              <path
+-                d="m7 1031.4c-1.5355 0-3.0784 0.5-4.25 1.7-2.3431 2.4-2.2788 6.1 0 8.5l9.25 9.8 9.25-9.8c2.279-2.4 2.343-6.1 0-8.5-2.343-2.3-6.157-2.3-8.5 0l-0.75 0.8-0.75-0.8c-1.172-1.2-2.7145-1.7-4.25-1.7z"
+-                fill="#c0392b"
+-              />
+-            </g>
+-          </svg>
++      <div className="mt-auto">
++        <div className="px-4 py-2 text-[10px] text-gray-600 uppercase tracking-widest border-t border-gray-800/50">
++          v{settings.VERSION}
+         </div>
+-        <div className="uppercase text-gray-500 text-sm mb-2 flex-1 pt-2 pl-0">Support AI-Toolkit</div>
+-      </a>
++        <a
++          href="https://ostris.com/support"
++          target="_blank"
++          rel="noreferrer"
++          className="flex items-center space-x-2 px-4 py-3"
++        >
++          <div className="min-w-[26px] min-h-[26px]">
++            <svg height="24" version="1.1" width="24" xmlns="http://www.w3.org/2000/svg">
++              <g transform="translate(0 -1028.4)">
++                <path
++                  d="m7 1031.4c-1.5355 0-3.0784 0.5-4.25 1.7-2.3431 2.4-2.2788 6.1 0 8.5l9.25 9.8 9.25-9.8c2.279-2.4 2.343-6.1 0-8.5-2.343-2.3-6.157-2.3-8.5 0l-0.75 0.8-0.75-0.8c-1.172-1.2-2.7145-1.7-4.25-1.7z"
++                  fill="#c0392b"
++                />
++              </g>
++            </svg>
++          </div>
++          <div className="uppercase text-gray-500 text-sm mb-2 flex-1 pt-2 pl-0">Support AI-Toolkit</div>
++        </a>
+ 
+-      {/* Social links grid */}
+-      <div className="px-1 py-1 border-t border-gray-800">
+-        <div className="grid grid-cols-3 gap-4">
+-          <a href="https://discord.gg/VXmU2f5WEU" target="_blank" rel="noreferrer" className={socialsBoxClass}>
+-            <FaDiscord className={socialIconClass} />
+-            {/* <span className="text-xs text-gray-500 mt-1">Discord</span> */}
+-          </a>
+-          <a href="https://www.youtube.com/@ostrisai" target="_blank" rel="noreferrer" className={socialsBoxClass}>
+-            <FaYoutube className={socialIconClass} />
+-            {/* <span className="text-xs text-gray-500 mt-1">YouTube</span> */}
+-          </a>
+-          <a href="https://x.com/ostrisai" target="_blank" rel="noreferrer" className={socialsBoxClass}>
+-            <FaXTwitter className={socialIconClass} />
+-            {/* <span className="text-xs text-gray-500 mt-1">X</span> */}
+-          </a>
++        {/* Social links grid */}
++        <div className="px-1 py-1 border-t border-gray-800">
++          <div className="grid grid-cols-3 gap-4">
++            <a href="https://discord.gg/VXmU2f5WEU" target="_blank" rel="noreferrer" className={socialsBoxClass}>
++              <FaDiscord className={socialIconClass} />
++              {/* <span className="text-xs text-gray-500 mt-1">Discord</span> */}
++            </a>
++            <a href="https://www.youtube.com/@ostrisai" target="_blank" rel="noreferrer" className={socialsBoxClass}>
++              <FaYoutube className={socialIconClass} />
++              {/* <span className="text-xs text-gray-500 mt-1">YouTube</span> */}
++            </a>
++            <a href="https://x.com/ostrisai" target="_blank" rel="noreferrer" className={socialsBoxClass}>
++              <FaXTwitter className={socialIconClass} />
++              {/* <span className="text-xs text-gray-500 mt-1">X</span> */}
++            </a>
++          </div>
+         </div>
+       </div>
+     </div>
+diff --git a/ui/src/hooks/useSettings.tsx b/ui/src/hooks/useSettings.tsx
+index 35fcc53..0fc9912 100644
+--- a/ui/src/hooks/useSettings.tsx
++++ b/ui/src/hooks/useSettings.tsx
+@@ -7,6 +7,7 @@ export interface Settings {
+   HF_TOKEN: string;
+   TRAINING_FOLDER: string;
+   DATASETS_FOLDER: string;
++  VERSION: string;
+ }
+ 
+ export default function useSettings() {
+@@ -14,6 +15,7 @@ export default function useSettings() {
+     HF_TOKEN: '',
+     TRAINING_FOLDER: '',
+     DATASETS_FOLDER: '',
++    VERSION: '',
+   });
+   const [isSettingsLoaded, setIsLoaded] = useState(false);
+   useEffect(() => {
+@@ -26,6 +28,7 @@ export default function useSettings() {
+           HF_TOKEN: data.HF_TOKEN || '',
+           TRAINING_FOLDER: data.TRAINING_FOLDER || '',
+           DATASETS_FOLDER: data.DATASETS_FOLDER || '',
++          VERSION: data.VERSION || '',
+         });
+         setIsLoaded(true);
+       })
+diff --git a/ui/src/types.ts b/ui/src/types.ts
+index a22fe91..5f31dab 100644
+--- a/ui/src/types.ts
++++ b/ui/src/types.ts
+@@ -78,6 +78,7 @@ export interface SaveConfig {
+   max_step_saves_to_keep: number;
+   save_format: string;
+   push_to_hub: boolean;
++  archive_optimizer?: boolean;
+ }
+ 
+ export interface DatasetConfig {
+diff --git a/ui/src/utils/jobs.ts b/ui/src/utils/jobs.ts
+index 8e48545..da648d1 100644
+--- a/ui/src/utils/jobs.ts
++++ b/ui/src/utils/jobs.ts
+@@ -34,6 +34,38 @@ export const stopJob = (jobID: string) => {
+   });
+ };
+ 
++export const saveJob = (jobID: string) => {
++  return new Promise<void>((resolve, reject) => {
++    apiClient
++      .get(`/api/jobs/${jobID}/save`)
++      .then(res => res.data)
++      .then(data => {
++        console.log('Job save requested:', data);
++        resolve();
++      })
++      .catch(error => {
++        console.error('Error requesting job save:', error);
++        reject(error);
++      });
++  });
++};
++
++export const sampleJob = (jobID: string) => {
++  return new Promise<void>((resolve, reject) => {
++    apiClient
++      .get(`/api/jobs/${jobID}/sample`)
++      .then(res => res.data)
++      .then(data => {
++        console.log('Job sample requested:', data);
++        resolve();
++      })
++      .catch(error => {
++        console.error('Error requesting job sample:', error);
++        reject(error);
++      });
++  });
++};
++
+ export const deleteJob = (jobID: string) => {
+   return new Promise<void>((resolve, reject) => {
+     apiClient
+@@ -70,19 +102,25 @@ export const getJobConfig = (job: Job) => {
+   return JSON.parse(job.job_config) as JobConfig;
+ };
+ 
+-export const getAvaliableJobActions = (job: Job) => {
++export const getAvaliableJobActions = (job: Job, isAnyJobRunning: boolean = false, hasSamples: boolean = false) => {
+   const jobConfig = getJobConfig(job);
+   const isStopping = job.stop && job.status === 'running';
+   const canDelete = ['queued', 'completed', 'stopped', 'error'].includes(job.status) && !isStopping;
+   const canEdit = ['queued','completed', 'stopped', 'error'].includes(job.status) && !isStopping;
+   const canRemoveFromQueue = job.status === 'queued';
+   const canStop = job.status === 'running' && !isStopping;
++  const canSave = job.status === 'running' && !job.save && !isStopping;
++
++  // allows sample if running OR if stopped and no other jobs are running AND has samples
++  const canSample = (job.status === 'running' && !job.sample && !isStopping) ||
++                    (!['running', 'queued'].includes(job.status) && !isAnyJobRunning && hasSamples && !job.sample);
++
+   let canStart = ['stopped', 'error'].includes(job.status) && !isStopping;
+   // can resume if more steps were added
+   if (job.status === 'completed' && jobConfig.config.process[0].train.steps > job.step && !isStopping) {
+     canStart = true;
+   }
+-  return { canDelete, canEdit, canStop, canStart, canRemoveFromQueue };
++  return { canDelete, canEdit, canStop, canStart, canRemoveFromQueue, canSave, canSample };
+ };
+ 
+ export const getNumberOfSamples = (job: Job) => {

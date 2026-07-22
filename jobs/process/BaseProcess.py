@@ -16,6 +16,7 @@ class BaseProcess(object):
         self.process_id = process_id
         self.meta: OrderedDict
         self.job = job
+        self.sample_only = getattr(self.job, 'sample_only', False)
         self.config = config
         self.raw_process_config = config
         self.name = self.get_conf('name', self.job.name)

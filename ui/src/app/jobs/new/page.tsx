@@ -20,6 +20,7 @@ import SimpleJob from './SimpleJob';
 import AdvancedConfigEditor from '@/components/AdvancedConfigEditor';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { apiClient } from '@/utils/api';
+import CheckConfigModal from '@/components/CheckConfigModal';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -28,6 +29,7 @@ export default function TrainingForm() {
   const searchParams = useSearchParams();
   const runId = searchParams.get('id');
   const cloneId = searchParams.get('cloneId');
+  const sampleOnly = searchParams.get('sampleOnly') === 'true';
   const [gpuIDs, setGpuIDs] = useState<string | null>(null);
   const { settings, isSettingsLoaded } = useSettings();
   const { gpuList, isGPUInfoLoaded } = useGPUInfo();
@@ -38,6 +40,15 @@ export default function TrainingForm() {
   const [jobConfig, setJobConfig] = useNestedState<JobConfig>(objectCopy(migrateJobConfig(defaultJobConfig)));
   const [status, setStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [checkConfigOpen, setCheckConfigOpen] = useState(false);
+  const [checkConfigEnabled, setCheckConfigEnabled] = useState(false);
+
+  useEffect(() => {
+    apiClient
+      .get('/api/jobs/check-config')
+      .then(res => setCheckConfigEnabled(!!res.data.enabled))
+      .catch(() => {});
+  }, []);
 
   const handleImportConfig = () => {
     fileInputRef.current?.click();
@@ -150,6 +161,15 @@ export default function TrainingForm() {
 
   const saveJob = async () => {
     if (status === 'saving') return;
+
+    // Validate: all prompts must be non-empty before saving
+    const samples = jobConfig?.config?.process?.[0]?.sample?.samples ?? [];
+    const emptyIdx = samples.findIndex((s: any) => !s.prompt || s.prompt.trim() === '');
+    if (emptyIdx !== -1) {
+      alert(`Prompt ${emptyIdx + 1} is empty. All prompts must have text before saving.`);
+      return;
+    }
+
     setStatus('saving');
 
     apiClient
@@ -196,8 +216,8 @@ export default function TrainingForm() {
           </Button>
         </div>
         <div className="flex-shrink-0">
-          <h1 className="text-base sm:text-lg truncate max-w-[120px] sm:max-w-none">
-            {runId ? 'Edit Training Job' : 'New Training Job'}
+          <h1 className="text-base sm:text-lg truncate max-w-[150px] sm:max-w-none">
+            {sampleOnly ? 'Edit Sample Settings' : runId ? 'Edit Training Job' : 'New Training Job'}
           </h1>
         </div>
         <div className="flex-1"></div>
@@ -219,7 +239,7 @@ export default function TrainingForm() {
             <div className="hidden md:block mx-4 bg-gray-200 dark:bg-gray-800 w-1 h-6"></div>
           </>
         )}
-        {!showAdvancedView && (
+        {!showAdvancedView && !sampleOnly && (
           <>
             <div className="hidden sm:block">
               <SelectInput
@@ -252,13 +272,25 @@ export default function TrainingForm() {
           </>
         )}
 
-        <div className="pr-1 sm:pr-2 flex-shrink-0">
+        {!sampleOnly && (
+          <div className="pr-1 sm:pr-2 flex-shrink-0">
+            <Button
+              className="text-gray-200 bg-gray-800 px-2 sm:px-3 py-1 rounded-md text-xs sm:text-base"
+              onClick={() => setShowAdvancedView(!showAdvancedView)}
+            >
+              <span className="sm:hidden">{showAdvancedView ? 'Simple' : 'Advanced'}</span>
+              <span className="hidden sm:inline">{showAdvancedView ? 'Show Simple' : 'Show Advanced'}</span>
+            </Button>
+          </div>
+        )}
+        <div className="flex-shrink-0">
           <Button
-            className="text-gray-200 bg-gray-800 px-2 sm:px-3 py-1 rounded-md text-xs sm:text-base"
-            onClick={() => setShowAdvancedView(!showAdvancedView)}
+            className="text-purple-300 border border-purple-600 hover:bg-purple-900/40 px-2 sm:px-3 py-1 rounded-md text-xs sm:text-base mr-2 disabled:opacity-40 disabled:cursor-not-allowed"
+            onClick={() => setCheckConfigOpen(true)}
+            disabled={!checkConfigEnabled}
+            title={checkConfigEnabled ? 'Check config with AI' : 'Set CHECK_CONFIG_API_BASE_URL to enable'}
           >
-            <span className="sm:hidden">{showAdvancedView ? 'Simple' : 'Advanced'}</span>
-            <span className="hidden sm:inline">{showAdvancedView ? 'Show Simple' : 'Show Advanced'}</span>
+            Check Config ✦
           </Button>
         </div>
         <div className="flex-shrink-0">
@@ -285,6 +317,16 @@ export default function TrainingForm() {
         accept=".yaml,.yml,.json,.jsonc"
         style={{ display: 'none' }}
         onChange={handleFileSelected}
+      />
+
+      <CheckConfigModal
+        isOpen={checkConfigOpen}
+        onClose={() => setCheckConfigOpen(false)}
+        jobId={runId}
+        jobConfig={jobConfig}
+        onApply={(field, value) => {
+          setJobConfig(setNestedValue(jobConfig, value, field));
+        }}
       />
 
       {showAdvancedView ? (
@@ -325,6 +367,7 @@ export default function TrainingForm() {
               gpuList={gpuList}
               datasetOptions={datasetOptions}
               isLoading={!isSettingsLoaded || !isGPUInfoLoaded || datasetFetchStatus !== 'success'}
+              sampleOnly={sampleOnly}
             />
           </ErrorBoundary>
 

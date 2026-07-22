@@ -30,6 +30,8 @@ model Job {
   updated_at      DateTime @updatedAt
   status          String   @default("stopped")
   stop            Boolean  @default(false)
+  save            Boolean  @default(false)
+  sample          Boolean  @default(false)
   return_to_queue Boolean  @default(false) // same as stop, but will be set to 'queued' when stopped
   step            Int      @default(0)
   total_steps     Int?
@@ -40,6 +42,9 @@ model Job {
   job_type        String   @default("train") // 'train', 'caption'
   job_ref         String? // can be used for anything for special jobs, like dataset path for caption jobs
   save_now        Boolean  @default(false) // if true, the job will be saved on the next step
+  stop_sample     Boolean  @default(false) // if true, abort active sample generation and resume training
+  alerts          String   @default("[]") // JSON array of alert objects {timestamp, step, type, message, data}
+  dataset_stats   String   @default("{}") // JSON object {total_images, buckets: {WxH: count}}
   sample_now      Boolean  @default(false) // if true, the job will be sampled on the next step
 
   @@index([status])

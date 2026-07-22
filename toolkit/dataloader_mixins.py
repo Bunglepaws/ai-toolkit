@@ -106,6 +106,16 @@ def clean_caption(caption):
     # caption = ', '.join(caption_split)
     return caption
 
+def read_text_file(path: str) -> str:
+    """Read a text file, falling back to cp1252 when UTF-8 decoding fails."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        with open(path, 'r', encoding='cp1252') as f:
+            return f.read()
+
+
 def waveform_to_stereo(waveform):
     c = waveform.shape[0]
     if c == 2:
@@ -148,17 +158,16 @@ class CaptionMixin:
         default_prompt_path_with_ext = os.path.join(os.path.dirname(img_path), 'default' + ext)
 
         if os.path.exists(prompt_path):
-            with open(prompt_path, 'r', encoding='utf-8') as f:
-                prompt = f.read()
-                prompt = clean_caption(prompt)
+            prompt = read_text_file(prompt_path)
+            if prompt_path.endswith('.json'):
+                prompt = json.loads(prompt)
+                if 'caption' in prompt:
+                    prompt = prompt['caption']
+            prompt = clean_caption(prompt)
         elif os.path.exists(default_prompt_path_with_ext):
-            with open(default_prompt_path_with_ext, 'r', encoding='utf-8') as f:
-                prompt = f.read()
-                prompt = clean_caption(prompt)
+            prompt = clean_caption(read_text_file(default_prompt_path_with_ext))
         elif os.path.exists(default_prompt_path):
-            with open(default_prompt_path, 'r', encoding='utf-8') as f:
-                prompt = f.read()
-                prompt = clean_caption(prompt)
+            prompt = clean_caption(read_text_file(default_prompt_path))
         else:
             prompt = ''
             # get default_prompt if it exists on the class instance
@@ -340,15 +349,34 @@ class CaptionProcessingDTOMixin:
             short_caption = None
 
             if os.path.exists(prompt_path):
-                with open(prompt_path, 'r', encoding='utf-8') as f:
-                    prompt = f.read()
-                    short_caption = None
-                    prompt = clean_caption(prompt)
-                    if short_caption is not None:
-                        short_caption = clean_caption(short_caption)
-                    
-                    if prompt.strip() == '' and self.dataset_config.default_caption is not None:
-                        prompt = self.dataset_config.default_caption
+                prompt = read_text_file(prompt_path)
+                short_caption = None
+                if prompt_path.endswith('.json'):
+                    # replace any line endings with commas for \n \r \r\n
+                    prompt = prompt.replace('\r\n', ' ')
+                    prompt = prompt.replace('\n', ' ')
+                    prompt = prompt.replace('\r', ' ')
+
+                    try:
+                        prompt_json = json.loads(prompt)
+                        if 'caption' in prompt_json:
+                            prompt = prompt_json['caption']
+                        if 'caption_short' in prompt_json:
+                            short_caption = prompt_json['caption_short']
+                            if self.dataset_config.use_short_captions:
+                                prompt = short_caption
+                        if 'extra_values' in prompt_json:
+                            self.extra_values = prompt_json['extra_values']
+                    except json.JSONDecodeError as e:
+                        print(f"WARNING: Failed to parse JSON caption at {prompt_path}: {e}. Using raw text.")
+                        prompt = prompt.strip()
+
+                prompt = clean_caption(prompt)
+                if short_caption is not None:
+                    short_caption = clean_caption(short_caption)
+
+                if prompt.strip() == '' and self.dataset_config.default_caption is not None:
+                    prompt = self.dataset_config.default_caption
             else:
                 prompt = ''
                 if self.dataset_config.default_caption is not None:
@@ -1313,7 +1341,7 @@ class ClipImageFileItemDTOMixin:
             ).pixel_values
             self.clip_image_tensor = clip_out.squeeze(0).clone().detach()
 
-    def cleanup_clip_image(self: 'FileItemDTO'):
+    def cleanup_clip_image(self):
         self.clip_image_tensor = None
         self.clip_image_embeds = None
 
@@ -1603,6 +1631,160 @@ class UnconditionalFileItemDTOMixin:
         self.unconditional_tensor = None
         self.unconditional_latent = None
 
+
+class PoiFileItemDTOMixin:
+    # Point of interest bounding box. Allows for dynamic cropping without cropping out the main subject
+    # items in the poi will always be inside the image when random cropping
+    def __init__(self: 'FileItemDTO', *args, **kwargs):
+        if hasattr(super(), '__init__'):
+            super().__init__(*args, **kwargs)
+        # poi is a name of the box point of interest in the caption json file
+        dataset_config = kwargs.get('dataset_config', None)
+        path = kwargs.get('path', None)
+        self.poi: Union[str, None] = dataset_config.poi
+        self.has_point_of_interest = self.poi is not None
+        self.poi_x: Union[int, None] = None
+        self.poi_y: Union[int, None] = None
+        self.poi_width: Union[int, None] = None
+        self.poi_height: Union[int, None] = None
+
+        if self.poi is not None:
+            # make sure latent caching is off
+            if dataset_config.cache_latents or dataset_config.cache_latents_to_disk:
+                raise Exception(
+                    f"Error: poi is not supported when caching latents. Please set cache_latents and cache_latents_to_disk to False in the dataset config"
+                )
+                # make sure we are loading through json
+            if dataset_config.caption_ext != '.json':
+                raise Exception(
+                    f"Error: poi is only supported when using json captions. Please set caption_ext to json in the dataset config"
+                )
+            self.poi = self.poi.strip()
+            # get the caption path
+            file_path_no_ext = os.path.splitext(path)[0]
+            caption_path = file_path_no_ext + '.json'
+            if not os.path.exists(caption_path):
+                raise Exception(f"Error: caption file not found for poi: {caption_path}")
+            json_data = json.loads(read_text_file(caption_path))
+            if 'poi' not in json_data:
+                print_acc(f"Warning: poi not found in caption file: {caption_path}")
+            if self.poi not in json_data['poi']:
+                print_acc(f"Warning: poi not found in caption file: {caption_path}")
+            # poi has, x, y, width, height
+            # do full image if no poi
+            self.poi_x = 0
+            self.poi_y = 0
+            self.poi_width = self.width
+            self.poi_height = self.height
+            try:
+                if self.poi in json_data['poi']:
+                    poi = json_data['poi'][self.poi]
+                    self.poi_x = int(poi['x'])
+                    self.poi_y = int(poi['y'])
+                    self.poi_width = int(poi['width'])
+                    self.poi_height = int(poi['height'])
+            except Exception as e:
+                pass
+
+            # handle flipping
+            if kwargs.get('flip_x', False):
+                # flip the poi
+                self.poi_x = self.width - self.poi_x - self.poi_width
+            if kwargs.get('flip_y', False):
+                # flip the poi
+                self.poi_y = self.height - self.poi_y - self.poi_height
+
+    def setup_poi_bucket(self: 'FileItemDTO'):
+        initial_width = int(self.width * self.dataset_config.scale)
+        initial_height = int(self.height * self.dataset_config.scale)
+        # we are using poi, so we need to calculate the bucket based on the poi
+
+        # if img resolution is less than dataset resolution, just return and let the normal bucketing happen
+        img_resolution = get_resolution(initial_width, initial_height)
+        if img_resolution <= self.dataset_config.resolution:
+            return False  # will trigger normal bucketing
+
+        bucket_tolerance = self.dataset_config.bucket_tolerance
+        poi_x = int(self.poi_x * self.dataset_config.scale)
+        poi_y = int(self.poi_y * self.dataset_config.scale)
+        poi_width = int(self.poi_width * self.dataset_config.scale)
+        poi_height = int(self.poi_height * self.dataset_config.scale)
+
+        # loop to keep expanding until we are at the proper resolution. This is not ideal, we can probably handle it better
+        num_loops = 0
+        while True:
+            # crop left
+            if poi_x > 0:
+                poi_x = random.randint(0, poi_x)
+            else:
+                poi_x = 0
+
+            # crop right
+            cr_min = poi_x + poi_width
+            if cr_min < initial_width:
+                crop_right = random.randint(poi_x + poi_width, initial_width)
+            else:
+                crop_right = initial_width
+
+            poi_width = crop_right - poi_x
+
+            if poi_y > 0:
+                poi_y = random.randint(0, poi_y)
+            else:
+                poi_y = 0
+
+            if poi_y + poi_height < initial_height:
+                crop_bottom = random.randint(poi_y + poi_height, initial_height)
+            else:
+                crop_bottom = initial_height
+
+            poi_height = crop_bottom - poi_y
+            try:
+                # now we have our random crop, but it may be smaller than resolution. Check and expand if needed
+                current_resolution = get_resolution(poi_width, poi_height)
+            except Exception as e:
+                print_acc(f"Error: {e}")
+                print_acc(f"Error getting resolution: {self.path}")
+                raise e
+                return False
+            if current_resolution >= self.dataset_config.resolution:
+                # We can break now
+                break
+            else:
+                num_loops += 1
+                if num_loops > 100:
+                    print_acc(
+                        f"Warning: poi bucketing looped too many times. This should not happen. Please report this issue.")
+                    return False
+
+        new_width = poi_width
+        new_height = poi_height
+
+        bucket_resolution = get_bucket_for_image_size(
+            new_width, new_height,
+            resolution=self.dataset_config.resolution,
+            divisibility=bucket_tolerance
+        )
+
+        width_scale_factor = bucket_resolution["width"] / new_width
+        height_scale_factor = bucket_resolution["height"] / new_height
+        # Use the maximum of the scale factors to ensure both dimensions are scaled above the bucket resolution
+        max_scale_factor = max(width_scale_factor, height_scale_factor)
+
+        self.scale_to_width = math.ceil(initial_width * max_scale_factor)
+        self.scale_to_height = math.ceil(initial_height * max_scale_factor)
+        self.crop_width = bucket_resolution['width']
+        self.crop_height = bucket_resolution['height']
+        self.crop_x = int(poi_x * max_scale_factor)
+        self.crop_y = int(poi_y * max_scale_factor)
+
+        if self.scale_to_width < self.crop_x + self.crop_width or self.scale_to_height < self.crop_y + self.crop_height:
+            # todo look into this. This still happens sometimes
+            print_acc('size mismatch')
+
+        return True
+
+
 class ArgBreakMixin:
     # just stops super calls form hitting object
     def __init__(self, *args, **kwargs):
@@ -1741,6 +1923,7 @@ class LatentCachingMixin:
 
             # use tqdm to show progress
             i = 0
+            failed_items = []
             for file_item in tqdm(self.file_list, desc=f'Caching latents{" to disk" if to_disk else ""}'):
                 file_item.is_caching_to_disk = to_disk
                 file_item.is_caching_to_memory = to_memory
@@ -1776,7 +1959,12 @@ class LatentCachingMixin:
                     except Exception as e:
                         print_acc(f"Error processing image: {file_item.path}")
                         print_acc(f"Error: {str(e)}")
-                        raise e
+                        print_acc(f"Skipping image and continuing...")
+                        if hasattr(file_item, 'tensor') and file_item.tensor is not None:
+                            del file_item.tensor
+                        file_item.cleanup()
+                        failed_items.append(file_item)
+                        continue
                     # do first frame
                     is_video = self.dataset_config.auto_frame_count or self.dataset_config.num_frames > 1
                     if is_video and self.dataset_config.do_i2v:
@@ -1827,8 +2015,23 @@ class LatentCachingMixin:
                 file_item.is_latent_cached = True
                 i += 1
 
+            if failed_items:
+                print_acc(f" - Skipped {len(failed_items)} images due to encode errors")
+                for item in failed_items:
+                    self.file_list.remove(item)
+
             # restore device state
-            self.sd.restore_device_state()
+            print_acc(" - Latent caching complete. Restoring device state...")
+            try:
+                self.sd.restore_device_state()
+            except Exception as e:
+                # CUDA context can be corrupted if any encoding step hit a CUDA error
+                # (e.g. misaligned address). Raising here prevents training from starting,
+                # which is correct — caller will see the error and the job will be marked failed.
+                print_acc(f" - ERROR: Failed to restore device state after latent caching: {e}")
+                print_acc(" - This usually means the CUDA context was corrupted during encoding.")
+                print_acc(" - Restart the server to reset GPU state before retrying.")
+                raise
 
 
 class TextEmbeddingFileItemDTOMixin:
@@ -1948,8 +2151,9 @@ class TextEmbeddingCachingMixin:
                 file_item.is_text_embedding_cached = True
                 i += 1
             # restore device state
-            # if did_move:
-            #     self.sd.restore_device_state()
+            if did_move:
+                print_acc(" - Text embedding caching complete. Restoring device state...")
+                self.sd.restore_device_state()
 
 
 class CLIPCachingMixin:
@@ -2117,13 +2321,10 @@ class CLIPCachingMixin:
                     # flush(garbage_collect=False)
                 file_item.is_vision_clip_cached = True
                 i += 1
-            # flush every 100
-            # if i % 100 == 0:
-            #     flush()
-
-        # restore device state
-        self.sd.restore_device_state()
-
+            
+            # restore device state
+            print_acc(" - CLIP vision caching complete. Restoring device state...")
+            self.sd.restore_device_state()
 
 
 class ControlCachingMixin:

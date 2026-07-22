@@ -23,7 +23,12 @@ export async function POST(request: Request) {
     const captionExt = ((ext || 'txt') as string).replace(/^\.+/, '').trim() || 'txt';
     const captionPath = imgPath.replace(/\.[^/.]+$/, '') + '.' + captionExt;
     // save caption to file
-    await fs.promises.writeFile(captionPath, caption);
+    if (captionExt === 'json') {
+      const parsed = JSON.parse(caption);
+      await fs.promises.writeFile(captionPath, JSON.stringify(parsed, null, 2));
+    } else {
+      await fs.promises.writeFile(captionPath, caption);
+    }
 
     return NextResponse.json({ success: true });
   } catch (error) {

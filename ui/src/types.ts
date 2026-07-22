@@ -80,6 +80,8 @@ export interface SaveConfig {
   max_step_saves_to_keep: number;
   save_format: string;
   push_to_hub: boolean;
+  archive_optimizer?: boolean;
+  save_with_step_num?:boolean;
 }
 
 export interface DatasetConfig {
@@ -184,6 +186,10 @@ export interface ModelConfig {
   layer_offloading_transformer_percent?: number;
   layer_offloading_text_encoder_percent?: number;
   assistant_lora_path?: string;
+  gemma_api_key?: string;
+  use_gemma_api?: boolean;
+  cache_quantized_model?: boolean;
+  extras_name_or_path?: string;
   unconditional_lora_path?: string;
   compile?: boolean;
   block_compile?: boolean;
@@ -191,6 +197,7 @@ export interface ModelConfig {
   compile_fullgraph?: boolean;
   compile_dynamic?: boolean;
   cache_size_limit?: number;
+  spatial_upscaler_path?: string;
 }
 
 export interface SampleItem {
@@ -226,6 +233,12 @@ export interface SampleConfig {
   sample_steps: number;
   num_frames: number;
   fps: number;
+  // LoRA applied only during sampling (not training). WAN 2.2 uses path + path_2 for two-stage LightX2V.
+  sample_lora_path?: string | null;
+  sample_lora_path_2?: string | null;
+  sample_lora_strength?: number;
+  sample_lora_strength_2?: number;
+  format?: 'jpg' | 'png' | 'webp';
 }
 
 export interface LoggingConfig {
@@ -287,7 +300,7 @@ export interface CaptionProcessConfig {
     qtype: string;
     low_vram: boolean;
     extensions: string[];
-    path_to_caption: string;
+    path_to_caption: string | string[];
     recaption: boolean;
     compile?: boolean;
     caption_prompt?: string;

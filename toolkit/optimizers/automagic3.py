@@ -657,8 +657,12 @@ class Automagic3(torch.optim.Optimizer):
             med = None
             if lrs:
                 dev = lrs[0].device
+                # Older v3 checkpoints stored lr as a per-row tensor (e.g. shape
+                # [64] or [3840]). Collapse to scalar before stacking so shapes
+                # are uniform across params.
+                flat = [t.to(torch.float32).to(dev).mean() if t.dim() > 0 else t.to(torch.float32).to(dev) for t in lrs]
                 med = (
-                    torch.stack([t.to(torch.float32).to(dev) for t in lrs])
+                    torch.stack(flat)
                     .log_()
                     .median()
                     .exp_()
@@ -668,7 +672,11 @@ class Automagic3(torch.optim.Optimizer):
                 if st is None:
                     continue
                 if isinstance(st.get("lr"), torch.Tensor):
-                    st["lr"] = st["lr"].to(torch.float32)
+                    lr_t = st["lr"].to(torch.float32)
+                    # Collapse old per-row lr tensors to scalar
+                    if lr_t.dim() > 0:
+                        lr_t = lr_t.mean().detach()
+                    st["lr"] = lr_t
                     if med is not None:
                         st["lr"].copy_(med.to(st["lr"].device))
                 # Sign history: keep it when its geometry matches the current

@@ -247,10 +247,14 @@ class TrainESRGANProcess(BaseTrainProcess):
         if step is not None:
             # zeropad 9 digits
             step_num = f"_{str(step).zfill(9)}"
+        elif hasattr(self, 'save_config') and self.save_config.save_with_step_num:
+            # if step is None, use current step
+            step_num = f"_{str(self.step_num).zfill(9)}"
 
         self.update_training_metadata()
         # filename = f'{self.job.name}{step_num}.safetensors'
         filename = f'{self.job.name}{step_num}.pth'
+        file_path = os.path.join(self.save_root, filename)
         # prepare meta
         save_meta = get_meta_for_safetensors(self.meta, self.job.name)
 
@@ -266,9 +270,9 @@ class TrainESRGANProcess(BaseTrainProcess):
 
         # most things wont use safetensors, save as torch
         # save_file(save_state_dict, os.path.join(self.save_root, filename), save_meta)
-        torch.save(save_state_dict, os.path.join(self.save_root, filename))
+        torch.save(save_state_dict, file_path)
 
-        self.print(f"Saved to {os.path.join(self.save_root, filename)}")
+        self.print(f"Saved to {file_path}")
 
         if self.use_critic:
             self.critic.save(step)

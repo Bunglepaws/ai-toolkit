@@ -1,5 +1,6 @@
 'use client';
 
+import { useState, useEffect, useRef, use } from 'react';
 import { useState, use } from 'react';
 import { FaChevronLeft } from 'react-icons/fa';
 import { MdDashboard, MdImage, MdShowChart, MdCode, MdExtension } from 'react-icons/md';
@@ -7,6 +8,8 @@ import { Button } from '@headlessui/react';
 import { TopBar, MainContent } from '@/components/layout';
 import useJob from '@/hooks/useJob';
 import usePollLoop from '@/hooks/usePollLoop';
+import useJobsList from '@/hooks/useJobsList';
+import useSampleImages from '@/hooks/useSampleImages';
 import SampleImages, { SampleImagesMenu } from '@/components/SampleImages';
 import JobOverview from '@/components/JobOverview';
 import { redirect } from 'next/navigation';
@@ -16,6 +19,9 @@ import JobLossGraph from '@/components/JobLossGraph';
 import JobPlugin from '@/components/JobPlugin';
 import { Job } from '@prisma/client';
 import { apiClient } from '@/utils/api';
+import { toast } from 'sonner';
+import type { JobAlert } from '@/components/JobAlertsPanel';
+import CheckConfigModal from '@/components/CheckConfigModal';
 
 type PageKey = 'overview' | 'samples' | 'config' | 'loss_log' | 'plugin';
 
@@ -24,7 +30,7 @@ interface Page {
   value: PageKey;
   icon: React.ComponentType<{ className?: string }>;
   component: React.ComponentType<{ job: Job }>;
-  menuItem?: React.ComponentType<{ job?: Job | null }> | null;
+  menuItem?: React.ComponentType<{ job: Job; onRefresh?: () => void; hasSamples?: boolean; isAnyJobRunning?: boolean }> | null;
   mainCss?: string;
   jobTypes?: string[]; // if specified, only show this page for these job types
 }
@@ -74,8 +80,20 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
   const usableParams = use(params as any) as { jobID: string };
   const jobID = usableParams.jobID;
   const { job, status, refreshJob } = useJob(jobID, 5000);
+  const { jobs } = useJobsList({ onlyActive: true, reloadInterval: 5000 });
+  const { sampleImages } = useSampleImages(jobID, 5000);
   const [pageKey, setPageKey] = useState<PageKey>('overview');
   const [hasPlugin, setHasPlugin] = useState(false);
+  const [oomModalOpen, setOomModalOpen] = useState(false);
+  const [oomMessage, setOomMessage] = useState('');
+  const [checkConfigEnabled, setCheckConfigEnabled] = useState(false);
+
+  useEffect(() => {
+    apiClient
+      .get('/api/jobs/check-config')
+      .then(res => setCheckConfigEnabled(!!res.data.enabled))
+      .catch(() => {});
+  }, []);
 
   // poll for plugin.html in the job folder; show the Plugin tab if it exists
   usePollLoop(
@@ -88,6 +106,33 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
     5000,
     [jobID],
   );
+
+  const isAnyJobRunning = jobs.some(j => j.status === 'running');
+  const hasSamples = sampleImages.length > 0;
+
+  // Fire a toast when new alerts arrive (don't toast on mount with existing alerts)
+  const prevAlertCountRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!job) return;
+    let alerts: JobAlert[] = [];
+    try { alerts = JSON.parse((job as any).alerts || '[]'); } catch { /* ignore */ }
+    const count = alerts.length;
+    if (prevAlertCountRef.current === null) {
+      prevAlertCountRef.current = count;
+      return;
+    }
+    if (count > prevAlertCountRef.current) {
+      const newest = alerts[alerts.length - 1];
+      if (newest) {
+        toast.warning(newest.message, { duration: 5000 });
+        if ((newest as any).type === 'oom' && checkConfigEnabled) {
+          setOomMessage(newest.message);
+          setOomModalOpen(true);
+        }
+      }
+    }
+    prevAlertCountRef.current = count;
+  }, [(job as any)?.alerts]);
 
   const page = pages.find(p => p.value === pageKey);
 
@@ -116,10 +161,13 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
             job={job}
             onRefresh={refreshJob}
             hideView
+            hideSample={pageKey === 'samples'}
             afterDelete={() => {
               redirect('/jobs');
             }}
-            autoStartQueue={true}
+            autoStartQueue={false}
+            isAnyJobRunning={isAnyJobRunning}
+            hasSamples={hasSamples}
           />
         )}
       </TopBar>
@@ -135,6 +183,17 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
           </>
         )}
       </MainContent>
+      {job && (
+        <CheckConfigModal
+          isOpen={oomModalOpen}
+          onClose={() => setOomModalOpen(false)}
+          jobId={jobID}
+          jobConfig={JSON.parse((job as any).job_config || '{}')}
+          onApply={() => toast.info('Navigate to the job editor to apply this suggestion')}
+          autoRun={true}
+          contextMessage={oomMessage}
+        />
+      )}
       <div className="bg-gray-800 absolute top-12 left-0 w-full h-8 flex items-center px-0 sm:px-2 text-sm sm:overflow-x-auto whitespace-nowrap">
         {pages.map(page => {
           if (page.jobTypes && !page.jobTypes.includes(jobType)) {
@@ -154,10 +213,10 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
             </Button>
           );
         })}
-        {page?.menuItem && (
+        {page?.menuItem && job && (
           <>
             <div className="hidden sm:block flex-grow"></div>
-            <page.menuItem job={job} />
+            <page.menuItem job={job} onRefresh={refreshJob} hasSamples={hasSamples} isAnyJobRunning={isAnyJobRunning} />
           </>
         )}
       </div>

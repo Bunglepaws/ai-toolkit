@@ -3,15 +3,26 @@
 import JobsTable from '@/components/JobsTable';
 import { TopBar, MainContent } from '@/components/layout';
 import Link from 'next/link';
+import { useSessionFilter } from '@/hooks/useSessionFilter';
+import MruTextInput from '@/components/MruTextInput';
 
 export default function Dashboard() {
+  const [filter, setFilter] = useSessionFilter('jobs-filter');
+
   return (
     <>
       <TopBar>
         <div>
           <h1 className="text-base sm:text-lg">Queue</h1>
         </div>
-        <div className="flex-1"></div>
+        <div className="flex-1 max-w-xl mx-4">
+          <MruTextInput
+            value={filter}
+            onChange={setFilter}
+            mruKey="jobs-filter-mru"
+            placeholder="Filter by name or model (supports AND, OR)..."
+          />
+        </div>
         <div>
           <Link
             href="/jobs/new"
@@ -23,7 +34,7 @@ export default function Dashboard() {
         </div>
       </TopBar>
       <MainContent>
-        <JobsTable />
+        <JobsTable filter={filter} />
       </MainContent>
     </>
   );

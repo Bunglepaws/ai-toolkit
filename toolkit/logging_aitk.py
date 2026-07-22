@@ -110,6 +110,7 @@ class UILogger:
         self._last_flush = time.time()
 
         self._first_commit_done = False
+        self._current_sample_row_id: Optional[int] = None
 
     # start logging the training
     def start(self):
@@ -210,6 +211,34 @@ class UILogger:
         self._con = None
         self._started = False
 
+    def record_session_start(self):
+        if not self._started or self._con is None:
+            return
+        self._con.execute(
+            "INSERT INTO training_sessions(start_time) VALUES(?);",
+            (time.time(),),
+        )
+
+    def record_sample_start(self):
+        if not self._started or self._con is None:
+            return
+        cur = self._con.execute(
+            "INSERT INTO sampling_periods(start_time) VALUES(?);",
+            (time.time(),),
+        )
+        self._current_sample_row_id = cur.lastrowid
+
+    def record_sample_end(self):
+        if not self._started or self._con is None:
+            return
+        if self._current_sample_row_id is None:
+            return
+        self._con.execute(
+            "UPDATE sampling_periods SET end_time=? WHERE id=?;",
+            (time.time(), self._current_sample_row_id),
+        )
+        self._current_sample_row_id = None
+
     # -------------------------
     # internal
     # -------------------------
@@ -246,6 +275,21 @@ class UILogger:
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_metrics_key_step ON metrics (key, step);"
         )
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS training_sessions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_time REAL NOT NULL
+            );
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS sampling_periods (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_time REAL NOT NULL,
+                end_time   REAL
+            );
+        """)
 
         con.execute("COMMIT;")
 

@@ -6,11 +6,12 @@ export const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, m
 
 export const imgExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp'];
 export const videoExtensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.m4v', '.flv'];
-export const audioExtensions = ['.mp3', '.wav', '.flac', '.ogg'];
+export const audioExtensions = ['.mp3', '.wav', '.flac', '.ogg', '.m4a'];
 
-export const isVideo = (filePath: string) => videoExtensions.includes(filePath.toLowerCase().slice(-4));
-export const isImage = (filePath: string) => imgExtensions.includes(filePath.toLowerCase().slice(-4));
-export const isAudio = (filePath: string) => audioExtensions.includes(filePath.toLowerCase().slice(-4));
+const fileExt = (filePath: string) => filePath.toLowerCase().replace(/^.*(\.[^.]+)$/, '$1');
+export const isVideo = (filePath: string) => videoExtensions.includes(fileExt(filePath));
+export const isImage = (filePath: string) => imgExtensions.includes(fileExt(filePath));
+export const isAudio = (filePath: string) => audioExtensions.includes(fileExt(filePath));
 
 export const tagsToObj = (tagStr: string): Record<string, any> => {
   const result: Record<string, any> = {};

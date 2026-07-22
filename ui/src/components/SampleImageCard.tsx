@@ -14,6 +14,7 @@ interface SampleImageCardProps {
   observerRoot?: Element | null;
   /** optional: tweak pre-load buffer */
   rootMargin?: string; // default '200px 0px'
+  stepLabel?: number | string;
 }
 
 const SampleImageCard: React.FC<SampleImageCardProps> = ({
@@ -26,6 +27,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
   onClick = () => {},
   observerRoot = null,
   rootMargin = '200px 0px',
+  stepLabel,
 }) => {
   const cardRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -102,11 +104,12 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
 
   return (
     <div className={`flex flex-col ${className}`}>
-      <div ref={cardRef} className="relative w-full cursor-pointer" style={{ paddingBottom: '100%' }} onClick={onClick}>
+      <div ref={cardRef} className="relative w-full cursor-pointer" style={{ paddingBottom: isItAudio ? '42%' : '100%' }} onClick={onClick}>
         <div
           className={`absolute inset-0 rounded-t-lg shadow-md bg-gray-900 ${
             isVisible && isImageType && !loaded ? 'animate-pulse' : ''
           }`}
+          style={{ containerType: 'size' }}
         >
           {isVisible ? (
             isItAudio ? (
@@ -138,6 +141,18 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
           ) : null}
 
           {children && isVisible && <div className="absolute inset-0 flex items-center justify-center">{children}</div>}
+          {stepLabel !== undefined && (
+            <div
+              className="absolute top-0 left-0 z-10 text-white font-bold leading-none select-none pointer-events-none"
+              style={{
+                fontSize: '20cqmin',
+                padding: '0.1em 0.15em',
+                textShadow: '0 0 6px rgba(0,0,0,1), 0 1px 4px rgba(0,0,0,0.9)',
+              }}
+            >
+              {stepLabel}
+            </div>
+          )}
         </div>
       </div>
     </div>

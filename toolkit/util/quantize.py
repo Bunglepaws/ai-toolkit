@@ -1,8 +1,13 @@
 from fnmatch import fnmatch
-from typing import List, Optional, Union, TYPE_CHECKING
+from typing import List, Optional, Union, TYPE_CHECKING, Tuple
+import hashlib
+import json
+import os
+import re
+import time
 import torch
 
-from optimum.quanto.quantize import _quantize_submodule
+from optimum.quanto.quantize import _quantize_submodule, quantization_map
 from optimum.quanto.tensor import Optimizer, qtype, qtypes
 from torchao.quantization.quant_api import (
     quantize_ as torchao_quantize_,
@@ -12,7 +17,7 @@ from torchao.quantization.quant_api import (
 )
 from optimum.quanto import freeze
 from tqdm import tqdm
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from huggingface_hub import hf_hub_download
 
 from toolkit.print import print_acc
@@ -22,7 +27,6 @@ from toolkit.util.ostris_quant import (
     convert_linear_to_ostris,
     get_ostris_quantizer,
 )
-import os
 
 if TYPE_CHECKING:
     from toolkit.models.base_model import BaseModel
@@ -39,6 +43,57 @@ Q_MODULES = [
     "QEmbeddingBag",
     "OstrisLinear",
 ]
+
+
+def filter_lora_state_dict_for_quantized_model(
+    transformer: "torch.nn.Module",
+    lora_state_dict: dict,
+) -> dict:
+    """Remove LoRA keys targeting quanto-quantized layers.
+
+    PEFT's load_lora_weights with assign=True calls QModule._load_from_state_dict,
+    which unconditionally pops weight._data from the state dict — raising KeyError
+    if the key isn't present (i.e. when loading a LoRA, not a full checkpoint).
+
+    LoRA key prefixes vary by training tool:
+      - kohya / custom: 'diffusion_model.<module>.<lora_A/B>...'
+      - diffusers:      'transformer.<module>.<lora_A/B>...'
+    Both must be stripped before matching against named_modules() names.
+    """
+    quantized_modules = set()
+    for name, mod in transformer.named_modules():
+        if mod.__class__.__name__ in Q_MODULES:
+            quantized_modules.add(name)
+            # When a training LoRA is already applied, the QLinear lives inside a
+            # PEFT LoraLinear as `base_layer`. LoRA keys target the parent path
+            # (e.g. "linear_1"), not "linear_1.base_layer", so we add the parent
+            # too so the filter correctly strips those keys.
+            if name.endswith('.base_layer'):
+                quantized_modules.add(name[:-len('.base_layer')])
+    if not quantized_modules:
+        return lora_state_dict
+
+    _LORA_MARKERS = (
+        ".lora_A.", ".lora_B.", ".lora_alpha",
+        ".lora_embedding_A.", ".lora_embedding_B.",
+    )
+    _STRIP_PREFIXES = ("diffusion_model.", "transformer.")
+
+    def _module_name(key: str) -> str:
+        for pfx in _STRIP_PREFIXES:
+            if key.startswith(pfx):
+                key = key[len(pfx):]
+                break
+        for marker in _LORA_MARKERS:
+            i = key.find(marker)
+            if i >= 0:
+                return key[:i]
+        return key
+
+    return {
+        k: v for k, v in lora_state_dict.items()
+        if _module_name(k) not in quantized_modules
+    }
 
 torchao_qtypes = {
     # "int4": Int4WeightOnlyConfig(),
@@ -226,9 +281,209 @@ def quantize(
             # raise e
 
 
+def _compute_quant_cache_key(base_model: "BaseModel", extra: str = "") -> Tuple[str, str]:
+    """Return (slug, hash20) for the quantization cache filename.
+
+    The slug is a sanitised basename of name_or_path so cache files are
+    human-readable and clearly tied to a specific checkpoint. `extra`
+    disambiguates multiple quantized submodels of one base model (e.g.
+    wan2.2 14b high/low noise transformers).
+    """
+    name = base_model.model_config.name_or_path
+    qtype_name = base_model.model_config.qtype
+    parts = [name, qtype_name, "v1"]
+    if extra:
+        parts.append(extra)
+    if os.path.isfile(name) or os.path.isdir(name):
+        try:
+            parts.append(str(int(os.path.getmtime(name))))
+        except OSError:
+            pass
+    hash20 = hashlib.sha256("|".join(parts).encode()).hexdigest()[:20]
+    # human-readable slug from the last path component (no extension)
+    basename = os.path.splitext(os.path.basename(name))[0] or name
+    if extra:
+        # keep the slug human-readable, e.g. ..._high-noise_...
+        extra_slug = re.sub(r'[^A-Za-z0-9._-]', '-', extra.split('|')[0])[:20].strip('-')
+        if extra_slug:
+            basename = f"{basename}_{extra_slug}"
+    slug = re.sub(r'[^A-Za-z0-9._-]', '-', basename)[:40].strip('-')
+    return slug, hash20
+
+
+def _save_to_quant_cache(
+    model_to_quantize: torch.nn.Module,
+    cache_path: str,
+    cache_qmap_path: str,
+):
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    raw_state = model_to_quantize.orig_state_dict()
+    raw_state = {k: v.cpu().contiguous() for k, v in raw_state.items()}
+    save_file(raw_state, cache_path)
+    qmap = quantization_map(model_to_quantize)
+    with open(cache_qmap_path, "w", encoding="utf-8") as f:
+        json.dump(qmap, f, indent=2)
+
+
+def _load_from_quant_cache(
+    model_to_quantize: torch.nn.Module,
+    cache_path: str,
+    cache_qmap_path: str,
+    stop_check=None,
+):
+    with open(cache_qmap_path, "r", encoding="utf-8") as f:
+        qmap = json.load(f)
+
+    # Rebuild QLinear module structure from the qmap.
+    #
+    # The naive approach calls _quantize_submodule per module, which quantizes
+    # the existing full-size weight — that's as slow as re-quantizing from scratch.
+    # Instead, replace each weight with a 1×1 dummy before the call so the
+    # quantization math is instant.  quanto's _load_from_state_dict then
+    # reconstructs the full QBytesTensor from _data/_scale in the cache,
+    # completely replacing the dummy regardless of its shape.
+    quantized_items = [
+        (name, m) for name, m in model_to_quantize.named_modules()
+        if name in qmap
+    ]
+    t_rebuild = time.time()
+    for name, m in tqdm(quantized_items, desc=" - rebuilding quantization structure"):
+        if stop_check is not None:
+            stop_check()
+        qconfig = qmap[name]
+        w = qconfig["weights"]
+        a = qconfig["activations"]
+        weights_qt = get_qtype(w) if w != "none" else None
+        activations_qt = get_qtype(a) if a != "none" else None
+        if weights_qt is not None and not isinstance(weights_qt, aotype):
+            # Temporarily swap in a 1×1 dummy weight so _quantize_submodule
+            # runs the quantization math on a single element (instant) instead
+            # of the full multi-MB weight tensor.  in_features/out_features are
+            # read from module attributes, not weight shape, so QLinear metadata
+            # stays correct.  The real weights come from load_state_dict below.
+            if hasattr(m, 'weight') and m.weight is not None:
+                m.weight = torch.nn.Parameter(
+                    torch.zeros(1, 1, dtype=m.weight.dtype, device='cpu'),
+                    requires_grad=False,
+                )
+            _quantize_submodule(model_to_quantize, name, m, weights=weights_qt, activations=activations_qt)
+
+    print_acc(f" - structure rebuild: {time.time() - t_rebuild:.1f}s")
+    if stop_check is not None:
+        stop_check()
+    # Load the frozen QTensor state — QModuleMixin._load_from_state_dict reconstructs
+    # QBytesTensors from _data/_scale without re-running any quantization math.
+    t_load = time.time()
+    print_acc(f" - loading quantized weights from cache ({os.path.basename(cache_path)})...")
+    state_dict = load_file(cache_path, device="cpu")
+    print_acc(f" - cache file read: {time.time() - t_load:.1f}s")
+    t_apply = time.time()
+    print_acc(" - applying weights to model...")
+    model_to_quantize.load_state_dict(state_dict, strict=False)
+    print_acc(f" - weights applied: {time.time() - t_apply:.1f}s")
+    freeze(model_to_quantize)
+
+
+def has_quant_cache(base_model: "BaseModel", cache_key_extra: str = "") -> bool:
+    """Return True if a usable quantization cache file exists for this model.
+
+    Uses a glob fallback for the case where the source file no longer exists:
+    when the file is present its mtime is mixed into the cache key, but when
+    the file is gone we can't reconstruct that key exactly, so we look for any
+    cache file whose slug matches.
+    """
+    import glob as _glob
+    cache_dir = os.environ.get("AITK_QUANTIZATION_CACHE_DIR", None)
+    if not cache_dir or not getattr(base_model.model_config, "cache_quantized_model", False):
+        return False
+    quantization_type = get_qtype(base_model.model_config.qtype)
+    is_torchao = isinstance(quantization_type, aotype)
+    slug, cache_key = _compute_quant_cache_key(base_model, cache_key_extra)
+    ext = "pt" if is_torchao else "safetensors"
+    exact = os.path.join(cache_dir, f"quant_{slug}_{cache_key}.{ext}")
+    if os.path.exists(exact):
+        return True
+    # Source file may be gone so its mtime wasn't in cache_key, but it was when
+    # the cache was written. Fall back to any slug match.
+    matches = _glob.glob(os.path.join(cache_dir, f"quant_{slug}_*.{ext}"))
+    return len(matches) > 0
+
+
+def _resolve_cache_path(
+    base_model: "BaseModel",
+    cache_dir: str,
+    slug: str,
+    cache_key: str,
+    ext: str,
+) -> Optional[str]:
+    """Return the cache file to load for this model, or None if there isn't one.
+
+    Prefers the exact mtime-keyed filename. Falls back to a slug glob ONLY when the
+    source checkpoint is missing: in that case its mtime could not be mixed into the
+    key at load time (it was at save time), so the exact name won't match. We never
+    glob-fall-back while the source exists, so a changed source (different mtime)
+    correctly forces a re-quantize rather than loading a stale cache.
+
+    This mirrors has_quant_cache(); the two MUST agree, otherwise has_quant_cache
+    green-lights skipping the source load while quantize_model then fails to find
+    the cache and quantizes an uninitialised (from_config) model.
+    """
+    import glob as _glob
+    exact = os.path.join(cache_dir, f"quant_{slug}_{cache_key}.{ext}")
+    if os.path.exists(exact):
+        return exact
+    name = base_model.model_config.name_or_path
+    source_present = os.path.isfile(name) or os.path.isdir(name)
+    if source_present:
+        return None
+    matches = sorted(
+        _glob.glob(os.path.join(cache_dir, f"quant_{slug}_*.{ext}")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    return matches[0] if matches else None
+
+
+def _save_torchao_cache(
+    model_to_quantize: torch.nn.Module,
+    cache_path: str,
+):
+    """Save a torchao-quantized model's state dict via torch.save.
+
+    torchao quantized weights are tensor subclasses (AffineQuantizedTensor etc.)
+    that carry their own quantization metadata. safetensors cannot store them,
+    but torch.save/load handles them natively via pickle.
+    """
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    state = {k: v.cpu() for k, v in model_to_quantize.state_dict().items()}
+    torch.save(state, cache_path)
+
+
+def _load_torchao_cache(
+    model_to_quantize: torch.nn.Module,
+    cache_path: str,
+    stop_check=None,
+):
+    """Restore a torchao-quantized model from a torch.save cache file.
+
+    The state dict contains torchao tensor subclasses; load_state_dict with
+    assign=True is required so PyTorch replaces parameter storage in-place
+    rather than trying to copy into plain tensors.
+    """
+    if stop_check is not None:
+        stop_check()
+    print_acc(" - loading torchao quantized weights from cache...")
+    state = torch.load(cache_path, map_location="cpu", weights_only=False)
+    if stop_check is not None:
+        stop_check()
+    print_acc(" - applying torchao weights to model...")
+    model_to_quantize.load_state_dict(state, strict=True, assign=True)
+
+
 def quantize_model(
     base_model: "BaseModel",
     model_to_quantize: torch.nn.Module,
+    cache_key_extra: str = "",
 ):
     from toolkit.dequantize import patch_dequantization_on_save
 
@@ -394,6 +649,58 @@ def quantize_model(
         # quantize model the original way without an accuracy recovery adapter
         # move and quantize only certain pieces at a time.
         quantization_type = get_qtype(base_model.model_config.qtype)
+
+        # Cache check: skip GPU quantization if a pre-computed cache exists
+        cache_dir = os.environ.get("AITK_QUANTIZATION_CACHE_DIR", None)
+        wants_cache = getattr(base_model.model_config, "cache_quantized_model", False)
+        is_torchao = isinstance(quantization_type, aotype)
+        use_cache = bool(cache_dir and wants_cache)
+        if wants_cache and not cache_dir:
+            base_model.print_and_status_update(
+                f" - Note: cache_quantized_model is enabled but AITK_QUANTIZATION_CACHE_DIR "
+                f"is not set. Configure a cache directory in Settings."
+            )
+        cache_path = cache_qmap_path = None
+        if use_cache:
+            slug, cache_key = _compute_quant_cache_key(base_model, cache_key_extra)
+            ext = "pt" if is_torchao else "safetensors"
+            # Path to save a freshly-quantized model to (exact key). The load side may
+            # resolve to a glob-matched file when the source checkpoint is missing.
+            resolved = _resolve_cache_path(base_model, cache_dir, slug, cache_key, ext)
+            if is_torchao:
+                # torchao: single .pt file (pickle-based; handles tensor subclasses)
+                cache_path = os.path.join(cache_dir, f"quant_{slug}_{cache_key}.pt")
+                cache_qmap_path = None
+                if resolved is not None:
+                    try:
+                        base_model.print_and_status_update(" - loading cached torchao quantized model...")
+                        _load_torchao_cache(model_to_quantize, resolved,
+                                            stop_check=base_model.maybe_stop)
+                        base_model.print_and_status_update(" - cached torchao quantized model loaded")
+                        return
+                    except Exception as e:
+                        base_model.print_and_status_update(
+                            f" - torchao cache load failed ({e}), re-quantizing from scratch"
+                        )
+            else:
+                # quanto: safetensors + qmap JSON
+                cache_path = os.path.join(cache_dir, f"quant_{slug}_{cache_key}.safetensors")
+                cache_qmap_path = os.path.join(cache_dir, f"quant_{slug}_{cache_key}_qmap.json")
+                if resolved is not None:
+                    # qmap sits beside the safetensors with the same key
+                    resolved_qmap = resolved[: -len(".safetensors")] + "_qmap.json"
+                    if os.path.exists(resolved_qmap):
+                        try:
+                            base_model.print_and_status_update(" - loading cached quantized model...")
+                            _load_from_quant_cache(model_to_quantize, resolved, resolved_qmap,
+                                                   stop_check=base_model.maybe_stop)
+                            base_model.print_and_status_update(" - cached quantized model loaded")
+                            return
+                        except Exception as e:
+                            base_model.print_and_status_update(
+                                f" - cache load failed ({e}), re-quantizing from scratch"
+                            )
+
         # all_blocks = list(model_to_quantize.transformer_blocks)
         all_blocks: List[torch.nn.Module] = []
         transformer_block_names = base_model.get_transformer_block_names()
@@ -411,6 +718,7 @@ def quantize_model(
             f" - quantizing {len(all_blocks)} transformer blocks"
         )
         for block in tqdm(all_blocks):
+            base_model.maybe_stop()
             block.to(base_model.device_torch, dtype=base_model.torch_dtype, non_blocking=True)
             quantize(block, weights=quantization_type)
             freeze(block)
@@ -420,9 +728,22 @@ def quantize_model(
             # host ram after the weights moved back to the gpu for training
             block.to("cpu")
 
-        # todo, on extras find a universal way to quantize them on device and move them back to their original
-        # device without having to move the transformer blocks to the device first
+        # Quantize the extras (non-transformer-block children) that weren't handled block-by-block above.
+        # We skip the already-frozen transformer block lists to avoid rescanning thousands of frozen
+        # sub-modules, which would be extremely slow on large models like LTX2-22B.
         base_model.print_and_status_update(" - quantizing extras")
         # model_to_quantize.to(base_model.device_torch, dtype=base_model.torch_dtype)
         quantize(model_to_quantize, weights=quantization_type, exclude=exclude_modules)
         freeze(model_to_quantize)
+
+        # Save to cache after successful quantization
+        if use_cache and cache_path:
+            try:
+                base_model.print_and_status_update(" - saving quantization cache...")
+                if is_torchao:
+                    _save_torchao_cache(model_to_quantize, cache_path)
+                else:
+                    _save_to_quant_cache(model_to_quantize, cache_path, cache_qmap_path)
+                base_model.print_and_status_update(f" - quantization cache saved to {cache_path}")
+            except Exception as e:
+                base_model.print_and_status_update(f" - warning: failed to save quantization cache: {e}")

@@ -118,7 +118,13 @@ def get_qwen3_vl_features(
     """
     language_model = text_encoder.language_model
 
-    inputs_embeds = language_model.embed_tokens(token_ids)
+    # embed_tokens may be on CPU (MemoryManager leaves large Embedding tables
+    # unmanaged to avoid cudaErrorLaunchOutOfResources on 152k-vocab tables).
+    # Do the lookup on whichever device the table lives on, then move the
+    # resulting dense (B, L, hidden) tensor to the forward-pass device.
+    _embed_dev = language_model.embed_tokens.weight.device
+    inputs_embeds = language_model.embed_tokens(token_ids.to(_embed_dev))
+    inputs_embeds = inputs_embeds.to(token_ids.device)
 
     position_ids_4d = pos_2d[None, ...].expand(4, pos_2d.shape[0], -1)
     text_position_ids = position_ids_4d[0]

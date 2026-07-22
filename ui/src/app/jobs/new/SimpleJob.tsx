@@ -1,5 +1,5 @@
 'use client';
-import { useMemo } from 'react';
+import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import {
   modelArchs,
   ModelArch,
@@ -32,6 +32,103 @@ import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
 import { isMac } from '@/helpers/basic';
+import useSettings from '@/hooks/useSettings';
+
+const MRU_LORA_KEY = 'aitk_mru_lora_paths';
+const MRU_MAX = 8;
+
+function getMruLoraList(): string[] {
+  try {
+    const raw = localStorage.getItem(MRU_LORA_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function addMruLoraPath(path: string) {
+  if (!path?.trim()) return;
+  const list = getMruLoraList().filter(p => p !== path);
+  list.unshift(path.trim());
+  localStorage.setItem(MRU_LORA_KEY, JSON.stringify(list.slice(0, MRU_MAX)));
+}
+
+function LoraPathInput({
+  label,
+  value,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [mru, setMru] = useState<string[]>([]);
+  const [dropdownRect, setDropdownRect] = useState<{ top: number; left: number; width: number } | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setMru(getMruLoraList());
+  }, []);
+
+  const handleFocus = useCallback(() => {
+    if (inputRef.current) {
+      const r = inputRef.current.getBoundingClientRect();
+      setDropdownRect({ top: r.bottom + 2, left: r.left, width: r.width });
+    }
+    setMru(getMruLoraList());
+    setOpen(true);
+  }, []);
+
+  const handleBlur = useCallback(() => {
+    setTimeout(() => {
+      setOpen(false);
+      if (value?.trim()) {
+        addMruLoraPath(value);
+        setMru(getMruLoraList());
+      }
+    }, 150);
+  }, [value]);
+
+  return (
+    <div className="relative">
+      <label className="block text-sm font-medium text-gray-300 mb-1">{label}</label>
+      <input
+        ref={inputRef}
+        type="text"
+        className="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
+        placeholder={placeholder ?? 'Path or HuggingFace repo/file'}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        onFocus={handleFocus}
+        onBlur={handleBlur}
+      />
+      {open && mru.length > 0 && dropdownRect && (
+        <div
+          style={{ position: 'fixed', top: dropdownRect.top, left: dropdownRect.left, width: dropdownRect.width, zIndex: 9999 }}
+          className="bg-gray-800 border border-gray-600 rounded shadow-xl max-h-48 overflow-y-auto"
+        >
+          {mru.map(p => (
+            <div
+              key={p}
+              className="px-3 py-2 text-sm text-gray-200 hover:bg-gray-700 cursor-pointer truncate"
+              title={p}
+              onMouseDown={e => {
+                e.preventDefault();
+                onChange(p);
+                setOpen(false);
+              }}
+            >
+              {p}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 type Props = {
   jobConfig: JobConfig;
@@ -44,6 +141,7 @@ type Props = {
   gpuList: any;
   datasetOptions: any;
   isLoading?: boolean;
+  sampleOnly?: boolean;
 };
 
 const isDev = process.env.NODE_ENV === 'development';
@@ -59,10 +157,15 @@ export default function SimpleJob({
   gpuList,
   datasetOptions,
   isLoading,
+  sampleOnly = false,
 }: Props) {
   const modelArch = useMemo(() => {
     return modelArchs.find(a => a.name === jobConfig.config.process[0].model.arch) as ModelArch;
   }, [jobConfig.config.process[0].model.arch]);
+
+  const { settings: globalSettings } = useSettings();
+  const gemmaApiKeyConfigured = !!(globalSettings.GEMMA_API_KEY && globalSettings.GEMMA_API_KEY.trim() !== '');
+  const useGemmaApi = !!(jobConfig.config.process[0].model.use_gemma_api);
 
   const jobType = useMemo(() => {
     return jobTypeOptions.find(j => j.value === jobConfig.config.process[0].type);
@@ -227,7 +330,7 @@ export default function SimpleJob({
         onSubmit={handleSubmit}
         className={`space-y-8 relative ${isLoading ? 'pointer-events-none opacity-50' : ''}`}
       >
-        {isLoading && (
+        {!sampleOnly && isLoading && (
           <div className="absolute inset-0 z-50 flex items-center justify-center">
             <div className="flex flex-col items-center gap-3">
               <div className="h-8 w-8 animate-spin rounded-full border-4 border-gray-400 border-t-blue-500" />
@@ -235,7 +338,7 @@ export default function SimpleJob({
             </div>
           </div>
         )}
-        <div className={topBarClass}>
+        <div className={`${topBarClass} ${sampleOnly ? 'hidden' : ''}`}>
           <Card title="Job">
             <TextInput
               label="Training Name"
@@ -330,6 +433,25 @@ export default function SimpleJob({
                   checked={jobConfig.config.process[0].model.low_vram}
                   onChange={value => setJobConfig(value, 'config.process[0].model.low_vram')}
                 />
+                {modelArch?.additionalSections?.includes('model.gemma_api') && (
+                  <Checkbox
+                    label={
+                      gemmaApiKeyConfigured
+                        ? 'Use Gemma API (saves ~24 GB VRAM)'
+                        : 'Use Gemma API (set key in Settings)'
+                    }
+                    checked={jobConfig.config.process[0].model.use_gemma_api || false}
+                    docKey="model.gemma_api"
+                    disabled={!gemmaApiKeyConfigured}
+                    onChange={value => {
+                      setJobConfig(value, 'config.process[0].model.use_gemma_api');
+                      if (value) {
+                        setJobConfig(true, 'config.process[0].train.cache_text_embeddings');
+                        setJobConfig(false, 'config.process[0].train.unload_text_encoder');
+                      }
+                    }}
+                  />
+                )}
               </FormGroup>
             )}
             {modelArch?.additionalSections?.includes('model.model_kwargs.kv_cache') && (
@@ -348,7 +470,21 @@ export default function SimpleJob({
                 onChange={value => setJobConfig(value, 'config.process[0].model.model_kwargs.match_target_res')}
               />
             )}
-            {modelArch?.additionalSections?.includes('model.layer_offloading') && !isMac() && (
+            {modelArch?.additionalSections?.includes('model.spatial_upscaler_path') && (
+              <TextInput
+                label="Spatial Upscaler Path"
+                value={jobConfig.config.process[0].model.spatial_upscaler_path ?? ''}
+                docKey="config.process[0].model.spatial_upscaler_path"
+                onChange={(value: string | undefined) => {
+                  if (value?.trim() === '') {
+                    value = undefined;
+                  }
+                  setJobConfig(value, 'config.process[0].model.spatial_upscaler_path');
+                }}
+                placeholder="Path to .safetensors upscaler model (optional)"
+              />
+            )}
+            {modelArch?.additionalSections?.includes('model.layer_offloading') && !isMac() && !useGemmaApi && (
               <>
                 <Checkbox
                   label={
@@ -407,7 +543,7 @@ export default function SimpleJob({
                 }}
                 options={transformerQuantizationOptions}
               />
-              {!disableSections.includes('model.quantize_te') && (
+              {!disableSections.includes('model.quantize_te') && !useGemmaApi && (
                 <SelectInput
                   label="Text Encoder"
                   value={
@@ -423,6 +559,13 @@ export default function SimpleJob({
                     setJobConfig(value, 'config.process[0].model.qtype_te');
                   }}
                   options={quantizationOptions}
+                />
+              )}
+              {jobConfig.config.process[0].model.quantize && (
+                <Checkbox
+                  label="Cache quantized model (skip re-quantization on subsequent runs)"
+                  checked={jobConfig.config.process[0].model.cache_quantized_model ?? false}
+                  onChange={value => setJobConfig(value, 'config.process[0].model.cache_quantized_model')}
                 />
               )}
               <FormGroup label="Compile Options">
@@ -444,6 +587,30 @@ export default function SimpleJob({
                   }
                 }}
               />
+              {jobConfig.config.process[0].model.compile && (
+                <>
+                  <Checkbox
+                    label="Block Compile (compile each transformer block separately — more compatible)"
+                    checked={jobConfig.config.process[0].model.block_compile ?? true}
+                    onChange={value => setJobConfig(value, 'config.process[0].model.block_compile')}
+                  />
+                  <SelectInput
+                    label="Compile Mode"
+                    value={jobConfig.config.process[0].model.compile_mode || 'default'}
+                    onChange={value => setJobConfig(value, 'config.process[0].model.compile_mode')}
+                    options={[
+                      { value: 'default', label: 'Default' },
+                      { value: 'max-autotune', label: 'Max Autotune (slower first step, faster training)' },
+                      { value: 'fastest', label: 'Fastest' },
+                    ]}
+                  />
+                  <Checkbox
+                    label="Full Graph (stricter compile — may fail with quantized/offloaded models)"
+                    checked={jobConfig.config.process[0].model.compile_fullgraph ?? false}
+                    onChange={value => setJobConfig(value, 'config.process[0].model.compile_fullgraph')}
+                  />
+                </>
+              )}
             </Card>
           )}
           {modelArch?.additionalSections?.includes('model.multistage') && (
@@ -586,9 +753,23 @@ export default function SimpleJob({
               min={1}
               required
             />
-          </Card>
+            <FormGroup label="Options">
+              <Checkbox
+                label="Archive Optimizer"
+                checked={jobConfig.config.process[0].save.archive_optimizer || false}
+                onChange={value => setJobConfig(value, 'config.process[0].save.archive_optimizer')}
+              />
+            </FormGroup>
+            <FormGroup label="Options">
+              <Checkbox
+                  label="Keep step number in final safetensors file name"
+                  checked={jobConfig.config.process[0].save.save_with_step_num || false}
+                  onChange={value => setJobConfig(value, 'config.process[0].save.save_with_step_num')}
+              />
+            </FormGroup>
+          </Card>claude
         </div>
-        <div>
+        <div className={sampleOnly ? 'hidden' : ''}>
           <Card title="Training">
             <div className={trainingBarClass}>
               <div>
@@ -837,7 +1018,7 @@ export default function SimpleJob({
             </div>
           </Card>
         </div>
-        <div>
+        <div className={sampleOnly ? 'hidden' : ''}>
           <Card
             title="Validation"
             toggled={!!validationConfig}
@@ -1006,7 +1187,7 @@ export default function SimpleJob({
             </div>
           </Card>
         </div>
-        <div>
+        <div className={sampleOnly ? 'hidden' : ''}>
           <Card title="Datasets">
             <>
               {jobConfig.config.process[0].datasets.map((dataset, i) => (
@@ -1046,7 +1227,7 @@ export default function SimpleJob({
                         label="Target Dataset"
                         value={dataset.folder_path}
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].folder_path`)}
-                        options={datasetOptions}
+                        options={[{ value: defaultDatasetConfig.folder_path, label: 'Please select...' }, ...datasetOptions]}
                       />
                       {modelArch?.additionalSections?.includes('datasets.control_path') && (
                         <SelectInput
@@ -1057,7 +1238,7 @@ export default function SimpleJob({
                           onChange={value =>
                             setJobConfig(value == '' ? null : value, `config.process[0].datasets[${i}].control_path`)
                           }
-                          options={[{ value: '', label: <>&nbsp;</> }, ...datasetOptions]}
+                          options={[{ value: '', label: 'None' }, ...datasetOptions]}
                         />
                       )}
                       {modelArch?.additionalSections?.includes('datasets.multi_control_paths') && (
@@ -1073,7 +1254,7 @@ export default function SimpleJob({
                                 `config.process[0].datasets[${i}].control_path_1`,
                               )
                             }
-                            options={[{ value: '', label: <>&nbsp;</> }, ...datasetOptions]}
+                            options={[{ value: '', label: 'None' }, ...datasetOptions]}
                           />
                           <SelectInput
                             label="Control Dataset 2"
@@ -1086,7 +1267,7 @@ export default function SimpleJob({
                                 `config.process[0].datasets[${i}].control_path_2`,
                               )
                             }
-                            options={[{ value: '', label: <>&nbsp;</> }, ...datasetOptions]}
+                            options={[{ value: '', label: 'None' }, ...datasetOptions]}
                           />
                           <SelectInput
                             label="Control Dataset 3"
@@ -1099,7 +1280,7 @@ export default function SimpleJob({
                                 `config.process[0].datasets[${i}].control_path_3`,
                               )
                             }
-                            options={[{ value: '', label: <>&nbsp;</> }, ...datasetOptions]}
+                            options={[{ value: '', label: 'None' }, ...datasetOptions]}
                           />
                         </>
                       )}
@@ -1291,7 +1472,7 @@ export default function SimpleJob({
                 type="button"
                 onClick={() => {
                   const newDataset = objectCopy(defaultDatasetConfig);
-                  // automaticallt add the controls for a new dataset
+                  // automatically add the controls for a new dataset
                   const controls = modelArch?.controls ?? [];
                   newDataset.controls = controls;
                   setJobConfig([...jobConfig.config.process[0].datasets, newDataset], 'config.process[0].datasets');
@@ -1554,25 +1735,13 @@ export default function SimpleJob({
                             ))}
                           </>
                         ) : (
-                          <>
-                            {modelArch?.hasMultiLinePrompts ? (
-                              <TextAreaInput
-                                label={`Prompt`}
-                                value={sample.prompt}
-                                onChange={value => setJobConfig(value, `config.process[0].sample.samples[${i}].prompt`)}
-                                placeholder="Enter prompt"
-                                required
-                              />
-                            ) : (
-                              <TextInput
-                                label={`Prompt`}
-                                value={sample.prompt}
-                                onChange={value => setJobConfig(value, `config.process[0].sample.samples[${i}].prompt`)}
-                                placeholder="Enter prompt"
-                                required
-                              />
-                            )}
-                          </>
+                          <TextAreaInput
+                            label={`Prompt`}
+                            value={sample.prompt}
+                            onChange={value => setJobConfig(value, `config.process[0].sample.samples[${i}].prompt`)}
+                            placeholder="Enter prompt"
+                            required
+                          />
                         )}
 
                         {modelArch?.additionalSections?.includes('ideogram_4_prompt') && (
@@ -1782,6 +1951,216 @@ export default function SimpleJob({
             >
               Add Prompt
             </button>
+            {!modelArch?.disableSections?.includes('sample.neg') && (
+              <>
+                <TextAreaInput
+                  label="Negative Prompt"
+                  value={jobConfig.config.process[0].sample.neg || ''}
+                  onChange={value => setJobConfig(value || false, 'config.process[0].sample.neg')}
+                  placeholder="eg. blurry, low quality"
+                  className="pt-2"
+                />
+                {jobConfig.config.process[0].sample.guidance_scale <= 1 && !!jobConfig.config.process[0].sample.neg && (
+                  <p className="text-xs text-yellow-500 mt-1">
+                    CFG = 1 — negative prompt will be ignored.
+                  </p>
+                )}
+              </>
+            )}
+
+            {/* Sampling LoRA — WAN 2.2 (two-stage LightX2V: high-noise + low-noise) */}
+            {modelArch?.additionalSections?.includes('sample.lightx2v_loras') && (
+              <div className="mt-4 border-t border-gray-700 pt-4">
+                <Checkbox
+                  label="Enable LoRA during sampling"
+                  docKey="sample.lightx2v_loras"
+                  checked={
+                    jobConfig.config.process[0].sample.sample_lora_path !== null &&
+                    jobConfig.config.process[0].sample.sample_lora_path !== undefined
+                  }
+                  onChange={value => {
+                    if (value) {
+                      setJobConfig('', 'config.process[0].sample.sample_lora_path');
+                      setJobConfig('', 'config.process[0].sample.sample_lora_path_2');
+                      setJobConfig(1.0, 'config.process[0].sample.sample_lora_strength');
+                      setJobConfig(1.0, 'config.process[0].sample.sample_lora_strength_2');
+                    } else {
+                      setJobConfig(null, 'config.process[0].sample.sample_lora_path');
+                      setJobConfig(null, 'config.process[0].sample.sample_lora_path_2');
+                    }
+                  }}
+                />
+                {jobConfig.config.process[0].sample.sample_lora_path !== null &&
+                  jobConfig.config.process[0].sample.sample_lora_path !== undefined && (
+                  <div className="mt-2 pl-2 space-y-2">
+                    <LoraPathInput
+                      label="Stage 1 LoRA (High Noise)"
+                      value={jobConfig.config.process[0].sample.sample_lora_path ?? ''}
+                      onChange={v => setJobConfig(v, 'config.process[0].sample.sample_lora_path')}
+                    />
+                    <SliderInput
+                      label="Stage 1 Strength"
+                      value={jobConfig.config.process[0].sample.sample_lora_strength ?? 1.0}
+                      onChange={value => setJobConfig(value, 'config.process[0].sample.sample_lora_strength')}
+                      min={0}
+                      max={2}
+                      step={0.05}
+                    />
+                    <LoraPathInput
+                      label="Stage 2 LoRA (Low Noise)"
+                      value={jobConfig.config.process[0].sample.sample_lora_path_2 ?? ''}
+                      onChange={v => setJobConfig(v, 'config.process[0].sample.sample_lora_path_2')}
+                    />
+                    <SliderInput
+                      label="Stage 2 Strength"
+                      value={jobConfig.config.process[0].sample.sample_lora_strength_2 ?? 1.0}
+                      onChange={value => setJobConfig(value, 'config.process[0].sample.sample_lora_strength_2')}
+                      min={0}
+                      max={2}
+                      step={0.05}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Sampling LoRA — LTX-2 / LTX-2.3 */}
+            {modelArch?.additionalSections?.includes('sample.distill_lora') && (
+              <div className="mt-4 border-t border-gray-700 pt-4">
+                <Checkbox
+                  label="Enable LoRA during sampling"
+                  docKey="sample.distill_lora"
+                  checked={
+                    jobConfig.config.process[0].sample.sample_lora_path !== null &&
+                    jobConfig.config.process[0].sample.sample_lora_path !== undefined
+                  }
+                  onChange={value => {
+                    if (value) {
+                      setJobConfig('', 'config.process[0].sample.sample_lora_path');
+                      setJobConfig(1.0, 'config.process[0].sample.sample_lora_strength');
+                    } else {
+                      setJobConfig(null, 'config.process[0].sample.sample_lora_path');
+                    }
+                  }}
+                />
+                {jobConfig.config.process[0].sample.sample_lora_path !== null &&
+                  jobConfig.config.process[0].sample.sample_lora_path !== undefined && (
+                  <div className="mt-2 pl-2 space-y-2">
+                    <LoraPathInput
+                      label="LoRA Path"
+                      value={jobConfig.config.process[0].sample.sample_lora_path ?? ''}
+                      onChange={v => setJobConfig(v, 'config.process[0].sample.sample_lora_path')}
+                    />
+                    {!jobConfig.config.process[0].model.spatial_upscaler_path && (
+                      <SliderInput
+                        label="Strength"
+                        value={jobConfig.config.process[0].sample.sample_lora_strength ?? 1.0}
+                        onChange={value => setJobConfig(value, 'config.process[0].sample.sample_lora_strength')}
+                        min={0}
+                        max={2}
+                        step={0.05}
+                      />
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Sampling LoRA — Qwen Image */}
+            {modelArch?.additionalSections?.includes('sample.sampling_lora') && (
+              <div className="mt-4 border-t border-gray-700 pt-4">
+                <Checkbox
+                  label="Enable LoRA during sampling"
+                  docKey="sample.sampling_lora"
+                  checked={
+                    jobConfig.config.process[0].sample.sample_lora_path !== null &&
+                    jobConfig.config.process[0].sample.sample_lora_path !== undefined
+                  }
+                  onChange={value => {
+                    if (value) {
+                      setJobConfig('', 'config.process[0].sample.sample_lora_path');
+                      setJobConfig(1.0, 'config.process[0].sample.sample_lora_strength');
+                    } else {
+                      setJobConfig(null, 'config.process[0].sample.sample_lora_path');
+                    }
+                  }}
+                />
+                {jobConfig.config.process[0].sample.sample_lora_path !== null &&
+                  jobConfig.config.process[0].sample.sample_lora_path !== undefined && (
+                  <div className="mt-2 pl-2 space-y-2">
+                    <LoraPathInput
+                      label="LoRA Path"
+                      value={jobConfig.config.process[0].sample.sample_lora_path ?? ''}
+                      onChange={v => setJobConfig(v, 'config.process[0].sample.sample_lora_path')}
+                    />
+                    <SliderInput
+                      label="Strength"
+                      value={jobConfig.config.process[0].sample.sample_lora_strength ?? 1.0}
+                      onChange={value => setJobConfig(value, 'config.process[0].sample.sample_lora_strength')}
+                      min={0}
+                      max={2}
+                      step={0.05}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+            {modelArch?.additionalSections?.includes('sample.krea2_sampling_lora') && (
+              <div className="mt-4 border-t border-gray-700 pt-4">
+                <Checkbox
+                  label="Apply LoRA during sampling"
+                  docKey="sample.sampling_lora"
+                  checked={
+                    jobConfig.config.process[0].sample.sample_lora_path !== null &&
+                    jobConfig.config.process[0].sample.sample_lora_path !== undefined
+                  }
+                  onChange={value => {
+                    if (value) {
+                      setJobConfig('', 'config.process[0].sample.sample_lora_path');
+                      setJobConfig(1, 'config.process[0].sample.sample_lora_strength');
+                    } else {
+                      setJobConfig(null, 'config.process[0].sample.sample_lora_path');
+                      setJobConfig(null, 'config.process[0].sample.sample_lora_path_2');
+                    }
+                  }}
+                />
+                {jobConfig.config.process[0].sample.sample_lora_path !== null &&
+                  jobConfig.config.process[0].sample.sample_lora_path !== undefined && (
+                  <div className="mt-2 pl-2 space-y-3">
+                    <div className="space-y-2">
+                      <LoraPathInput
+                        label="LoRA 1 Path"
+                        value={jobConfig.config.process[0].sample.sample_lora_path ?? ''}
+                        onChange={v => setJobConfig(v, 'config.process[0].sample.sample_lora_path')}
+                      />
+                      <NumberInput
+                        label="Strength"
+                        value={jobConfig.config.process[0].sample.sample_lora_strength ?? 1}
+                        onChange={value => setJobConfig(value, 'config.process[0].sample.sample_lora_strength')}
+                        min={0.01}
+                        max={1000}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <LoraPathInput
+                        label="LoRA 2 Path (optional)"
+                        value={jobConfig.config.process[0].sample.sample_lora_path_2 ?? ''}
+                        onChange={v => setJobConfig(v || null, 'config.process[0].sample.sample_lora_path_2')}
+                      />
+                      {jobConfig.config.process[0].sample.sample_lora_path_2 && (
+                        <NumberInput
+                          label="Strength"
+                          value={jobConfig.config.process[0].sample.sample_lora_strength_2 ?? 4}
+                          onChange={value => setJobConfig(value, 'config.process[0].sample.sample_lora_strength_2')}
+                          min={0.01}
+                          max={1000}
+                        />
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </Card>
         </div>
 

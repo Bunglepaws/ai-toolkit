@@ -3,7 +3,7 @@ import { Job } from '@prisma/client';
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
-import { TOOLKIT_ROOT, getTrainingFolder, getHFToken } from '../paths';
+import { TOOLKIT_ROOT, getTrainingFolder, getHFToken, getGemmaApiKey, getQuantizationCacheDir } from '../paths';
 import { resolvePythonPath } from '../pythonPath';
 const isWindows = process.platform === 'win32';
 
@@ -13,9 +13,9 @@ const appendJobLog = (logPath: string, message: string) => {
   });
 };
 
-const startAndWatchJob = (job: Job) => {
+const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
   // starts and watches the job asynchronously
-  return new Promise<void>(async (resolve, reject) => {
+  return new Promise<void>(async resolve => {
     const jobID = job.id;
 
     // setup the training
@@ -41,12 +41,53 @@ const startAndWatchJob = (job: Job) => {
           fs.mkdirSync(logsFolder, { recursive: true });
         }
 
-        let num = 0;
-        while (fs.existsSync(path.join(logsFolder, `${num}_log.txt`))) {
-          num++;
-        }
+        // safe move helper: try rename, then copy+unlink, then timestamped copy; never throw
+        const safeMoveLog = (src: string, destDir: string) => {
+          try {
+            let num = 0;
+            let destPath = path.join(destDir, `${num}_log.txt`);
+            while (fs.existsSync(destPath)) {
+              num++;
+              destPath = path.join(destDir, `${num}_log.txt`);
+            }
+            try {
+              fs.renameSync(src, destPath);
+              return;
+            } catch (err: any) {
+              // If rename fails (common on Windows when file is locked), try copy + unlink
+              console.warn('rename failed when moving log file, attempting copy+unlink', err?.code);
+              try {
+                fs.copyFileSync(src, destPath);
+                try {
+                  fs.unlinkSync(src);
+                } catch (unlinkErr: any) {
+                  // couldn't remove original (probably locked) — that's fine, we left a copy
+                  console.warn('Could not unlink original log after copy, leaving original in place', unlinkErr?.code);
+                }
+                return;
+              } catch (copyErr: any) {
+                // If copy also fails, try a timestamped fallback copy name
+                console.warn('copy failed when moving log file, attempting timestamped copy', copyErr?.code);
+                try {
+                  const tsName = `${Date.now()}_log.txt`;
+                  const fallback = path.join(destDir, tsName);
+                  fs.copyFileSync(src, fallback);
+                  return;
+                } catch (fallbackErr: any) {
+                  // Give up — log the error and continue; we don't want to block job startup for a log file
+                  console.error('Failed to move or copy log file; skipping move. Errors:', err, copyErr, fallbackErr);
+                  return;
+                }
+              }
+            }
+          } catch (e) {
+            console.error('Unexpected error while attempting to move log file:', e);
+            return;
+          }
+        };
 
-        fs.renameSync(logPath, path.join(logsFolder, `${num}_log.txt`));
+        // perform safe move
+        safeMoveLog(logPath, logsFolder);
       }
     } catch (e) {
       console.error('Error moving log file:', e);
@@ -61,14 +102,14 @@ const startAndWatchJob = (job: Job) => {
 
     const pythonPath = resolvePythonPath();
 
-    const runFilePath = path.join(TOOLKIT_ROOT, 'run.py');
+    const runFilePath = path.join(TOOLKIT_ROOT, 'run_ui.py');
     if (!fs.existsSync(runFilePath)) {
-      console.error(`run.py not found at path: ${runFilePath}`);
+      console.error(`run_ui.py not found at path: ${runFilePath}`);
       await prisma.job.update({
         where: { id: jobID },
         data: {
           status: 'error',
-          info: `Error launching job: run.py not found`,
+          info: `Error launching job: run_ui.py not found`,
         },
       });
       return;
@@ -82,13 +123,32 @@ const startAndWatchJob = (job: Job) => {
       PYTHONUNBUFFERED: '1', // write Python output immediately so it is not lost on a crash
     };
 
+    if (sampleOnly) {
+      additionalEnv.AITK_SAMPLE_ONLY = '1';
+      // Pass the job's current status so Python can restore it after sample-only completes
+      additionalEnv.AITK_PREVIOUS_STATUS = job.status;
+    }
+
     // HF_TOKEN
     const hfToken = await getHFToken();
     if (hfToken && hfToken.trim() !== '') {
       additionalEnv.HF_TOKEN = hfToken;
     }
 
-    const args = [runFilePath, configPath];
+    // GEMMA_API_KEY — injected so Python can use it without embedding it in the config YAML
+    const gemmaApiKey = await getGemmaApiKey();
+    if (gemmaApiKey && gemmaApiKey.trim() !== '') {
+      additionalEnv.GEMMA_API_KEY = gemmaApiKey;
+    }
+
+    // AITK_QUANTIZATION_CACHE_DIR — only injected when the job opts in via cache_quantized_model
+    if (jobConfig?.config?.process?.[0]?.model?.cache_quantized_model) {
+      const quantCacheDir = await getQuantizationCacheDir();
+      additionalEnv.AITK_QUANTIZATION_CACHE_DIR = quantCacheDir;
+    }
+
+    // Add the --log argument to the command
+    const args = [runFilePath, configPath, '--log', logPath];
 
     let logFd: number | null = null;
     try {
@@ -197,7 +257,7 @@ const startAndWatchJob = (job: Job) => {
   });
 };
 
-export default async function startJob(jobID: string) {
+export default async function startJob(jobID: string, sampleOnly: boolean = false) {
   const job: Job | null = await prisma.job.findUnique({
     where: { id: jobID },
   });
@@ -212,9 +272,9 @@ export default async function startJob(jobID: string) {
       status: 'running',
       stop: false,
       return_to_queue: false,
-      info: 'Starting job...',
+      info: sampleOnly ? 'Generating samples...' : 'Starting job...',
     },
   });
   // start and watch the job asynchronously so the cron can continue
-  startAndWatchJob(job);
+  startAndWatchJob(job, sampleOnly);
 }

@@ -397,7 +397,10 @@ class Wan21(BaseModel):
         self.print_and_status_update("Loading Wan model")
         subfolder = 'transformer'
         transformer_path = model_path
-        if os.path.exists(transformer_path):
+        if transformer_path.endswith('.safetensors'):
+            # single-file (ComfyUI style) checkpoint
+            subfolder = None
+        elif os.path.exists(transformer_path):
             subfolder = None
             transformer_path = os.path.join(transformer_path, 'transformer')
         

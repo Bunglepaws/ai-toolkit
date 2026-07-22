@@ -30,8 +30,27 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
 
   render(): ReactNode {
     if (this.state.hasError) {
-      // You can render any custom fallback UI
-      return this.props.fallback || <div>Something went wrong.</div>;
+      return (
+        this.props.fallback || (
+          <div className="flex flex-col items-center justify-center h-full min-h-[200px] p-8 text-center">
+            <div className="text-red-400 text-4xl mb-4">⚠</div>
+            <h2 className="text-lg font-semibold text-gray-100 mb-2">Something went wrong</h2>
+            <p className="text-gray-400 text-sm mb-6">An unexpected error occurred. Check the browser console for details.</p>
+            <button
+              onClick={() => this.setState({ hasError: false })}
+              className="px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white text-sm rounded-md mr-3"
+            >
+              Try again
+            </button>
+            <button
+              onClick={() => window.location.reload()}
+              className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-gray-300 text-sm rounded-md"
+            >
+              Reload page
+            </button>
+          </div>
+        )
+      );
     }
 
     return this.props.children;

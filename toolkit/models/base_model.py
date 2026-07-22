@@ -122,6 +122,7 @@ class BaseModel:
         self.te_torch_dtype = get_torch_dtype(model_config.te_dtype)
 
         self.model_config = model_config
+        self.sample_config = None  # set by trainer before sampling; models prefer this over model_config for LoRA paths
         self.prediction_type = "v_prediction" if self.model_config.is_v_pred else "epsilon"
 
         self.device_state = None
@@ -164,6 +165,7 @@ class BaseModel:
         self.invert_assistant_lora = False
         self._after_sample_img_hooks = []
         self._status_update_hooks = []
+        self._maybe_stop_hooks = []
         self.is_transformer = False
 
         self.sample_prompts_cache = None
@@ -256,6 +258,18 @@ class BaseModel:
         return self.arch == 'flux'
 
     @property
+    def is_ltx2(self):
+        return self.arch == 'ltx2'
+
+    @property
+    def is_wan21(self):
+        return self.arch == 'wan21'
+
+    @property
+    def is_z_image(self):
+        return self.arch == 'z_image'
+
+    @property
     def is_lumina2(self):
         return self.arch == 'lumina2'
     
@@ -276,6 +290,15 @@ class BaseModel:
         if self.is_flux:
             divisibility = divisibility * 2
         return divisibility
+
+    def reload_text_encoder(self):
+        """Reload text encoder from disk when it was unloaded by a previous training job.
+
+        Override in model subclasses that support reloading the TE independently
+        of the transformer (e.g. LTX2Model with local Gemma). Default is a no-op
+        for models that either don't unload their TE or use an API for encoding.
+        """
+        pass
 
     # these must be implemented in child classes
     def load_model(self):
@@ -356,16 +379,38 @@ class BaseModel:
     def add_after_sample_image_hook(self, func):
         self._after_sample_img_hooks.append(func)
 
+    def _validate_sample_config(self, image_configs):
+        """Override to raise FileNotFoundError early if required sample assets are missing.
+        Called before get_generation_pipeline() so no models are loaded for a doomed run."""
+        pass
+
+    def _before_generate_images_loop(self, pipeline, image_configs):
+        pass
+
+    def _after_generate_images_loop(self, pipeline):
+        pass
+
+    def _after_sample_failure(self):
+        """Called after any sample generation exception before training resumes. Override to clean up GPU state."""
+        pass
+
     def _status_update(self, status: str):
         for hook in self._status_update_hooks:
             hook(status)
 
     def print_and_status_update(self, status: str):
-        print_acc(status)
-        self._status_update(status)
+        print_acc("\n" + status)
+        self._status_update("\n" + status)
 
     def add_status_update_hook(self, func):
         self._status_update_hooks.append(func)
+
+    def add_maybe_stop_hook(self, func):
+        self._maybe_stop_hooks.append(func)
+
+    def maybe_stop(self):
+        for hook in self._maybe_stop_hooks:
+            hook()
 
     @torch.no_grad()
     def generate_images(
@@ -377,6 +422,7 @@ class BaseModel:
     ):
         network = self.network
         merge_multiplier = 1.0
+        self.print_and_status_update("Switching to inference mode")
         flush()
         # if using assistant, unfuse it
         if self.model_config.assistant_lora_path is not None:
@@ -416,6 +462,8 @@ class BaseModel:
         rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
 
+        self._validate_sample_config(image_configs)
+
         if pipeline is None:
             pipeline = self.get_generation_pipeline()
             try:
@@ -429,12 +477,15 @@ class BaseModel:
 
         # pipeline.to(self.device_torch)
 
+        self._before_generate_images_loop(pipeline, image_configs)
+
         with network:
             with torch.no_grad():
                 if network is not None:
                     assert network.is_active
 
-                for i in tqdm(range(len(image_configs)), desc=f"Generating Samples", leave=True, position=0):
+                for i in tqdm(range(len(image_configs)), desc=f"Generating Samples", leave=False):
+                    self.maybe_stop()
                     gen_config = image_configs[i]
 
                     extra = {}
@@ -516,7 +567,17 @@ class BaseModel:
                             quad_count=4
                         )
 
-                    if self.sample_prompts_cache is not None:
+                    # The cache is indexed by position and must line up with image_configs.
+                    # If it's short (e.g. a re-cache failed after the text encoder was
+                    # unloaded, or prompts were edited mid-run), fall back to live encoding
+                    # rather than raising IndexError and aborting the whole sample batch.
+                    use_cache = self.sample_prompts_cache is not None and i < len(self.sample_prompts_cache)
+                    if self.sample_prompts_cache is not None and not use_cache:
+                        print(
+                            f"Warning: sample prompt cache missing entry {i} "
+                            f"(have {len(self.sample_prompts_cache)}); encoding this prompt live."
+                        )
+                    if use_cache:
                         conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
                         unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
                     else:
@@ -674,6 +735,8 @@ class BaseModel:
                 if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                     self.adapter.clear_memory()
 
+        self._after_generate_images_loop(pipeline)
+
         # clear pipeline and cache to reduce vram usage
         del pipeline
         torch.cuda.empty_cache()
@@ -684,6 +747,7 @@ class BaseModel:
             torch.cuda.set_rng_state(cuda_rng_state)
 
         self.restore_device_state()
+        self.print_and_status_update("Resuming training mode")
         if network is not None:
             network.train()
             network.multiplier = start_multiplier
@@ -1573,6 +1637,8 @@ class BaseModel:
         self.set_device_state(state)
 
     def text_encoder_to(self, *args, **kwargs):
+        if self.text_encoder is None:
+            return
         if isinstance(self.text_encoder, list):
             for encoder in self.text_encoder:
                 encoder.to(*args, **kwargs)

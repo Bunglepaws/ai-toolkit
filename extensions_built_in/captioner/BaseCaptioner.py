@@ -28,9 +28,12 @@ class CaptionConfig:
         self.extensions = kwargs.get("extensions", [])
         if self.extensions is None or len(self.extensions) == 0:
             raise ValueError("At least one extension is required in config")
-        self.path_to_caption = kwargs.get("path_to_caption", None)
-        if self.path_to_caption is None:
+        path_to_caption = kwargs.get("path_to_caption", None)
+        if path_to_caption is None:
             raise ValueError("path_to_caption is required in config")
+        if isinstance(path_to_caption, str):
+            path_to_caption = path_to_caption.split("|")
+        self.path_to_caption = [p.strip() for p in path_to_caption if p.strip()]
         self.dtype = kwargs.get("dtype", "bf16")
         self.device = kwargs.get("device", "cuda")
         self.quantize = kwargs.get("quantize", False)
@@ -44,6 +47,7 @@ class CaptionConfig:
         self.caption_prompt = kwargs.get(
             "caption_prompt", "Describe this image in detail."
         )
+        self.ignore_mismatched_sizes = kwargs.get("ignore_mismatched_sizes", True)
         self.compile = kwargs.get("compile", False)
 
 
@@ -156,16 +160,17 @@ class BaseCaptioner(BaseExtensionProcess):
         self.update_status("running", status)
 
     def find_files(self):
-        # recursivly find all the files in the path_to_caption with the specified extensions and save the paths to self.file_paths
-        for root, dirs, files in os.walk(self.caption_config.path_to_caption):
-            dirs[:] = [d for d in dirs if d != "_controls"]
-            for file in files:
-                if any(
-                    file.lower().endswith(f".{ext}") and not file.startswith(".")
-                    for ext in self.caption_config.extensions
-                ):
-                    full_path = os.path.join(root, file)
-                    self.file_paths.append(full_path)
+        # recursivly find all the files in each path_to_caption with the specified extensions and save the paths to self.file_paths
+        for path_to_caption in self.caption_config.path_to_caption:
+            for root, dirs, files in os.walk(path_to_caption):
+                dirs[:] = [d for d in dirs if d != "_controls"]
+                for file in files:
+                    if any(
+                        file.lower().endswith(f".{ext}") and not file.startswith(".")
+                        for ext in self.caption_config.extensions
+                    ):
+                        full_path = os.path.join(root, file)
+                        self.file_paths.append(full_path)
         # sort
         self.file_paths.sort()
         # it not recaption, remove the ones with captions

@@ -477,17 +477,21 @@ class TrainVAEProcess(BaseTrainProcess):
         if step is not None:
             # zeropad 9 digits
             step_num = f"_{str(step).zfill(9)}"
+        elif hasattr(self, 'save_config') and self.save_config.save_with_step_num:
+            # if step is None, use current step
+            step_num = f"_{str(self.step_num).zfill(9)}"
 
         self.update_training_metadata()
         filename = f'{self.job.name}{step_num}_diffusers'
+        file_path = os.path.join(self.save_root, filename)
 
         self.vae = self.vae.to("cpu", dtype=torch.float16)
         self.vae.save_pretrained(
-            save_directory=os.path.join(self.save_root, filename)
+            save_directory=file_path
         )
         self.vae = self.vae.to(self.device, dtype=self.torch_dtype)
 
-        self.print(f"Saved to {os.path.join(self.save_root, filename)}")
+        self.print(f"Saved to {file_path}")
 
         if self.use_critic:
             self.critic.save(step)

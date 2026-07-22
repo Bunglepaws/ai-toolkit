@@ -1,9 +1,15 @@
-from collections import OrderedDict
+from collections import OrderedDict, deque
+import glob as _glob
+import json
 import os
+import shutil
 import sqlite3
 import asyncio
 import concurrent.futures
+import traceback
 from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
+from toolkit.config_modules import SampleConfig
+from toolkit.ui_utils import JobStoppedException
 from typing import Literal, Optional
 import threading
 import time
@@ -40,6 +46,13 @@ class DiffusionTrainer(SDTrainer):
             self._run_async_operation(self._update_status("running", "Starting"))
             self._stop_watcher_started = False
             # self.start_stop_watcher(interval_sec=2.0)
+
+        # Alert detection state (maintained regardless of is_ui_trainer so the
+        # rolling history works even for non-UI runs — only DB writes are gated)
+        self._loss_history: deque = deque(maxlen=50)
+        self._last_step_loss: float = 0.0
+        self._last_spike_step: int = -1
+        self._baseline_sample_avg_bytes: float | None = None
     
     def start_stop_watcher(self, interval_sec: float = 5.0):
         """
@@ -100,7 +113,12 @@ class DiffusionTrainer(SDTrainer):
         else:
             task = loop.create_task(coro)
             self._async_tasks.append(task)
-            loop.run_until_complete(task)
+            try:
+                loop.run_until_complete(task)
+            except Exception as e:
+                # Status/step updates are informational only — a DB hiccup (lock,
+                # transient I/O error on WSL/NTFS, etc.) must never crash the job.
+                print(f"[AITK] Warning: DB update failed (non-fatal): {e}")
 
     async def _execute_db_operation(self, operation_func):
         """Execute a database operation in a separate thread with retry on lock."""
@@ -116,20 +134,21 @@ class DiffusionTrainer(SDTrainer):
         return conn
 
     def _retry_db_operation(self, operation_func, max_retries=3, base_delay=2.0):
-        """Retry a database operation with exponential backoff on lock errors."""
+        """Retry a database operation with exponential backoff on lock/transient I/O errors."""
         last_error = None
+        retryable = ("database is locked", "disk i/o error")
         for attempt in range(max_retries + 1):
             try:
                 return operation_func()
             except sqlite3.OperationalError as e:
-                if "database is locked" in str(e):
+                if any(r in str(e).lower() for r in retryable):
                     last_error = e
                     if attempt < max_retries:
                         delay = base_delay * (2 ** attempt)  # 2s, 4s, 8s
-                        print(f"[AITK] Database locked (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay:.1f}s...")
+                        print(f"[AITK] Database error ({e}) (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay:.1f}s...")
                         time.sleep(delay)
                     else:
-                        print(f"[AITK] Database locked after {max_retries + 1} attempts, giving up.")
+                        print(f"[AITK] Database error persisted after {max_retries + 1} attempts, giving up.")
                 else:
                     raise
         raise last_error
@@ -160,21 +179,9 @@ class DiffusionTrainer(SDTrainer):
 
         return self._retry_db_operation(_check_return_to_queue)
 
-    def maybe_stop(self):
-        if not self.is_ui_trainer:
-            return
-        if self.should_stop():
-            self._run_async_operation(
-                self._update_status("stopped", "Job stopped"))
-            self.is_stopping = True
-            raise Exception("Job stopped")
-        if self.should_return_to_queue():
-            self._run_async_operation(
-                self._update_status("queued", "Job queued"))
-            self.is_stopping = True
-            raise Exception("Job returning to queue")
-
     def should_save(self):
+        # Reads the `save_now` flag (ostris' canonical on-demand-save schema).
+        # Save-and-pause sets `save_now` + `stop` together; see maybe_save/save.
         if not self.is_ui_trainer:
             return False
         def _check_save():
@@ -187,15 +194,50 @@ class DiffusionTrainer(SDTrainer):
 
         return self._retry_db_operation(_check_save)
 
+    def reset_save(self):
+        if self.accelerator.is_main_process and self.is_ui_trainer:
+            self.update_db_key("save_now", 0)
+
+    def should_sample(self):
+        if not self.is_ui_trainer:
+            return False
+
+        def _check_sample():
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT sample FROM Job WHERE id = ?", (self.job_id,))
+                sample = cursor.fetchone()
+                return False if sample is None else sample[0] == 1
+
+        return _check_sample()
+
+    def reset_sample(self):
+        if self.accelerator.is_main_process and self.is_ui_trainer:
+            self.update_db_key("sample", False)
+
+    def maybe_stop(self):
+        if not self.is_ui_trainer:
+            return
+        if self.should_stop():
+            self._run_async_operation(
+                self._update_status("stopped", "Job stopped"))
+            self.is_stopping = True
+            raise JobStoppedException("Job stopped")
+        if self.should_return_to_queue():
+            self._run_async_operation(
+                self._update_status("queued", "Job queued"))
+            self.is_stopping = True
+            raise JobStoppedException("Job returning to queue")
+
     def maybe_save(self):
         if not self.is_ui_trainer:
             return
         if self.should_save():
-            self.update_db_key("save_now", 0)
+            self.reset_save()
             if self.progress_bar is not None:
                 self.progress_bar.pause()
             print_acc(f"\nSaving at step {self.step_num}")
-            # clear any grads
             self.optimizer.zero_grad()
             self.save(self.step_num)
             self.ensure_params_requires_grad()
@@ -216,19 +258,53 @@ class DiffusionTrainer(SDTrainer):
 
         return self._retry_db_operation(_check_sample)
 
+    def reload_sample_config(self):
+        """Re-read sample config from the DB in case prompts were edited while running."""
+        if not self.is_ui_trainer:
+            return
+        try:
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT job_config FROM Job WHERE id = ?", (self.job_id,))
+                row = cursor.fetchone()
+                if row:
+                    job_cfg = json.loads(row[0])
+                    sample_conf = job_cfg.get('config', {}).get('process', [{}])[0].get('sample', {})
+                    if sample_conf:
+                        self.sample_config = SampleConfig(**sample_conf)
+                        # prompt embeds are precomputed and indexed by position when the
+                        # text encoder is unloaded/cached; rebuild that cache so newly
+                        # added prompts have a matching entry
+                        if self.sd.sample_prompts_cache is not None:
+                            self.cache_sample_prompts()
+        except Exception as e:
+            print(f"Warning: Could not reload sample config from DB: {e}")
+
     def maybe_sample(self):
         if not self.is_ui_trainer:
             return
         if self.should_sample():
+            # From HEAD
             self.update_db_key("sample_now", 0)
             if self.progress_bar is not None:
                 self.progress_bar.pause()
             print_acc(f"\nSampling at step {self.step_num}")
+
+            # From incoming branch (setup before actual sampling logic)
+            self.reload_sample_config()
+            self.reset_sample()
+            self.save(self.step_num) # This saves the model *before* sampling
+
+            # From HEAD (sampling specific setup)
             # clear any grads
             self.optimizer.zero_grad()
             if self.train_config.free_u:
                 self.sd.pipeline.disable_freeu()
+
+            # The actual sample call
             self.sample(self.step_num)
+
+            # From HEAD (sampling specific teardown)
             if self.train_config.unload_text_encoder:
                 # make sure the text encoder is unloaded
                 self.sd.text_encoder_to('cpu')
@@ -236,7 +312,6 @@ class DiffusionTrainer(SDTrainer):
             flush()
             if self.progress_bar is not None:
                 self.progress_bar.unpause()
-
     async def _update_key(self, key, value):
         if not self.accelerator.is_main_process:
             return
@@ -246,8 +321,10 @@ class DiffusionTrainer(SDTrainer):
                 cursor = conn.cursor()
                 cursor.execute("BEGIN IMMEDIATE")
                 try:
-                    # Convert the value to string if it's not already
-                    if isinstance(value, str):
+                    # Convert the value to appropriate SQLite type
+                    if isinstance(value, bool):
+                        value_to_insert = 1 if value else 0
+                    elif isinstance(value, (int, float, str)) or value is None:
                         value_to_insert = value
                     else:
                         value_to_insert = str(value)
@@ -256,7 +333,13 @@ class DiffusionTrainer(SDTrainer):
                     update_query = f"UPDATE Job SET {key} = ? WHERE id = ?"
                     cursor.execute(
                         update_query, (value_to_insert, self.job_id))
-                finally:
+                except Exception:
+                    try:
+                        cursor.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+                else:
                     cursor.execute("COMMIT")
 
         await self._execute_db_operation(_do_update)
@@ -265,6 +348,17 @@ class DiffusionTrainer(SDTrainer):
         """Non-blocking update of the step count."""
         if self.accelerator.is_main_process and self.is_ui_trainer:
             self._run_async_operation(self._update_key("step", self.step_num))
+
+    def load_training_state_from_metadata_if_available(self):
+        """Read step/epoch from the latest checkpoint metadata without loading weights.
+        Safe to call early (e.g. before model load) so on_error() has the right step
+        if training is stopped during the loading / quantization phase."""
+        try:
+            latest = self.get_latest_save_path()
+            if latest is not None:
+                self.load_training_state_from_metadata(latest)
+        except Exception:
+            pass
 
     def update_db_key(self, key, value):
         """Non-blocking update a key in the database."""
@@ -290,7 +384,13 @@ class DiffusionTrainer(SDTrainer):
                             "UPDATE Job SET status = ? WHERE id = ?",
                             (status, self.job_id)
                         )
-                finally:
+                except Exception:
+                    try:
+                        cursor.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+                else:
                     cursor.execute("COMMIT")
 
         await self._execute_db_operation(_do_update)
@@ -299,6 +399,102 @@ class DiffusionTrainer(SDTrainer):
         """Non-blocking update of status."""
         if self.accelerator.is_main_process and self.is_ui_trainer:
             self._run_async_operation(self._update_status(status, info))
+
+    def append_alert(self, alert_type: str, message: str, data: dict = None):
+        """Append one alert to the Job.alerts JSON column (capped at 50 entries).
+        Synchronous with BEGIN IMMEDIATE so concurrent alert writes can't corrupt the JSON."""
+        if not self.accelerator.is_main_process or not self.is_ui_trainer:
+            return
+        import datetime
+        alert = {
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "step": self.step_num,
+            "type": alert_type,
+            "message": message,
+            "data": data or {},
+        }
+        try:
+            def _do_append():
+                with self._db_connect() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("BEGIN IMMEDIATE")
+                    try:
+                        row = cursor.execute(
+                            "SELECT alerts FROM Job WHERE id = ?", (self.job_id,)
+                        ).fetchone()
+                        existing = json.loads(row[0]) if row and row[0] else []
+                        existing.append(alert)
+                        if len(existing) > 50:
+                            existing = existing[-50:]
+                        cursor.execute(
+                            "UPDATE Job SET alerts = ? WHERE id = ?",
+                            (json.dumps(existing), self.job_id)
+                        )
+                    except Exception:
+                        try:
+                            cursor.execute("ROLLBACK")
+                        except Exception:
+                            pass
+                        raise
+                    else:
+                        cursor.execute("COMMIT")
+            self._retry_db_operation(_do_append)
+        except Exception as e:
+            print(f"[AITK] Warning: could not write alert to DB: {e}")
+
+    def preserve_safe_snapshot(self, reason: str):
+        """Copy the most recent checkpoint's .safetensors and .pt files to
+        {save_root}/_safe_snapshots/{reason}_step_{N}/ so they survive cleanup."""
+        if not self.accelerator.is_main_process or not self.is_ui_trainer:
+            return
+        try:
+            save_root = getattr(self, 'save_root', None)
+            if not save_root:
+                return
+            # Find the most recent step_* checkpoint directory
+            step_dirs = sorted(
+                _glob.glob(os.path.join(save_root, "step_*")),
+                key=lambda p: int(p.rsplit("_", 1)[-1]) if p.rsplit("_", 1)[-1].isdigit() else -1
+            )
+            if not step_dirs:
+                print(f"[AITK] Safe snapshot: no checkpoint found to snapshot (step {self.step_num})")
+                return
+            src_dir = step_dirs[-1]
+            snap_name = f"{reason}_step_{self.step_num}"
+            dst_dir = os.path.join(save_root, "_safe_snapshots", snap_name)
+            os.makedirs(dst_dir, exist_ok=True)
+
+            copied = []
+            for pattern in ("*.safetensors", "*.pt"):
+                for fpath in _glob.glob(os.path.join(src_dir, pattern)):
+                    dst = os.path.join(dst_dir, os.path.basename(fpath))
+                    shutil.copy2(fpath, dst)
+                    copied.append(os.path.basename(fpath))
+
+            if not copied:
+                print(f"[AITK] Safe snapshot: no .safetensors/.pt files found in {src_dir}")
+                return
+
+            import datetime
+            readme = (
+                f"Safe snapshot — training anomaly detected\n"
+                f"Reason: {reason}\n"
+                f"Detected at step: {self.step_num}\n"
+                f"Timestamp: {datetime.datetime.utcnow().isoformat()}Z\n"
+                f"Source checkpoint: {src_dir}\n"
+                f"Files preserved: {', '.join(copied)}\n\n"
+                f"To restore:\n"
+                f"  1. Copy the .safetensors file(s) back to the output directory.\n"
+                f"  2. Set 'resume_lora_model' in your config to point at the .safetensors.\n"
+                f"  3. For WAN 2.2: both high and low noise files must be present.\n"
+                f"  4. Restart training from the UI.\n"
+            )
+            with open(os.path.join(dst_dir, "README.txt"), "w") as f:
+                f.write(readme)
+
+            print(f"[AITK] Safe snapshot saved to {dst_dir} ({len(copied)} file(s): {', '.join(copied)})")
+        except Exception as e:
+            print(f"[AITK] Warning: safe snapshot failed: {e}")
 
     async def wait_for_all_async(self):
         """Wait for all tracked async operations to complete."""
@@ -313,13 +509,43 @@ class DiffusionTrainer(SDTrainer):
             # Clear the task list after completion
             self._async_tasks.clear()
 
+    def _is_oom_error(self, e: Exception) -> bool:
+        msg = str(e).lower()
+        return (
+            isinstance(e, (MemoryError,))
+            or "out of memory" in msg
+            or "cuda out of memory" in msg
+            or "cudaerroroutofmemory" in msg
+        )
+
     def on_error(self, e: Exception):
         super(DiffusionTrainer, self).on_error(e)
         if self.is_ui_trainer:
             try:
-                if self.accelerator.is_main_process and not self.is_stopping:
+                is_intentional = self.is_stopping or isinstance(e, (KeyboardInterrupt, JobStoppedException)) or "Job stopped" in str(e)
+                if self.accelerator.is_main_process and not is_intentional:
+                    if self._is_oom_error(e):
+                        import torch as _torch
+                        vram_info = ""
+                        try:
+                            alloc = _torch.cuda.memory_allocated() / 1024**3
+                            reserved = _torch.cuda.memory_reserved() / 1024**3
+                            total = _torch.cuda.get_device_properties(0).total_memory / 1024**3
+                            vram_info = f" (VRAM: {alloc:.1f}GB alloc / {reserved:.1f}GB reserved / {total:.1f}GB total)"
+                        except Exception:
+                            pass
+                        self.append_alert("oom", f"Out of memory at step {self.step_num}{vram_info}", {
+                            "step": self.step_num,
+                            "error": str(e)[:300],
+                        })
                     self.update_status("error", str(e))
-                self.update_db_key("step", self.last_save_step)
+                    self.update_db_key("step", self.last_save_step)
+                else:
+                    # If it's a KeyboardInterrupt, mark as stopped instead of error
+                    if not self.is_stopping and (isinstance(e, KeyboardInterrupt) or "Job stopped" in str(e)):
+                        self.update_status("stopped", "Job stopped by user")
+                    # On intentional stop/pause (including SIGINT), preserve the current step count
+                    self.update_db_key("step", self.step_num)
                 asyncio.run(self.wait_for_all_async())
             except Exception as db_err:
                 print(f"[AITK] Warning: failed to update DB during error handling: {db_err}")
@@ -342,22 +568,69 @@ class DiffusionTrainer(SDTrainer):
     def done_hook(self):
         super(DiffusionTrainer, self).done_hook()
         if self.is_ui_trainer:
-            self.update_status("completed", "Training completed")
+            if self.sample_only:
+                # Restore the status the job had before sample-only mode started
+                previous_status = os.environ.get("AITK_PREVIOUS_STATUS", "stopped")
+                self.update_status(previous_status, "Sampling complete")
+            else:
+                self.update_status("completed", "Training completed")
             # Wait for all async operations to finish before shutting down
             asyncio.run(self.wait_for_all_async())
             self.thread_pool.shutdown(wait=True)
 
+    def _check_loss_spike(self):
+        """Update rolling loss history and fire an alert if a spike is detected."""
+        loss = getattr(self, '_last_step_loss', 0.0)
+        # Compute rolling avg from history BEFORE appending so the spike doesn't
+        # inflate its own detection threshold.
+        if len(self._loss_history) >= 10:
+            rolling_avg = sum(self._loss_history) / len(self._loss_history)
+        else:
+            rolling_avg = None
+        self._loss_history.append(loss)
+        if rolling_avg is None:
+            return
+        if (loss > rolling_avg * 3 and loss > 0.4
+                and self.step_num - self._last_spike_step > 10):
+            self._last_spike_step = self.step_num
+            msg = f"Loss spike at step {self.step_num}: {loss:.4f} (rolling avg {rolling_avg:.4f}, {loss/rolling_avg:.1f}×)"
+            print(f"[AITK] ⚠ {msg}")
+            self.append_alert("loss_spike", msg, {
+                "current_loss": loss,
+                "rolling_avg": rolling_avg,
+                "ratio": round(loss / rolling_avg, 2),
+            })
+            self.preserve_safe_snapshot("loss_spike")
+
     def end_step_hook(self):
         super(DiffusionTrainer, self).end_step_hook()
+        self._check_loss_spike()
         if self.is_ui_trainer:
             self.update_step()
-            self.maybe_stop()
+            # Order matters: maybe_save() runs before maybe_stop() so that
+            # save-and-pause (save_now + stop set together) writes the checkpoint
+            # before the stop is raised. save()'s trailing maybe_stop() then stops
+            # cleanly. maybe_sample() is our on-demand sample feature.
             self.maybe_save()
+            self.maybe_sample()
+            self.maybe_stop()
             self.maybe_sample()
 
     def hook_before_model_load(self):
         super().hook_before_model_load()
+        # Validate sample LoRA paths before loading anything — fail fast rather than
+        # discovering a bad path only when the first sample is triggered mid-training.
+        from toolkit.util.get_model import get_model_class
+        ModelClass = get_model_class(self.model_config)
+        if hasattr(ModelClass, 'validate_sample_lora_paths'):
+            sample_configs = list({id(c): c for c in [self.sample_config, self.first_sample_config] if c is not None}.values())
+            ModelClass.validate_sample_lora_paths(self.model_config, *sample_configs)
         if self.is_ui_trainer:
+            # Pre-load step from checkpoint before the first maybe_stop() call so
+            # on_error() has the right step even if we stop during model
+            # loading / quantization (checkpoint weights aren't loaded until much later).
+            if self.step_num == 0:
+                self.load_training_state_from_metadata_if_available()
             self.maybe_stop()
             self.update_status("running", "Loading model")
 
@@ -367,13 +640,42 @@ class DiffusionTrainer(SDTrainer):
             self.maybe_stop()
             self.update_status("running", "Loading dataset")
 
+    def _persist_dataset_stats(self):
+        """Write image count + bucket distribution to Job.dataset_stats after caching."""
+        try:
+            all_datasets = []
+            if self.datasets:
+                all_datasets.extend(self.datasets)
+            if self.datasets_reg:
+                all_datasets.extend(self.datasets_reg)
+            if not all_datasets:
+                return
+            total_images = sum(len(ds.file_list) for ds in all_datasets if hasattr(ds, 'file_list'))
+            buckets: dict = {}
+            for ds in all_datasets:
+                if not hasattr(ds, 'buckets') or not isinstance(ds.buckets, dict) or not ds.buckets:
+                    continue
+                for key, bucket in ds.buckets.items():
+                    count = len(getattr(bucket, 'file_list_idx', []))
+                    buckets[key] = buckets.get(key, 0) + count
+            stats = {"total_images": total_images, "buckets": buckets}
+            self.update_db_key("dataset_stats", json.dumps(stats))
+        except Exception as e:
+            print(f"[AITK] Warning: could not persist dataset stats: {e}")
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         if self.is_ui_trainer:
             self.maybe_stop()
+            # Clear any stale save flag left over from a previous session that was
+            # stopped before completing a step (e.g. killed during model loading /
+            # quantization).  No steps have run yet this session, so there is nothing
+            # new to save.
+            self.reset_save()
             self.update_step()
             self.update_status("running", "Training")
             self.timer.add_after_print_hook(self.handle_timing_print_hook)
+            self._persist_dataset_stats()
 
     def status_update_hook_func(self, string):
         self.update_status("running", string)
@@ -383,6 +685,7 @@ class DiffusionTrainer(SDTrainer):
         if self.is_ui_trainer:
             self.maybe_stop()
             self.sd.add_status_update_hook(self.status_update_hook_func)
+            self.sd.add_maybe_stop_hook(self.maybe_stop)
 
     def sample_step_hook(self, img_num, total_imgs):
         super().sample_step_hook(img_num, total_imgs)
@@ -395,12 +698,50 @@ class DiffusionTrainer(SDTrainer):
         self.maybe_stop()
         total_imgs = len(self.sample_config.prompts)
         self.update_status("running", f"Generating images - 0/{total_imgs}")
-        super().sample(step, is_first)
+        if self.is_ui_trainer:
+            self.logger.record_sample_start()
+        try:
+            try:
+                super().sample(step, is_first)
+            except JobStoppedException:
+                raise
+            except Exception as e:
+                if self.sample_only:
+                    raise
+                print(f"\nWarning: Sample generation failed at step {step}, continuing training:\n{e}")
+                traceback.print_exc()
+                import torch as _torch
+                if self._is_oom_error(e):
+                    vram_info = ""
+                    try:
+                        reserved = _torch.cuda.memory_reserved() / 1024**3
+                        total = _torch.cuda.get_device_properties(0).total_memory / 1024**3
+                        vram_info = f" ({reserved:.1f}GB reserved / {total:.1f}GB total VRAM)"
+                    except Exception:
+                        pass
+                    self.append_alert("oom", f"Out of memory during sample generation at step {step}{vram_info}", {
+                        "step": step,
+                        "context": "sample_generation",
+                        "error": str(e)[:300],
+                    })
+                self.update_status("running", f"Sample failed (step {step}), continuing training")
+                _torch.cuda.empty_cache()
+                self.sd._after_sample_failure()
+        finally:
+            if self.is_ui_trainer:
+                self.logger.record_sample_end()
         self.maybe_stop()
-        self.update_status("running", "Training")
+        if self.sample_only:
+            # reset sample flag in DB
+            self.update_db_key("sample", False)
+        else:
+            self.update_status("running", "Training")
 
     def save(self, step=None):
-        self.maybe_stop()
+        # NOTE: ostris' upstream save() leads with maybe_stop(); we intentionally
+        # do NOT. Save-and-pause sets save_now + stop together, so a leading
+        # maybe_stop() would raise before the model is ever written to disk. The
+        # trailing maybe_stop() below handles the stop cleanly after the save.
         self.update_status("running", "Saving model")
         super().save(step)
         self.maybe_stop()

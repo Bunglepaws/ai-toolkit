@@ -29,6 +29,7 @@ export interface TextInputProps extends InputProps {
   type?: 'text' | 'password';
   disabled?: boolean;
   suffix?: React.ReactNode;
+  onKeyDown?: (e: React.KeyboardEvent<HTMLInputElement>) => void;
 }
 
 export const TextInput = forwardRef<HTMLInputElement, TextInputProps>((props: TextInputProps, ref) => {
@@ -43,6 +44,7 @@ export const TextInput = forwardRef<HTMLInputElement, TextInputProps>((props: Te
     className,
     docKey = null,
     suffix,
+    onKeyDown,
   } = props;
   let { doc } = props;
   if (!doc && docKey) {
@@ -74,6 +76,7 @@ export const TextInput = forwardRef<HTMLInputElement, TextInputProps>((props: Te
             onChange={e => {
               if (!disabled) onChange(e.target.value);
             }}
+            onKeyDown={onKeyDown}
             className="flex-1 min-w-0 bg-transparent text-sm px-3 py-1 text-gray-100 placeholder:text-gray-500 focus:outline-none"
             placeholder={placeholder}
             required={required}
@@ -91,6 +94,7 @@ export const TextInput = forwardRef<HTMLInputElement, TextInputProps>((props: Te
           onChange={e => {
             if (!disabled) onChange(e.target.value);
           }}
+          onKeyDown={onKeyDown}
           className={`${inputClasses} ${disabled ? 'opacity-30 cursor-not-allowed' : ''}`}
           placeholder={placeholder}
           required={required}
@@ -112,11 +116,12 @@ export interface TextAreaInputProps extends InputProps {
 }
 
 export const TextAreaInput = forwardRef<HTMLTextAreaElement, TextAreaInputProps>((props: TextAreaInputProps, ref) => {
-  const { label, value, onChange, placeholder, required, disabled, rows = 4, className, docKey = null } = props;
+  const { label, value, onChange, placeholder, required, disabled, rows, className, docKey = null } = props;
   let { doc } = props;
   if (!doc && docKey) {
     doc = getDoc(docKey);
   }
+  const autoGrow = rows === undefined;
   return (
     <div className={classNames(className)}>
       {label && (
@@ -140,6 +145,7 @@ export const TextAreaInput = forwardRef<HTMLTextAreaElement, TextAreaInputProps>
         required={required}
         disabled={disabled}
         rows={rows}
+        style={autoGrow ? ({ fieldSizing: 'content', resize: 'none', overflow: 'hidden', minHeight: '2rem' } as React.CSSProperties) : undefined}
       />
     </div>
   );

@@ -125,8 +125,9 @@ class QwenImageEditPlusModel(QwenImageModel):
         # flush_between_steps = self.model_config.low_vram
         flush_between_steps = False
 
-        # Fix a bug in diffusers/torch
+        # Fix a bug in diffusers/torch; also check for stop signal between denoising steps
         def callback_on_step_end(pipe, i, t, callback_kwargs):
+            self.maybe_stop()
             if flush_between_steps:
                 flush()
             latents = callback_kwargs["latents"]
@@ -134,34 +135,37 @@ class QwenImageEditPlusModel(QwenImageModel):
             return {"latents": latents}
 
         if self.model_config.low_vram:
-            # set vae to tile decode
             pipeline.vae.enable_tiling()
 
-        img = pipeline(
-            image=control_img_list,
-            prompt_embeds=conditional_embeds.text_embeds,
-            prompt_embeds_mask=conditional_embeds.attention_mask.to(
-                self.device_torch, dtype=torch.int64
-            ),
-            negative_prompt_embeds=unconditional_embeds.text_embeds,
-            negative_prompt_embeds_mask=unconditional_embeds.attention_mask.to(
-                self.device_torch, dtype=torch.int64
-            ),
-            height=gen_config.height,
-            width=gen_config.width,
-            num_inference_steps=gen_config.num_inference_steps,
-            true_cfg_scale=gen_config.guidance_scale,
-            latents=gen_config.latents,
-            generator=generator,
-            callback_on_step_end=callback_on_step_end,
-            do_cfg_norm=gen_config.do_cfg_norm,
-            **extra,
-        ).images[0]
+        if getattr(self, '_sampling_lora_ready', False):
+            self._lora_move(pipeline.transformer, "sampling_lora", self.device_torch)
+        try:
+            img = pipeline(
+                image=control_img_list,
+                prompt_embeds=conditional_embeds.text_embeds,
+                prompt_embeds_mask=conditional_embeds.attention_mask.to(
+                    self.device_torch, dtype=torch.int64
+                ),
+                negative_prompt_embeds=unconditional_embeds.text_embeds,
+                negative_prompt_embeds_mask=unconditional_embeds.attention_mask.to(
+                    self.device_torch, dtype=torch.int64
+                ),
+                height=gen_config.height,
+                width=gen_config.width,
+                num_inference_steps=gen_config.num_inference_steps,
+                true_cfg_scale=gen_config.guidance_scale,
+                latents=gen_config.latents,
+                generator=generator,
+                callback_on_step_end=callback_on_step_end,
+                do_cfg_norm=gen_config.do_cfg_norm,
+                **extra,
+            ).images[0]
+        finally:
+            if getattr(self, '_sampling_lora_ready', False):
+                self._lora_move(pipeline.transformer, "sampling_lora", "cpu")
 
         if self.model_config.low_vram:
-            # restore no tiling
             pipeline.vae.disable_tiling()
-
         return img
 
     def condition_noisy_latents(

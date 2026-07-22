@@ -10,12 +10,13 @@ class BaseJob:
     def __init__(self, config: OrderedDict):
         if not config:
             raise ValueError('config is required')
-        self.process: List[BaseProcess]
+        self.process: List[BaseProcess] = []
 
         self.config = config['config']
         self.raw_config = config
         self.job = config['job']
         self.name = self.get_conf('name', required=True)
+        self.sample_only = False
         if 'meta' in config:
             self.meta = config['meta']
         else:

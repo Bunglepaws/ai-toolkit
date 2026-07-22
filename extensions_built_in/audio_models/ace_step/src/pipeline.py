@@ -87,6 +87,7 @@ class AceStep15Pipeline:
         time_sig="N/A",
         language="en",
         guidance_scale=1.0,
+        context_latents: Optional[torch.Tensor] = None,
     ):
         t_sched = compute_timesteps(num_inference_steps, 3.0)
         latent_len = int(duration * self.LATENT_RATE)
@@ -97,10 +98,14 @@ class AceStep15Pipeline:
         if encoder_embeddings is not None and encoder_mask is not None:
             enc_h = encoder_embeddings
             enc_m = encoder_mask
-            sil = get_silence_latent(latent_len, device, dtype)  # [1, 64, T]
-            src = sil.transpose(1, 2)  # [1, T, 64]
-            chunk_masks = torch.ones_like(src)
-            ctx = torch.cat([src, chunk_masks.to(src.dtype)], dim=-1)
+            if context_latents is not None:
+                # Pre-computed lm_hints context from Qwen3 LM — use instead of silence
+                ctx = context_latents.to(device=device, dtype=dtype)
+            else:
+                sil = get_silence_latent(latent_len, device, dtype)  # [1, 64, T]
+                src = sil.transpose(1, 2)  # [1, T, 64]
+                chunk_masks = torch.ones_like(src)
+                ctx = torch.cat([src, chunk_masks.to(src.dtype)], dim=-1)
         else:
             text_h, text_m, lyric_h, lyric_m = self.get_text_embedings(
                 prompt, lyrics, bpm, key, time_sig, duration, language
@@ -158,10 +163,15 @@ class AceStep15Pipeline:
             else:
                 xt = xt - vt * (tv - t_sched_t[i + 1].item())
 
-        # VAE decode
+        # VAE decode in float32: SnakeBeta exp/sin activations lose high-frequency
+        # precision in bf16, causing the "underwater" smearing of instruments.
+        # Same pattern as SD VAEs which are always kept in float32.
+        vae_dtype = next(self.vae.parameters()).dtype
+        self.vae.float()
         if self.do_tiled_decoding:
-            wav = self.vae.tiled_decode(xt.transpose(1, 2))  # [1, 2, samples]
+            wav = self.vae.tiled_decode(xt.float().transpose(1, 2))  # [1, 2, samples]
         else:
-            wav = self.vae.decode(xt.transpose(1, 2))  # [1, 2, samples]
+            wav = self.vae.decode(xt.float().transpose(1, 2))  # [1, 2, samples]
+        self.vae.to(vae_dtype)
         wav = wav[0, :, : int(duration * SAMPLE_RATE)]
-        return wav
+        return wav.float()

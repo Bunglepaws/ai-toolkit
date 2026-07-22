@@ -1,5 +1,9 @@
 from functools import partial
+import io
 import os
+import pickle
+import time
+import requests
 from typing import List, Optional
 
 import torch
@@ -17,9 +21,10 @@ from toolkit.samplers.custom_flowmatch_sampler import (
 from accelerate import init_empty_weights
 from toolkit.accelerator import unwrap_model
 from optimum.quanto import freeze
-from toolkit.util.quantize import quantize, get_qtype, quantize_model
+from toolkit.util.quantize import quantize, get_qtype, quantize_model, filter_lora_state_dict_for_quantized_model
 from toolkit.memory_management import MemoryManager
 from safetensors.torch import load_file
+from safetensors import safe_open
 from PIL import Image
 import huggingface_hub
 
@@ -80,6 +85,10 @@ vocoder_prefix = "vocoder."
 base_te_path = "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized"
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
+LTXV_API_BASE_URL = "https://api.ltx.video"
+LTXV_MODEL_ID_KEY = "encrypted_wandb_properties"
+# Read from env as fallback; model config gemma_api_key takes precedence if both are set
+_GEMMA_API_KEY_FROM_ENV = os.getenv("GEMMA_API_KEY", None)
 
 
 def new_save_image_function(
@@ -90,11 +99,13 @@ def new_save_image_function(
     **kwargs,
 ):
     # this replaces gen image config save image function so we can save the video with sound from ltx2
-    image["output_path"] = self.get_image_path(count, max_count)
+    output_path = self.get_image_path(count, max_count)
+    image["output_path"] = output_path
     # make sample directory if it does not exist
-    os.makedirs(os.path.dirname(image["output_path"]), exist_ok=True)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     encode_video(**image)
     flush()
+    self._embed_mp4_metadata(output_path)
 
 
 def blank_log_image_function(self, *args, **kwargs):
@@ -203,6 +214,12 @@ class LTX2Model(BaseModel):
     ltx_version = "2.0"
     ltx_te_path = None
 
+    @property
+    def text_embedding_space_version(self):
+        if getattr(self.model_config, 'gemma_api_key', None) is not None:
+            return self.arch + "_gemma_api"
+        return self.arch
+
     def __init__(
         self,
         device,
@@ -233,6 +250,21 @@ class LTX2Model(BaseModel):
         # invalidate older caches
         self.latent_space_version = f"{self.arch}_v2"
 
+        # cached model_id for Gemma API mode (extracted from checkpoint metadata at load time)
+        self._gemma_model_id: Optional[str] = None
+        self._gemma_api_last_call_time: float = 0.0
+
+        # Resolve effective API key (model config YAML > env var injected by UI from Settings)
+        # use_gemma_api: false explicitly disables the API even if the env var is set.
+        if self.model_config.gemma_api_key is None and self.model_config.use_gemma_api:
+            if _GEMMA_API_KEY_FROM_ENV:
+                self.model_config.gemma_api_key = _GEMMA_API_KEY_FROM_ENV
+            else:
+                raise ValueError(
+                    "use_gemma_api is enabled but no GEMMA_API_KEY was found. "
+                    "Set your Lightricks API key in the AI Toolkit Settings page."
+                )
+
     # static method to get the noise scheduler
     @staticmethod
     def get_train_scheduler():
@@ -241,97 +273,27 @@ class LTX2Model(BaseModel):
     def get_bucket_divisibility(self):
         return 32
 
-    def load_model(self):
+    def reload_text_encoder(self):
+        """Reload Gemma text encoder from disk after it was unloaded into a FakeTextEncoder stub.
+
+        Called by the persistent-process model cache (run_ui.py) when the hot model
+        is reused for a new job but the text encoder was already unloaded by the
+        previous job's embedding-caching step. Only runs in non-API mode; Gemma API
+        mode leaves text_encoder=[] and this is a no-op.
+        """
+        if self.model_config.gemma_api_key is not None:
+            return  # API handles encoding; nothing to reload
+
         dtype = self.torch_dtype
-        self.print_and_status_update("Loading LTX2 model")
         model_path = self.model_config.name_or_path
-        base_model_path = self.model_config.extras_name_or_path
 
-        combined_state_dict = None
+        self.print_and_status_update("Reloading text encoder")
 
-        self.print_and_status_update("Loading transformer")
-
-        if not os.path.exists(model_path) and model_path.endswith(".safetensors"):
-            # download the model from the Hugging Face Hub if it is not a local path
-            splits = model_path.split("/")
-            if len(splits) != 3:
-                raise ValueError(
-                    f"Invalid model path: {model_path}. Must be in the format 'repo_id/repo/filename.safetensors' to download from the Hugging Face Hub."
-                )
-            # download the model from the hub
-            model_path = huggingface_hub.hf_hub_download(
-                repo_id="/".join(splits[:2]),
-                filename=splits[2],
-                token=HF_TOKEN,
-            )
-
-        # if we have a safetensors file it is a mono checkpoint
-        if os.path.exists(model_path) and model_path.endswith(".safetensors"):
-            combined_state_dict = load_file(model_path)
-            combined_state_dict = dequantize_state_dict(combined_state_dict)
-
-        if combined_state_dict is not None:
-            original_dit_ckpt = get_model_state_dict_from_combined_ckpt(
-                combined_state_dict, dit_prefix
-            )
-            transformer = convert_ltx2_transformer(
-                original_dit_ckpt, version=self.ltx_version
-            )
-            transformer = transformer.to(dtype)
-        else:
-            transformer_path = model_path
-            transformer_subfolder = "transformer"
-            if os.path.exists(transformer_path):
-                transformer_subfolder = None
-                transformer_path = os.path.join(transformer_path, "transformer")
-                # check if the path is a full checkpoint.
-                te_folder_path = os.path.join(model_path, "text_encoder")
-                # if we have the te, this folder is a full checkpoint, use it as the base
-                if os.path.exists(te_folder_path):
-                    base_model_path = model_path
-
-            transformer = LTX2VideoTransformer3DModel.from_pretrained(
-                transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
-            )
-
-        if self.model_config.quantize:
-            self.print_and_status_update("Quantizing Transformer")
-            quantize_model(self, transformer)
-            flush()
-
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_transformer_percent > 0
-        ):
-            ignore_modules = []
-            for block in transformer.transformer_blocks:
-                ignore_modules.append(block.scale_shift_table)
-                ignore_modules.append(block.audio_scale_shift_table)
-                ignore_modules.append(block.video_a2v_cross_attn_scale_shift_table)
-                ignore_modules.append(block.audio_a2v_cross_attn_scale_shift_table)
-            ignore_modules.append(transformer.scale_shift_table)
-            ignore_modules.append(transformer.audio_scale_shift_table)
-            MemoryManager.attach(
-                transformer,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_transformer_percent,
-                ignore_modules=ignore_modules,
-            )
-
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving transformer to CPU")
-            transformer.to("cpu")
-
-        flush()
-
-        self.print_and_status_update("Loading text encoder")
         if (
             self.model_config.te_name_or_path is not None
             and self.model_config.te_name_or_path.endswith(".safetensors")
         ):
-            # load from comfyui gemma3 checkpoint
             tokenizer = GemmaTokenizerFast.from_pretrained(base_te_path)
-
             with init_empty_weights():
                 text_encoder = Gemma3ForConditionalGeneration(
                     Gemma3Config(
@@ -397,37 +359,30 @@ class LTX2Model(BaseModel):
             te_state_dict = convert_comfy_gemma3_to_transformers(te_state_dict)
             for key in te_state_dict:
                 te_state_dict[key] = te_state_dict[key].to(dtype)
-
             text_encoder.load_state_dict(te_state_dict, assign=True, strict=True)
             del te_state_dict
             flush()
         elif self.model_config.te_name_or_path is not None:
-            # a repo or folder
-            tokenizer = GemmaTokenizerFast.from_pretrained(
-                self.model_config.te_name_or_path
-            )
+            tokenizer = GemmaTokenizerFast.from_pretrained(self.model_config.te_name_or_path)
             text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
                 self.model_config.te_name_or_path, dtype=dtype
             )
         elif self.ltx_te_path is not None:
-            # pull from model specific te
             tokenizer = GemmaTokenizerFast.from_pretrained(self.ltx_te_path)
             text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
                 self.ltx_te_path, dtype=dtype
             )
         else:
-            # using combo hf repo
             tokenizer = GemmaTokenizerFast.from_pretrained(
-                self.model_config.name_or_path, subfolder="tokenizer"
+                model_path, subfolder="tokenizer"
             )
             text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
-                self.model_config.name_or_path, subfolder="text_encoder", dtype=dtype
+                model_path, subfolder="text_encoder", dtype=dtype
             )
 
-        # remove the vision tower
         text_encoder.model.vision_tower = None
         flush()
-        
+
         if self.model_config.quantize_te:
             self.print_and_status_update("Quantizing Text Encoder")
             quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
@@ -448,7 +403,244 @@ class LTX2Model(BaseModel):
             )
 
         text_encoder.to(self.device_torch, dtype=dtype)
+        text_encoder.requires_grad_(False)
+        text_encoder.eval()
         flush()
+
+        self.pipeline.text_encoder = text_encoder
+        self.text_encoder = [text_encoder]
+        self.print_and_status_update("Text encoder reloaded")
+
+    def load_model(self):
+        dtype = self.torch_dtype
+        self.print_and_status_update("Loading LTX2 model")
+        model_path = self.model_config.name_or_path
+        base_model_path = self.model_config.extras_name_or_path
+        use_gemma_api = self.model_config.gemma_api_key is not None
+
+        # Extract model_id from checkpoint metadata early so API calls work after load
+        if use_gemma_api and model_path.endswith(".safetensors") and os.path.exists(model_path):
+            with safe_open(model_path, framework="pt", device="cpu") as f:
+                metadata = f.metadata()
+                if metadata and LTXV_MODEL_ID_KEY in metadata:
+                    self._gemma_model_id = metadata[LTXV_MODEL_ID_KEY]
+                else:
+                    raise ValueError(
+                        f"Cannot use gemma_api_key: checkpoint '{model_path}' does not contain "
+                        f"'{LTXV_MODEL_ID_KEY}' metadata required by the API."
+                    )
+
+        combined_state_dict = None
+
+        self.print_and_status_update("Loading transformer")
+
+        if not os.path.exists(model_path) and model_path.endswith(".safetensors"):
+            # download the model from the Hugging Face Hub if it is not a local path
+            splits = model_path.split("/")
+            if len(splits) != 3:
+                raise ValueError(
+                    f"Invalid model path: {model_path}. Must be in the format 'repo_id/repo/filename.safetensors' to download from the Hugging Face Hub."
+                )
+            # download the model from the hub
+            model_path = huggingface_hub.hf_hub_download(
+                repo_id="/".join(splits[:2]),
+                filename=splits[2],
+                token=HF_TOKEN,
+            )
+
+        # if we have a safetensors file it is a mono checkpoint
+        if os.path.exists(model_path) and model_path.endswith(".safetensors"):
+            combined_state_dict = load_file(model_path)
+            combined_state_dict = dequantize_state_dict(combined_state_dict)
+
+        if combined_state_dict is not None:
+            original_dit_ckpt = get_model_state_dict_from_combined_ckpt(
+                combined_state_dict, dit_prefix
+            )
+            transformer = convert_ltx2_transformer(
+                original_dit_ckpt, version=self.ltx_version
+            )
+            transformer = transformer.to(dtype)
+        else:
+            transformer_path = model_path
+            transformer_subfolder = "transformer"
+            if os.path.exists(transformer_path):
+                transformer_subfolder = None
+                transformer_path = os.path.join(transformer_path, "transformer")
+                # check if the path is a full checkpoint.
+                te_folder_path = os.path.join(model_path, "text_encoder")
+                # if we have the te, this folder is a full checkpoint, use it as the base
+                if os.path.exists(te_folder_path):
+                    base_model_path = model_path
+
+            transformer = LTX2VideoTransformer3DModel.from_pretrained(
+                transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
+            )
+
+        if self.model_config.quantize:
+            self.print_and_status_update("Quantizing Transformer")
+            quantize_model(self, transformer)
+            flush()
+
+        self.maybe_stop()
+
+        if (
+            self.model_config.layer_offloading
+            and self.model_config.layer_offloading_transformer_percent > 0
+        ):
+            ignore_modules = []
+            for block in transformer.transformer_blocks:
+                ignore_modules.append(block.scale_shift_table)
+                ignore_modules.append(block.audio_scale_shift_table)
+                ignore_modules.append(block.video_a2v_cross_attn_scale_shift_table)
+                ignore_modules.append(block.audio_a2v_cross_attn_scale_shift_table)
+            ignore_modules.append(transformer.scale_shift_table)
+            ignore_modules.append(transformer.audio_scale_shift_table)
+            MemoryManager.attach(
+                transformer,
+                self.device_torch,
+                offload_percent=self.model_config.layer_offloading_transformer_percent,
+                ignore_modules=ignore_modules,
+            )
+
+        if self.model_config.low_vram:
+            self.print_and_status_update("Moving transformer to CPU")
+            transformer.to("cpu")
+
+        flush()
+
+        if use_gemma_api:
+            self.print_and_status_update("Skipping text encoder load (using Gemma API)")
+            text_encoder = None
+            tokenizer = None
+        else:
+            self.print_and_status_update("Loading text encoder")
+            if (
+                self.model_config.te_name_or_path is not None
+                and self.model_config.te_name_or_path.endswith(".safetensors")
+            ):
+                # load from comfyui gemma3 checkpoint
+                tokenizer = GemmaTokenizerFast.from_pretrained(base_te_path)
+
+                with init_empty_weights():
+                    text_encoder = Gemma3ForConditionalGeneration(
+                        Gemma3Config(
+                            **{
+                                "boi_token_index": 255999,
+                                "bos_token_id": 2,
+                                "eoi_token_index": 256000,
+                                "eos_token_id": 106,
+                                "image_token_index": 262144,
+                                "initializer_range": 0.02,
+                                "mm_tokens_per_image": 256,
+                                "model_type": "gemma3",
+                                "pad_token_id": 0,
+                                "text_config": {
+                                    "attention_bias": False,
+                                    "attention_dropout": 0.0,
+                                    "attn_logit_softcapping": None,
+                                    "cache_implementation": "hybrid",
+                                    "final_logit_softcapping": None,
+                                    "head_dim": 256,
+                                    "hidden_activation": "gelu_pytorch_tanh",
+                                    "hidden_size": 3840,
+                                    "initializer_range": 0.02,
+                                    "intermediate_size": 15360,
+                                    "max_position_embeddings": 131072,
+                                    "model_type": "gemma3_text",
+                                    "num_attention_heads": 16,
+                                    "num_hidden_layers": 48,
+                                    "num_key_value_heads": 8,
+                                    "query_pre_attn_scalar": 256,
+                                    "rms_norm_eps": 1e-06,
+                                    "rope_local_base_freq": 10000,
+                                    "rope_scaling": {"factor": 8.0, "rope_type": "linear"},
+                                    "rope_theta": 1000000,
+                                    "sliding_window": 1024,
+                                    "sliding_window_pattern": 6,
+                                    "torch_dtype": "bfloat16",
+                                    "use_cache": True,
+                                    "vocab_size": 262208,
+                                },
+                                "torch_dtype": "bfloat16",
+                                "transformers_version": "4.51.3",
+                                "unsloth_fixed": True,
+                                "vision_config": {
+                                    "attention_dropout": 0.0,
+                                    "hidden_act": "gelu_pytorch_tanh",
+                                    "hidden_size": 1152,
+                                    "image_size": 896,
+                                    "intermediate_size": 4304,
+                                    "layer_norm_eps": 1e-06,
+                                    "model_type": "siglip_vision_model",
+                                    "num_attention_heads": 16,
+                                    "num_channels": 3,
+                                    "num_hidden_layers": 27,
+                                    "patch_size": 14,
+                                    "torch_dtype": "bfloat16",
+                                    "vision_use_head": False,
+                                },
+                            }
+                        )
+                    )
+                te_state_dict = load_file(self.model_config.te_name_or_path)
+                te_state_dict = convert_comfy_gemma3_to_transformers(te_state_dict)
+                for key in te_state_dict:
+                    te_state_dict[key] = te_state_dict[key].to(dtype)
+
+                text_encoder.load_state_dict(te_state_dict, assign=True, strict=True)
+                del te_state_dict
+                flush()
+            elif self.model_config.te_name_or_path is not None:
+                # a repo or folder
+                tokenizer = GemmaTokenizerFast.from_pretrained(
+                    self.model_config.te_name_or_path
+                )
+                text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
+                    self.model_config.te_name_or_path, dtype=dtype
+                )
+            elif self.ltx_te_path is not None:
+                # pull from model specific te
+                tokenizer = GemmaTokenizerFast.from_pretrained(self.ltx_te_path)
+                text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
+                    self.ltx_te_path, dtype=dtype
+                )
+            else:
+                # using combo hf repo
+                tokenizer = GemmaTokenizerFast.from_pretrained(
+                    self.model_config.name_or_path, subfolder="tokenizer"
+                )
+                text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
+                    self.model_config.name_or_path, subfolder="text_encoder", dtype=dtype
+                )
+
+            # remove the vision tower
+            text_encoder.model.vision_tower = None
+            flush()
+
+            self.maybe_stop()
+
+            if self.model_config.quantize_te:
+                self.print_and_status_update("Quantizing Text Encoder")
+                quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
+                freeze(text_encoder)
+                flush()
+
+            if (
+                self.model_config.layer_offloading
+                and self.model_config.layer_offloading_text_encoder_percent > 0
+            ):
+                MemoryManager.attach(
+                    text_encoder,
+                    self.device_torch,
+                    offload_percent=self.model_config.layer_offloading_text_encoder_percent,
+                    ignore_modules=[
+                        text_encoder.model.language_model.base_model.embed_tokens
+                    ],
+                )
+
+            text_encoder.to(self.device_torch, dtype=dtype)
+            flush()
 
         self.print_and_status_update("Loading VAEs and other components")
         if combined_state_dict is not None:
@@ -522,18 +714,21 @@ class LTX2Model(BaseModel):
 
         self.print_and_status_update("Preparing Model")
 
-        text_encoder = [pipe.text_encoder]
-        tokenizer = [pipe.tokenizer]
-
         # leave it on cpu for now
         if not self.low_vram:
             pipe.transformer = pipe.transformer.to(self.device_torch)
 
         flush()
-        # just to make sure everything is on the right device and dtype
-        text_encoder[0].to(self.device_torch)
-        text_encoder[0].requires_grad_(False)
-        text_encoder[0].eval()
+
+        if pipe.text_encoder is not None:
+            text_encoder = [pipe.text_encoder]
+            tokenizer = [pipe.tokenizer]
+            text_encoder[0].to(self.device_torch)
+            text_encoder[0].requires_grad_(False)
+            text_encoder[0].eval()
+        else:
+            text_encoder = []
+            tokenizer = []
         flush()
 
         # save it to the model class
@@ -606,6 +801,344 @@ class LTX2Model(BaseModel):
 
         return latents.to(device, dtype=dtype)
 
+    @classmethod
+    def validate_sample_lora_paths(cls, model_config, *sample_configs):
+        """Called at job startup — raises FileNotFoundError if any configured LoRA path is missing."""
+        all_configs = [model_config] + list(sample_configs)
+        for cfg in all_configs:
+            if cfg is None:
+                continue
+            path = getattr(cfg, 'sample_lora_path', None)
+            if path and not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"Distill LoRA path not found (check your config before training starts): {path}"
+                )
+
+    def _has_distill_lora(self):
+        sc = getattr(self, 'sample_config', None)
+        if sc is not None and getattr(sc, 'sample_lora_path', None):
+            return True
+        return self.model_config.sample_lora_path is not None
+
+    def _lora_move(self, transformer, adapter_name, device):
+        """Move LoRA adapter weights for a transformer to the given device."""
+        for module in transformer.modules():
+            if hasattr(module, 'lora_A') and adapter_name in module.lora_A:
+                module.lora_A[adapter_name].to(device)
+                module.lora_B[adapter_name].to(device)
+
+    def _prepare_distill_lora(self, pipeline: "LTX2Pipeline"):
+        """Load the distill LoRA once and park weights on CPU.
+
+        _before_generate_images_loop calls this once before the sample loop.
+        Per-sample code moves weights to GPU and back via _lora_move.
+        """
+        import peft.tuners.lora.model as _peft_lora_model
+        from safetensors.torch import load_file as _load_safetensors
+
+        sc = getattr(self, 'sample_config', None)
+        lora_path = (getattr(sc, 'sample_lora_path', None) if sc else None) or self.model_config.sample_lora_path
+        strength = (getattr(sc, 'sample_lora_strength', None) if sc else None) or self.model_config.sample_lora_strength
+
+        if not os.path.exists(lora_path):
+            self.print_and_status_update(f"Warning: distill LoRA not found: {lora_path}")
+            return
+
+        # PEFT 0.18.x bug: dispatch_torchao called without required kwarg on quantized weights
+        _orig_dispatch_torchao = _peft_lora_model.dispatch_torchao
+        _peft_lora_model.dispatch_torchao = lambda *args, **kwargs: None
+
+        try:
+            # Clear any stale adapter registration before loading
+            if hasattr(pipeline.transformer, 'peft_config') and 'distill_lora' in pipeline.transformer.peft_config:
+                try:
+                    del pipeline.transformer.peft_config['distill_lora']
+                except Exception:
+                    pass
+            for module in pipeline.transformer.modules():
+                if hasattr(module, 'delete_adapter'):
+                    try:
+                        module.delete_adapter('distill_lora')
+                    except Exception:
+                        pass
+
+            # QLinear._load_from_state_dict (optimum.quanto) expects weight._data in the
+            # state dict (full-checkpoint format). During LoRA loading those keys are absent,
+            # causing KeyError. Monkey-patch it to fall back to nn.Module's default handler
+            # when the quantized sub-keys aren't present; restore immediately after loading.
+            _q_patch_cls = None
+            _orig_q_load = None
+            try:
+                from optimum.quanto import QLinear as _QLin
+                _orig_q_load = _QLin._load_from_state_dict
+                def _patched_q_load(self_mod, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+                    weight_name = prefix + "weight"
+                    if self_mod.weight_qtype is not None and weight_name not in state_dict and (weight_name + "._data") not in state_dict:
+                        return torch.nn.Module._load_from_state_dict(
+                            self_mod, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+                        )
+                    return _orig_q_load(self_mod, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+                _QLin._load_from_state_dict = _patched_q_load
+                _q_patch_cls = _QLin
+            except ImportError:
+                pass
+
+            lora_state_dict = _load_safetensors(lora_path)
+            # Filter only patchify_proj / audio_patchify_proj: PEFT's delete_adapter
+            # leaves weight=None on these specific quanto-wrapped layers after teardown,
+            # which crashes the next training forward pass. All other quantized layers
+            # (attention, ff_net) are handled safely by the QLinear monkey-patch above.
+            _UNSAFE_PREFIXES = (
+                "diffusion_model.patchify_proj.",
+                "diffusion_model.audio_patchify_proj.",
+            )
+            n_before = len(lora_state_dict)
+            lora_state_dict = {k: v for k, v in lora_state_dict.items() if not any(k.startswith(p) for p in _UNSAFE_PREFIXES)}
+            n_skipped = n_before - len(lora_state_dict)
+            if n_skipped:
+                self.print_and_status_update(
+                    f"Sampling LoRA: skipping {n_skipped} patchify_proj keys (PEFT teardown incompatible with quantized weights)"
+                )
+
+            load_strength = 0.25 if self._has_upscaler() else strength
+            self.print_and_status_update(f"Loading distill LoRA (strength={load_strength})")
+            pipeline.load_lora_weights(lora_state_dict, adapter_name="distill_lora")
+            pipeline.set_adapters(["distill_lora"], adapter_weights=[load_strength])
+            # Park on CPU until needed per-sample
+            self._lora_move(pipeline.transformer, "distill_lora", "cpu")
+        finally:
+            if _q_patch_cls is not None:
+                _q_patch_cls._load_from_state_dict = _orig_q_load
+            _peft_lora_model.dispatch_torchao = _orig_dispatch_torchao
+
+        self._distill_lora_ready = True
+
+    def _teardown_distill_lora(self, pipeline: "LTX2Pipeline" = None):
+        """Remove the distill LoRA adapter completely after all sampling is done.
+
+        pipeline is optional; if omitted, operates directly on self.model so this
+        can be called from _after_sample_failure without a pipeline reference.
+        """
+        transformer = pipeline.transformer if pipeline is not None else self.model
+        if hasattr(transformer, 'peft_config') and 'distill_lora' in transformer.peft_config:
+            try:
+                del transformer.peft_config['distill_lora']
+            except Exception:
+                pass
+        for module in transformer.modules():
+            if hasattr(module, 'delete_adapter'):
+                try:
+                    module.delete_adapter('distill_lora')
+                except Exception:
+                    pass
+        self._distill_lora_ready = False
+
+    def _after_sample_failure(self):
+        """Ensure the distill LoRA is never left attached to the training transformer after a sample crash."""
+        if getattr(self, '_distill_lora_ready', False):
+            try:
+                self._teardown_distill_lora()  # pipeline=None → operates on self.model
+            except Exception:
+                pass
+
+    def _validate_sample_config(self, image_configs):
+        if not self._has_distill_lora():
+            return
+        sc = getattr(self, 'sample_config', None)
+        path = (getattr(sc, 'sample_lora_path', None) if sc else None) or self.model_config.sample_lora_path
+        if path and not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Sample LoRA not found — aborting sample to avoid useless inference: {path}"
+            )
+
+    def _has_upscaler(self):
+        path = getattr(self.model_config, 'spatial_upscaler_path', None)
+        return bool(path and os.path.exists(path))
+
+    def _get_upsampler_model(self):
+        if getattr(self, '_upsampler_model', None) is not None:
+            return self._upsampler_model
+        from diffusers.pipelines.ltx.modeling_latent_upsampler import LTXLatentUpsamplerModel
+        from safetensors.torch import load_file as _load_sf
+        path = self.model_config.spatial_upscaler_path
+        self.print_and_status_update(f"Loading spatial upsampler: {os.path.basename(path)}")
+        state_dict = _load_sf(path, device="cpu")
+        model = LTXLatentUpsamplerModel(
+            in_channels=128,
+            mid_channels=1024,
+            num_blocks_per_stage=4,
+            dims=3,
+            spatial_upsample=True,
+            temporal_upsample=False,
+        )
+        model.load_state_dict(state_dict)
+        model = model.to(dtype=self.torch_dtype)
+        self._upsampler_model = model
+        return model
+
+    def _generate_two_pass(self, pipeline, gen_config, conditional_embeds, unconditional_embeds, generator, extra):
+        """Two-pass generation: half-res → spatial upscale → full-res refinement."""
+        full_h, full_w = gen_config.height, gen_config.width
+        bd = self.get_bucket_divisibility()
+        half_h = (full_h // 2 // bd) * bd
+        half_w = (full_w // 2 // bd) * bd
+
+        def _stop_cb(pipe, i, t, kw):
+            self.maybe_stop()
+            return kw
+
+        # Build Gemma passthrough if needed (captured once, reused both passes)
+        _video_hidden_dim = None
+        if self.model_config.gemma_api_key is not None:
+            _video_hidden_dim = pipeline.connectors.config.video_hidden_dim
+
+            class _GemmaPass(torch.nn.Module):
+                def forward(self_, text_embeds, attn_mask, **kwargs):
+                    return text_embeds[..., :_video_hidden_dim], text_embeds[..., _video_hidden_dim:], attn_mask
+
+        def _gemma_enter():
+            if _video_hidden_dim is None:
+                return None
+            orig = pipeline.connectors
+            pipeline.connectors = _GemmaPass()
+            return orig
+
+        def _gemma_exit(orig):
+            if orig is not None:
+                pipeline.connectors = orig
+
+        # ── Phase 1: half-resolution ──────────────────────────────────────────
+        p1_extra = {k: v for k, v in extra.items() if k != "image"}
+        if gen_config.ctrl_img is not None:
+            ctrl_half = Image.open(gen_config.ctrl_img).convert("RGB").resize((half_w, half_h), Image.LANCZOS)
+            p1_extra["image"] = ctrl_half
+
+        if getattr(self, '_distill_lora_ready', False):
+            pipeline.set_adapters(["distill_lora"], adapter_weights=[0.25])
+            self._lora_move(pipeline.transformer, "distill_lora", self.device_torch)
+            self.print_and_status_update("Phase 1: distill LoRA @ 0.25")
+
+        orig_conn = _gemma_enter()
+        try:
+            p1_out = pipeline(
+                prompt_embeds=conditional_embeds.text_embeds.to(self.device_torch, dtype=self.torch_dtype),
+                prompt_attention_mask=conditional_embeds.attention_mask.to(self.device_torch),
+                negative_prompt_embeds=unconditional_embeds.text_embeds.to(self.device_torch, dtype=self.torch_dtype),
+                negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(self.device_torch),
+                height=half_h,
+                width=half_w,
+                num_inference_steps=gen_config.num_inference_steps,
+                guidance_scale=gen_config.guidance_scale,
+                num_frames=gen_config.num_frames,
+                generator=generator,
+                return_dict=False,
+                output_type="latent",
+                callback_on_step_end=_stop_cb,
+                **p1_extra,
+            )
+        finally:
+            if getattr(self, '_distill_lora_ready', False):
+                try:
+                    torch.cuda.empty_cache()
+                    self._lora_move(pipeline.transformer, "distill_lora", "cpu")
+                except Exception as _e:
+                    print(f"\nWarning: two-pass phase 1 LoRA cleanup failed: {_e}")
+                    try:
+                        self._teardown_distill_lora(pipeline)
+                    except Exception:
+                        pass
+            _gemma_exit(orig_conn)
+
+        video_latents, audio_latents = p1_out  # both raw/denormalized
+
+        # ── Upscale: 2× spatial in latent space ──────────────────────────────
+        self.print_and_status_update("Upscaling latents 2×")
+        try:
+            upsampler_model = self._get_upsampler_model().to(self.device_torch)
+            with torch.no_grad():
+                upscaled = upsampler_model(video_latents.to(self.device_torch, dtype=upsampler_model.dtype))
+            upsampler_model.to("cpu")
+        except Exception as _up_err:
+            # Upsampler failed — tear down distill LoRA so training isn't left with it on CPU
+            if getattr(self, '_distill_lora_ready', False):
+                try:
+                    self._teardown_distill_lora(pipeline)
+                except Exception:
+                    pass
+            raise
+        torch.cuda.empty_cache()
+
+        # ── Phase 2: full-resolution refinement ──────────────────────────────
+        # For i2v: pass the ctrl image at full resolution so the pipeline re-encodes
+        # it and inserts it at frame 0 with strength 1.0.  All other image-like
+        # kwargs from phase 1 are dropped.
+        p2_extra = {k: v for k, v in extra.items() if k != "image"}
+        if gen_config.ctrl_img is not None:
+            ctrl_full = Image.open(gen_config.ctrl_img).convert("RGB").resize((full_w, full_h), Image.LANCZOS)
+            p2_extra["image"] = ctrl_full
+
+        # Free phase 1 latents before phase 2 to avoid holding both in VRAM simultaneously.
+        del video_latents
+        torch.cuda.empty_cache()
+
+        # Phase 2 uses a non-dynamic-shifting scheduler (matches distill LoRA training).
+        from diffusers import FlowMatchEulerDiscreteScheduler
+        orig_scheduler = pipeline.scheduler
+        pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+            pipeline.scheduler.config,
+            use_dynamic_shifting=False,
+        )
+
+        if getattr(self, '_distill_lora_ready', False):
+            pipeline.set_adapters(["distill_lora"], adapter_weights=[0.6])
+            self._lora_move(pipeline.transformer, "distill_lora", self.device_torch)
+            self.print_and_status_update("Phase 2: distill LoRA @ 0.6")
+
+        orig_conn = _gemma_enter()
+        try:
+            video, audio = pipeline(
+                prompt_embeds=conditional_embeds.text_embeds.to(self.device_torch, dtype=self.torch_dtype),
+                prompt_attention_mask=conditional_embeds.attention_mask.to(self.device_torch),
+                negative_prompt_embeds=unconditional_embeds.text_embeds.to(self.device_torch, dtype=self.torch_dtype),
+                negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(self.device_torch),
+                height=full_h,
+                width=full_w,
+                latents=upscaled.to(dtype=self.torch_dtype),
+                audio_latents=audio_latents,
+                noise_scale=0.85,
+                sigmas=[0.85, 0.725, 0.4219, 0.0],
+                guidance_scale=1.0,
+                num_frames=gen_config.num_frames,
+                generator=generator,
+                return_dict=False,
+                output_type="np",
+                callback_on_step_end=_stop_cb,
+                **p2_extra,
+            )
+        finally:
+            pipeline.scheduler = orig_scheduler
+            if getattr(self, '_distill_lora_ready', False):
+                try:
+                    torch.cuda.empty_cache()
+                    self._lora_move(pipeline.transformer, "distill_lora", "cpu")
+                except Exception as _e:
+                    print(f"\nWarning: two-pass phase 2 LoRA cleanup failed: {_e}")
+                    try:
+                        self._teardown_distill_lora(pipeline)
+                    except Exception:
+                        pass
+            _gemma_exit(orig_conn)
+
+        return video, audio
+
+    def _before_generate_images_loop(self, pipeline, image_configs):
+        if self._has_distill_lora():
+            self._prepare_distill_lora(pipeline)
+
+    def _after_generate_images_loop(self, pipeline):
+        if getattr(self, '_distill_lora_ready', False):
+            self._teardown_distill_lora(pipeline)
+
     def get_generation_pipeline(self):
         scheduler = LTX2Model.get_train_scheduler()
 
@@ -620,7 +1153,7 @@ class LTX2Model(BaseModel):
             vocoder=unwrap_model(self.pipeline.vocoder),
         )
         pipeline.transformer = unwrap_model(self.model)
-        pipeline.text_encoder = unwrap_model(self.text_encoder[0])
+        pipeline.text_encoder = unwrap_model(self.text_encoder[0]) if self.text_encoder else None
 
         pipeline = pipeline.to(self.device_torch)
 
@@ -716,30 +1249,74 @@ class LTX2Model(BaseModel):
                 True  # they dont set this in some examples in diffusers, but I believe it should always be true for 2.3
             )
 
-        video, audio = pipeline(
-            prompt_embeds=conditional_embeds.text_embeds.to(
-                self.device_torch, dtype=self.torch_dtype
-            ),
-            prompt_attention_mask=conditional_embeds.attention_mask.to(
-                self.device_torch
-            ),
-            negative_prompt_embeds=unconditional_embeds.text_embeds.to(
-                self.device_torch, dtype=self.torch_dtype
-            ),
-            negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(
-                self.device_torch
-            ),
-            height=gen_config.height,
-            width=gen_config.width,
-            num_inference_steps=gen_config.num_inference_steps,
-            guidance_scale=gen_config.guidance_scale,
-            latents=gen_config.latents,
-            num_frames=gen_config.num_frames,
-            generator=generator,
-            return_dict=False,
-            output_type="np" if is_video else "pil",
-            **extra,
-        )
+        def _stop_callback(pipe, i, t, callback_kwargs):
+            self.maybe_stop()
+            return callback_kwargs
+
+        use_two_pass = self._has_upscaler() and is_video and self.ltx_version == "2.3"
+        if use_two_pass:
+            video, audio = self._generate_two_pass(
+                pipeline, gen_config, conditional_embeds, unconditional_embeds, generator, extra
+            )
+        else:
+            if getattr(self, '_distill_lora_ready', False):
+                self._lora_move(pipeline.transformer, "distill_lora", self.device_torch)
+
+            # When using Gemma API the pipeline receives post-connector embeddings [batch, seq, 4096+2048].
+            # Temporarily replace pipeline.connectors with a passthrough that splits them.
+            _orig_connectors = None
+            if self.model_config.gemma_api_key is not None:
+                _video_hidden_dim = pipeline.connectors.config.video_hidden_dim
+
+                class _GemmaAPIConnectorPassthrough(torch.nn.Module):
+                    def forward(self, text_embeds, attn_mask, **kwargs):
+                        video = text_embeds[..., :_video_hidden_dim]
+                        audio = text_embeds[..., _video_hidden_dim:]
+                        return video, audio, attn_mask
+
+                _orig_connectors = pipeline.connectors
+                pipeline.connectors = _GemmaAPIConnectorPassthrough()
+
+            try:
+                video, audio = pipeline(
+                    prompt_embeds=conditional_embeds.text_embeds.to(
+                        self.device_torch, dtype=self.torch_dtype
+                    ),
+                    prompt_attention_mask=conditional_embeds.attention_mask.to(
+                        self.device_torch
+                    ),
+                    negative_prompt_embeds=unconditional_embeds.text_embeds.to(
+                        self.device_torch, dtype=self.torch_dtype
+                    ),
+                    negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(
+                        self.device_torch
+                    ),
+                    height=gen_config.height,
+                    width=gen_config.width,
+                    num_inference_steps=gen_config.num_inference_steps,
+                    guidance_scale=gen_config.guidance_scale,
+                    latents=gen_config.latents,
+                    num_frames=gen_config.num_frames,
+                    generator=generator,
+                    return_dict=False,
+                    output_type="np" if is_video else "pil",
+                    callback_on_step_end=_stop_callback,
+                    **extra,
+                )
+            finally:
+                if getattr(self, '_distill_lora_ready', False):
+                    try:
+                        torch.cuda.empty_cache()
+                        self._lora_move(pipeline.transformer, "distill_lora", "cpu")
+                    except Exception as _cleanup_err:
+                        print(f"\nWarning: Failed to park distill LoRA on CPU (OOM); tearing it down entirely: {_cleanup_err}")
+                        try:
+                            self._teardown_distill_lora(pipeline)
+                        except Exception:
+                            pass
+                if _orig_connectors is not None:
+                    pipeline.connectors = _orig_connectors
+
         if self.low_vram:
             # Restore no tiling
             # pipeline.vae.use_tiling = False
@@ -978,22 +1555,31 @@ class LTX2Model(BaseModel):
                     latents=None,
                 )
 
-            if self.pipeline.connectors.device != self.transformer.device:
-                self.pipeline.connectors.to(self.transformer.device)
+            if self.model_config.gemma_api_key is not None:
+                # API returns post-connector embeddings: [batch, seq, video_hidden_dim + audio_hidden_dim]
+                # e.g. [batch, seq, 4096 + 2048] = [batch, seq, 6144] — connectors already applied server-side
+                video_hidden_dim = self.pipeline.connectors.config.video_hidden_dim
+                api_embeds = text_embeddings.text_embeds.to(self.transformer.dtype)
+                connector_prompt_embeds = api_embeds[..., :video_hidden_dim]
+                connector_audio_prompt_embeds = api_embeds[..., video_hidden_dim:]
+                connector_attention_mask = text_embeddings.attention_mask
+            else:
+                if self.pipeline.connectors.device != self.transformer.device:
+                    self.pipeline.connectors.to(self.transformer.device)
 
-            # Padding side for default Gemma3-12B text encoder
-            tokenizer_padding_side = "left"
-            if getattr(self, "tokenizer", None) is not None:
-                tokenizer_padding_side = getattr(self.tokenizer, "padding_side", "left")
-            (
-                connector_prompt_embeds,
-                connector_audio_prompt_embeds,
-                connector_attention_mask,
-            ) = self.pipeline.connectors(
-                text_embeddings.text_embeds,
-                text_embeddings.attention_mask.to(self.transformer.dtype),
-                padding_side=tokenizer_padding_side,
-            )
+                # Padding side for default Gemma3-12B text encoder
+                tokenizer_padding_side = "left"
+                if getattr(self, "tokenizer", None) is not None:
+                    tokenizer_padding_side = getattr(self.tokenizer, "padding_side", "left")
+                (
+                    connector_prompt_embeds,
+                    connector_audio_prompt_embeds,
+                    connector_attention_mask,
+                ) = self.pipeline.connectors(
+                    text_embeddings.text_embeds,
+                    text_embeddings.attention_mask.to(self.transformer.dtype),
+                    padding_side=tokenizer_padding_side,
+                )
 
             # compute video and audio positional ids
             video_coords = self.transformer.rope.prepare_video_coords(
@@ -1053,7 +1639,69 @@ class LTX2Model(BaseModel):
 
         return unpacked_output
 
+    # Minimum seconds between consecutive API calls to stay within rate limits
+    _GEMMA_API_CALL_INTERVAL = 0.25
+
+    def _encode_via_gemma_api(self, prompts: List[str]) -> PromptEmbeds:
+        if self._gemma_model_id is None:
+            raise RuntimeError(
+                "Gemma model_id not available. Ensure name_or_path is a .safetensors checkpoint "
+                "with 'encrypted_wandb_properties' metadata."
+            )
+        api_key = self.model_config.gemma_api_key
+        all_embeds = []
+        all_masks = []
+        for prompt in prompts:
+            # Throttle consecutive calls to respect API rate limits
+            elapsed = time.monotonic() - self._gemma_api_last_call_time
+            if elapsed < self._GEMMA_API_CALL_INTERVAL:
+                time.sleep(self._GEMMA_API_CALL_INTERVAL - elapsed)
+            # API rejects empty strings; use a single space for unconditional/negative prompts
+            api_prompt = prompt if prompt and prompt.strip() else " "
+            payload = {"prompt": api_prompt, "model_id": self._gemma_model_id, "enhance_prompt": False}
+            try:
+                response = requests.post(
+                    f"{LTXV_API_BASE_URL}/v1/prompt-embedding",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    timeout=60,
+                )
+                if response.status_code == 401:
+                    raise RuntimeError("Invalid Gemma API key. Generate one at: https://console.ltx.video/")
+                # Retry on 429 (concurrency/rate limit) with exponential backoff
+                retry_delays = [5.0, 10.0, 20.0, 40.0]
+                for delay in retry_delays:
+                    if response.status_code != 429:
+                        break
+                    print(f"Gemma API rate limited, retrying in {delay:.0f}s...")
+                    time.sleep(delay)
+                    response = requests.post(
+                        f"{LTXV_API_BASE_URL}/v1/prompt-embedding",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        timeout=60,
+                    )
+                if response.status_code != 200:
+                    raise RuntimeError(f"Gemma API request failed ({response.status_code}): {response.text}")
+                self._gemma_api_last_call_time = time.monotonic()
+                conditioning = pickle.load(io.BytesIO(response.content))
+                # response format: [[text_embeds[1,1024,6144], {"pooled_output": None, "attention_mask": mask[1,1024]}]]
+                text_embeds = conditioning[0][0].cpu().to(self.torch_dtype)
+                attention_mask = conditioning[0][1]["attention_mask"].cpu()
+                all_embeds.append(text_embeds)
+                all_masks.append(attention_mask)
+            except RuntimeError:
+                raise
+            except Exception as e:
+                raise RuntimeError(f"Gemma API request failed: {e}") from e
+        pe = PromptEmbeds([torch.cat(all_embeds, dim=0), None])
+        pe.attention_mask = torch.cat(all_masks, dim=0)
+        return pe
+
     def get_prompt_embeds(self, prompt: str) -> PromptEmbeds:
+        if self.model_config.gemma_api_key is not None:
+            return self._encode_via_gemma_api(prompt)
+
         if self.pipeline.text_encoder.device != self.device_torch:
             self.pipeline.text_encoder.to(self.device_torch)
 

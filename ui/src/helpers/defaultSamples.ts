@@ -972,7 +972,7 @@ export const defaultIdeogramSamplesConfig: SampleConfig = {
   neg: '',
   seed: 42,
   walk_seed: true,
-  guidance_scale: 4,
+  guidance_scale: 7,
   sample_steps: 30,
   num_frames: 1,
   fps: 1,

@@ -33,6 +33,8 @@ export const defaultSliderConfig: SliderConfig = {
 
 export const defaultCompileOptions = {
   block_compile: true,
+  compile_mode: 'default',
+  compile_fullgraph: false,
 };
 
 export const defaultJobConfig: JobConfig = {
@@ -65,6 +67,7 @@ export const defaultJobConfig: JobConfig = {
           max_step_saves_to_keep: 4,
           save_format: 'diffusers',
           push_to_hub: false,
+          archive_optimizer: false,
         },
         datasets: [defaultDatasetConfig],
         train: {
@@ -109,6 +112,7 @@ export const defaultJobConfig: JobConfig = {
           qtype: 'qfloat8',
           quantize_te: true,
           qtype_te: 'qfloat8',
+          cache_quantized_model: false,
           arch: 'flex1',
           low_vram: false,
           model_kwargs: {},

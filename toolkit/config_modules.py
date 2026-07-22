@@ -31,6 +31,8 @@ class SaveConfig:
         self.push_to_hub: bool = kwargs.get("push_to_hub", False)
         self.hf_repo_id: Optional[str] = kwargs.get("hf_repo_id", None)
         self.hf_private: Optional[str] = kwargs.get("hf_private", False)
+        self.archive_optimizer: bool = kwargs.get("archive_optimizer", False)
+        self.save_with_step_num: bool = kwargs.get("save_with_step_num", True)
 
 class LoggingConfig:
     def __init__(self, **kwargs):
@@ -90,14 +92,15 @@ class SampleConfig:
         self.sample_steps = kwargs.get('sample_steps', 20)
         self.network_multiplier = kwargs.get('network_multiplier', 1)
         self.guidance_rescale = kwargs.get('guidance_rescale', 0.0)
-        self.ext: ImgExt = kwargs.get('format', 'jpg')
         self.adapter_conditioning_scale = kwargs.get('adapter_conditioning_scale', 1.0)
         self.refiner_start_at = kwargs.get('refiner_start_at',
                                            0.5)  # step to start using refiner on sample if it exists
         self.extra_values = kwargs.get('extra_values', [])
         self.num_frames = kwargs.get('num_frames', 1)
         self.fps: int = kwargs.get('fps', 16)
-        if self.num_frames > 1 and self.ext not in ['webp']:
+        default_ext = 'mp4' if self.num_frames > 1 else 'jpg'
+        self.ext: ImgExt = kwargs.get('format', default_ext)
+        if self.num_frames > 1 and self.ext not in ['webp', 'mp4']:
             print("Changing sample extention to animated webp")
             self.ext = 'webp'
         
@@ -112,7 +115,30 @@ class SampleConfig:
         self.samples = [SampleItem(self, **item) for item in raw_samples]
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
-        
+
+        # LoRA applied during sampling only (not training).
+        # Accepts old arch-specific names as backwards-compatible aliases.
+        self.sample_lora_path: Optional[str] = (
+            kwargs.get('sample_lora_path', None)
+            or kwargs.get('lightx2v_high_noise_lora_path', None)
+            or kwargs.get('distill_lora_path', None)
+            or kwargs.get('sampling_lora_path', None)
+            or None
+        )
+        # Second path for two-stage models (WAN 2.2 LightX2V low-noise stage)
+        self.sample_lora_path_2: Optional[str] = (
+            kwargs.get('sample_lora_path_2', None)
+            or kwargs.get('lightx2v_low_noise_lora_path', None)
+            or None
+        )
+        # Strength — check new name first, then old arch-specific names
+        self.sample_lora_strength: float = next(
+            (kwargs[k] for k in ('sample_lora_strength', 'lightx2v_lora_strength', 'distill_lora_strength', 'sampling_lora_strength') if k in kwargs),
+            1.0
+        )
+        # Second strength for two-stage models (WAN 2.2 low-noise stage)
+        self.sample_lora_strength_2: float = kwargs.get('sample_lora_strength_2', 1.0)
+
     @property
     def prompts(self):
         # for backwards compatibility as this is checked for length frequently
@@ -630,6 +656,9 @@ class ModelConfig:
         self.is_auraflow: bool = kwargs.get('is_auraflow', False)
         self.is_v3: bool = kwargs.get('is_v3', False)
         self.is_flux: bool = kwargs.get('is_flux', False)
+        self.is_ltx2: bool = kwargs.get('is_ltx2', False)
+        self.is_wan21: bool = kwargs.get('is_wan21', False)
+        self.is_z_image: bool = kwargs.get('is_z_image', False)
         self.is_lumina2: bool = kwargs.get('is_lumina2', False)
         if self.is_pixart_sigma:
             self.is_pixart = True
@@ -646,6 +675,33 @@ class ModelConfig:
         # mainly for decompression loras for distilled models
         self.assistant_lora_path = kwargs.get('assistant_lora_path', None)
         self.inference_lora_path = kwargs.get('inference_lora_path', None)
+        # Generic sampling LoRA — applied during sample generation only, not training.
+        # New canonical names; old arch-specific names accepted as aliases for YAML backwards compat.
+        self.sample_lora_path = (
+            kwargs.get('sample_lora_path', None)
+            or kwargs.get('lightx2v_high_noise_lora_path', None)
+            or kwargs.get('distill_lora_path', None)
+            or kwargs.get('sampling_lora_path', None)
+            or None
+        )
+        self.sample_lora_path_2 = (
+            kwargs.get('sample_lora_path_2', None)
+            or kwargs.get('lightx2v_low_noise_lora_path', None)
+            or None
+        )
+        self.sample_lora_strength = next(
+            (kwargs[k] for k in ('sample_lora_strength', 'lightx2v_lora_strength', 'distill_lora_strength', 'sampling_lora_strength') if k in kwargs),
+            1.0
+        )
+        self.sample_lora_strength_2 = kwargs.get('sample_lora_strength_2', 1.0)
+        # Old field aliases — kept so any code still referencing them directly continues to work
+        self.lightx2v_high_noise_lora_path = self.sample_lora_path
+        self.lightx2v_low_noise_lora_path = self.sample_lora_path_2
+        self.lightx2v_lora_strength = self.sample_lora_strength
+        self.distill_lora_path = self.sample_lora_path
+        self.distill_lora_strength = self.sample_lora_strength
+        self.sampling_lora_path = self.sample_lora_path
+        self.sampling_lora_strength = self.sample_lora_strength
         # a lora that stays inactive except during the unconditional (negative)
         # CFG pass -- used to learn the unconditional branch without a second model
         self.unconditional_lora_path = kwargs.get('unconditional_lora_path', None)
@@ -682,6 +738,9 @@ class ModelConfig:
         self.qtype = kwargs.get("qtype", "qfloat8")
         self.qtype_te = kwargs.get("qtype_te", "qfloat8")
         self.low_vram = kwargs.get("low_vram", False)
+        self.turbo_model_path = kwargs.get("turbo_model_path", None)
+        self.audio_lm_path = kwargs.get("audio_lm_path", None)
+        self.spatial_upscaler_path = kwargs.get("spatial_upscaler_path", None)
         self.attn_masking = kwargs.get("attn_masking", False)
         if self.attn_masking and not self.is_flux:
             raise ValueError("attn_masking is only supported with flux models currently")
@@ -697,7 +756,19 @@ class ModelConfig:
         self.split_model_other_module_param_count_scale = kwargs.get("split_model_other_module_param_count_scale", 0.3)
         
         self.te_name_or_path = kwargs.get("te_name_or_path", None)
-        
+
+        # API key for LTX Gemma text encoding — skips loading the 12B Gemma model locally.
+        # Can also be set via the GEMMA_API_KEY environment variable (injected by the UI from Settings).
+        self.gemma_api_key: Optional[str] = kwargs.get("gemma_api_key", None)
+        # When True and no explicit gemma_api_key is given, read the key from the GEMMA_API_KEY env var.
+        # Set this via the UI checkbox; the key itself comes from Settings.
+        self.use_gemma_api: bool = kwargs.get("use_gemma_api", False)
+
+        # When True, save the quantized transformer to disk after the first run and reload it on
+        # subsequent runs, skipping the slow GPU quantization step. Cache dir is supplied via the
+        # AITK_QUANTIZATION_CACHE_DIR env var (injected by the UI from Settings).
+        self.cache_quantized_model: bool = kwargs.get("cache_quantized_model", False)
+
         self.arch: ModelArch = kwargs.get("arch", None)
         
         # auto memory management, only for some models
@@ -779,6 +850,12 @@ class ModelConfig:
                 self.is_auraflow = True
             elif self.arch == 'flux':
                 self.is_flux = True
+            elif self.arch == 'ltx2':
+                self.is_ltx2 = True
+            elif self.arch == 'wan21':
+                self.is_wan21 = True
+            elif self.arch == 'z_image':
+                self.is_z_image = True
             elif self.arch == 'lumina2':
                 self.is_lumina2 = True
             elif self.arch == 'vega':
@@ -802,6 +879,12 @@ class ModelConfig:
                 self.arch = 'auraflow'
             elif kwargs.get('is_flux', False):
                 self.arch = 'flux'
+            elif kwargs.get('is_ltx2', False):
+                self.arch = 'ltx2'
+            elif kwargs.get('is_wan21', False):
+                self.arch = 'wan21'
+            elif kwargs.get('is_z_image', False):
+                self.arch = 'z_image'
             elif kwargs.get('is_lumina2', False):
                 self.arch = 'lumina2'
             elif kwargs.get('is_vega', False):
@@ -1089,6 +1172,36 @@ def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
     return new_config
 
 
+def _build_jpeg_exif_usercomment(text: str) -> bytes:
+    """
+    Build a minimal EXIF APP1 blob with UserComment (tag 0x9286) correctly
+    placed inside ExifIFD (not IFD0). PIL's getexif()/tobytes() puts 0x9286
+    in IFD0 which is technically wrong and invisible to MediaInfo/Windows/CivitAI.
+
+    Structure (little-endian TIFF):
+      offset 0  : TIFF header (8 bytes)
+      offset 8  : IFD0 — 1 entry: ExifIFD pointer (tag 0x8769)
+      offset 26 : ExifIFD — 1 entry: UserComment (tag 0x9286)
+      offset 44 : UserComment data ("UNICODE\\x00" + UTF-16-LE)
+    """
+    import struct
+    pack = struct.pack
+    user_comment = b'UNICODE\x00' + text.encode('utf-16-le')
+    exif_ifd_offset   = 26
+    user_comment_offset = 44
+    tiff = (
+        b'II' + pack('<H', 42) + pack('<I', 8) +           # TIFF header, IFD0 at 8
+        pack('<H', 1) +                                     # IFD0: 1 entry
+        pack('<HHI', 0x8769, 4, 1) + pack('<I', exif_ifd_offset) +  # ExifIFD ptr
+        pack('<I', 0) +                                     # IFD0 next = none
+        pack('<H', 1) +                                     # ExifIFD: 1 entry
+        pack('<HHI', 0x9286, 7, len(user_comment)) + pack('<I', user_comment_offset) +
+        pack('<I', 0) +                                     # ExifIFD next = none
+        user_comment
+    )
+    return b'Exif\x00\x00' + tiff
+
+
 class GenerateImageConfig:
     def __init__(
             self,
@@ -1124,6 +1237,7 @@ class GenerateImageConfig:
             fps: int = 15,
             ctrl_idx: int = 0,
             do_cfg_norm: bool = False,
+            sampler: str = '',
     ):
         self.width: int = width
         self.height: int = height
@@ -1132,8 +1246,8 @@ class GenerateImageConfig:
         self.guidance_rescale: float = guidance_rescale
         self.prompt: str = prompt
         self.prompt_2: str = prompt_2
-        self.negative_prompt: str = negative_prompt
-        self.negative_prompt_2: str = negative_prompt_2
+        self.negative_prompt: str = negative_prompt if isinstance(negative_prompt, str) else ''
+        self.negative_prompt_2: str = negative_prompt_2 if isinstance(negative_prompt_2, str) else None
         self.latents: Union[torch.Tensor | None] = latents
 
         self.output_path: str = output_path
@@ -1154,6 +1268,7 @@ class GenerateImageConfig:
         self.extra_values = extra_values if extra_values is not None else []
         self.num_frames = num_frames
         self.fps = fps
+        self.sampler = sampler
         self.ctrl_img = ctrl_img
         self.ctrl_idx = ctrl_idx
         
@@ -1227,7 +1342,111 @@ class GenerateImageConfig:
         # join with folder
         return os.path.join(self.output_folder, filename)
 
+    def _build_civitai_parameters(self) -> str:
+        # Matches the exact A1111 format CivitAI parses: prompt, then optional
+        # "Negative prompt:" line, then comma-separated settings — no trailing newline.
+        metadata_text = f"{self.prompt}\n"
+        if self.negative_prompt:
+            metadata_text += f"Negative prompt: {self.negative_prompt}\n"
+        settings_parts = [f"Steps: {self.num_inference_steps}"]
+        if self.sampler:
+            settings_parts.append(f"Sampler: {self.sampler}")
+        settings_parts.append(f"CFG scale: {self.guidance_scale}")
+        settings_parts.append(f"Seed: {self.seed}")
+        settings_parts.append(f"Size: {self.width}x{self.height}")
+        if self.num_frames > 1:
+            settings_parts.append(f"Frames: {self.num_frames}")
+            settings_parts.append(f"FPS: {self.fps}")
+        metadata_text += ", ".join(settings_parts)
+        return metadata_text
+
+    def _embed_mp4_metadata(self, output_path: str):
+        """
+        Embeds generation metadata into an MP4 using ffmpeg FFMETADATA1 format
+        (same approach as ComfyUI VideoHelperSuite).  The 'parameters' key is
+        stored as a named container tag readable by ffprobe / CivitAI.
+        Falls back to mutagen ©cmt if ffmpeg is not available.
+        """
+        import shutil
+        import subprocess
+        import tempfile
+
+        params = self._build_civitai_parameters()
+
+        def escape_ffmetadata(value: str) -> str:
+            # FFMETADATA1 requires escaping of = ; # \ and newlines
+            value = value.replace('\\', '\\\\')
+            value = value.replace(';', '\\;')
+            value = value.replace('#', '\\#')
+            value = value.replace('=', '\\=')
+            value = value.replace('\n', '\\\n')
+            return value
+
+        ffmpeg_exe = shutil.which('ffmpeg')
+        if ffmpeg_exe:
+            metadata_file = None
+            temp_path = output_path + '.tmp.mp4'
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode='w', suffix='.txt', delete=False, encoding='utf-8'
+                ) as f:
+                    metadata_file = f.name
+                    f.write(';FFMETADATA1\n')
+                    f.write(f'parameters={escape_ffmetadata(params)}\n')
+                    f.write(f'comment={escape_ffmetadata(params)}\n')
+
+                result = subprocess.run(
+                    [ffmpeg_exe, '-y', '-v', 'error',
+                     '-i', output_path,
+                     '-i', metadata_file,
+                     '-map_metadata', '1',
+                     '-c', 'copy',
+                     '-movflags', 'use_metadata_tags',
+                     temp_path],
+                    capture_output=True,
+                )
+                if result.returncode == 0 and os.path.exists(temp_path):
+                    try:
+                        os.replace(temp_path, output_path)
+                    except OSError:
+                        # os.replace / os.rename fail on NTFS via WSL (DrvFs
+                        # does not allow atomic rename-over-existing).
+                        # Copy bytes in-place instead — this always works
+                        # because the file is open-for-write (mutagen does it).
+                        import shutil as _shutil
+                        with open(temp_path, 'rb') as _src, \
+                                open(output_path, 'wb') as _dst:
+                            _shutil.copyfileobj(_src, _dst)
+                        try:
+                            os.unlink(temp_path)
+                        except OSError:
+                            pass
+                    return
+            except Exception:
+                pass
+            finally:
+                if metadata_file and os.path.exists(metadata_file):
+                    try:
+                        os.unlink(metadata_file)
+                    except Exception:
+                        pass
+                if os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except Exception:
+                        pass
+
+        # Fallback: mutagen ©cmt (readable by our binary parser in the UI)
+        try:
+            from mutagen.mp4 import MP4
+            mp4 = MP4(output_path)
+            mp4['©cmt'] = [params]
+            mp4.save()
+        except Exception:
+            pass
+
     def save_image(self, image, count: int = 0, max_count=0):
+        import numpy as np
         # make parent dirs
         os.makedirs(self.output_folder, exist_ok=True)
         self.set_gen_time()
@@ -1235,37 +1454,75 @@ class GenerateImageConfig:
             # video
             if self.num_frames == 1:
                 raise ValueError(f"Expected 1 img but got a list {len(image)}")
-            if self.num_frames > 1 and self.output_ext not in ['webp']:
+            if self.num_frames > 1 and self.output_ext not in ['webp', 'mp4']:
                 self.output_ext = 'webp'
+            output_path = self.get_image_path(count, max_count)
             if self.output_ext == 'webp':
                 # save as animated webp
                 duration = 1000 // self.fps  # Convert fps to milliseconds per frame
                 image[0].save(
-                    self.get_image_path(count, max_count),
+                    output_path,
                     format='WEBP',
                     append_images=image[1:],
                     save_all=True,
                     duration=duration,  # Duration per frame in milliseconds
                     loop=0,  # 0 means loop forever
-                    quality=80  # Quality setting (0-100)
+                    quality=100  # Quality setting (0-100)
                 )
+            elif self.output_ext == 'mp4':
+                import av
+                container = av.open(output_path, mode='w')
+                stream = container.add_stream('libx264', rate=self.fps)
+                first_np = np.array(image[0])
+                stream.height = first_np.shape[0]
+                stream.width = first_np.shape[1]
+                stream.pix_fmt = 'yuv420p'
+                for pil_frame in image:
+                    frame = av.VideoFrame.from_ndarray(np.array(pil_frame), format='rgb24')
+                    for packet in stream.encode(frame):
+                        container.mux(packet)
+                for packet in stream.encode():
+                    container.mux(packet)
+                container.close()
+                self._embed_mp4_metadata(output_path)
             else:
                 raise ValueError(f"Unsupported video format {self.output_ext}")
         elif self.output_ext in ['wav', 'mp3', 'flac', 'ogg']:
             # save audio file
             audio_path = self.get_image_path(count, max_count)
-            torchaudio.save(
-                audio_path, 
-                image[0].to('cpu'),
-                sample_rate=48000, 
-                format=None, 
-                backend=None
-            )
+            audio = image.to('cpu').float()
+            if audio.dim() == 1:
+                audio = audio.unsqueeze(0)  # ensure [channels, samples]
             if self.output_ext == 'mp3':
+                import av
+                import numpy as np
+                audio_np = audio.numpy().clip(-1.0, 1.0).astype(np.float32)
+                n_ch = audio_np.shape[0]
+                layout = 'stereo' if n_ch >= 2 else 'mono'
+                with av.open(audio_path, 'w') as mp3_container:
+                    mp3_stream = mp3_container.add_stream('mp3', rate=48000)
+                    mp3_stream.bit_rate = 128000
+                    mp3_frame = av.AudioFrame.from_ndarray(audio_np[:2] if n_ch >= 2 else audio_np, format='fltp', layout=layout)
+                    mp3_frame.sample_rate = 48000
+                    for packet in mp3_stream.encode(mp3_frame):
+                        mp3_container.mux(packet)
+                    for packet in mp3_stream.encode(None):
+                        mp3_container.mux(packet)
                 add_album_artwork(audio_path)
+            else:
+                torchaudio.save(audio_path, audio, sample_rate=48000, format=None, backend=None)
         else:
-            # TODO save image gen header info for A1111 and us, our seeds probably wont match
-            image.save(self.get_image_path(count, max_count))
+            output_path = self.get_image_path(count, max_count)
+            params = self._build_civitai_parameters()
+            if self.output_ext == 'png':
+                from PIL import PngImagePlugin
+                pnginfo = PngImagePlugin.PngInfo()
+                pnginfo.add_text("parameters", params)
+                image.save(output_path, "PNG", pnginfo=pnginfo)
+            elif self.output_ext in ('jpg', 'jpeg'):
+                image.save(output_path, "JPEG", exif=_build_jpeg_exif_usercomment(params), quality=95)
+            else:
+                image.save(output_path)
             # do prompt file
             if self.add_prompt_file:
                 self.save_prompt_file(count, max_count)

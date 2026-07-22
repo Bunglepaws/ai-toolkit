@@ -13,9 +13,11 @@ export interface ConfirmState {
   title: string;
   message?: string;
   confirmText?: string;
+  secondaryConfirmText?: string;
   type?: 'danger' | 'warning' | 'info';
   inputTitle?: string;
   onConfirm?: (value?: string) => void | Promise<void>;
+  onSecondaryConfirm?: (value?: string) => void | Promise<void>;
   onCancel?: () => void;
 }
 
@@ -65,6 +67,13 @@ export default function ConfirmModal() {
   const onConfirm = () => {
     if (confirm?.onConfirm) {
       confirm.onConfirm(inputValue);
+    }
+    setIsOpen(false);
+  };
+
+  const onSecondaryConfirm = () => {
+    if (confirm?.onSecondaryConfirm) {
+      confirm.onSecondaryConfirm(inputValue);
     }
     setIsOpen(false);
   };
@@ -184,6 +193,15 @@ export default function ConfirmModal() {
               >
                 {confirm?.confirmText || 'Confirm'}
               </button>
+              {confirm?.secondaryConfirmText && (
+                <button
+                  type="button"
+                  onClick={onSecondaryConfirm}
+                  className="mt-3 inline-flex w-full justify-center rounded-md bg-gray-600 hover:bg-gray-500 px-3 py-2 text-sm font-semibold text-gray-200 shadow-xs sm:mt-0 sm:ml-3 sm:w-auto"
+                >
+                  {confirm.secondaryConfirmText}
+                </button>
+              )}
               <button
                 type="button"
                 data-autofocus

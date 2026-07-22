@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from collections import OrderedDict
 from typing import Optional, Union, List, Type, TYPE_CHECKING, Dict, Any, Literal
 
@@ -14,8 +15,34 @@ from toolkit.config_modules import NetworkConfig
 from toolkit.lorm import extract_conv, extract_linear, count_parameters
 from toolkit.metadata import add_model_hash_to_meta
 from toolkit.paths import KEYMAPS_ROOT
+from toolkit.print import print_acc
 from toolkit.saving import get_lora_keymap_from_model_keymap
 from optimum.quanto import QBytesTensor
+
+
+def _save_with_io_retry(save_fn, max_retries=3, base_delay=2.0):
+    """Retry a save callable on transient I/O errors (seen on WSL/NTFS-backed paths).
+
+    Losing the final checkpoint of a multi-hour run to a one-off disk hiccup is
+    far worse than waiting a few seconds and trying again.
+    """
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            return save_fn()
+        except Exception as e:
+            msg = str(e).lower()
+            is_io_error = isinstance(e, OSError) or "i/o error" in msg or "os error" in msg
+            if not is_io_error:
+                raise
+            last_err = e
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                print_acc(f" - Save failed ({e}), retrying in {delay:.1f}s... (attempt {attempt + 1}/{max_retries + 1})")
+                time.sleep(delay)
+            else:
+                print_acc(f" - Save failed after {max_retries + 1} attempts.")
+    raise last_err
 
 if TYPE_CHECKING:
     from toolkit.lycoris_special import LycorisSpecialNetwork, LoConSpecialModule
@@ -637,9 +664,9 @@ class ToolkitNetworkMixin:
         
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
-            save_file(save_dict, file, metadata)
+            _save_with_io_retry(lambda: save_file(save_dict, file, metadata))
         else:
-            torch.save(save_dict, file)
+            _save_with_io_retry(lambda: torch.save(save_dict, file))
 
     def load_weights(self: Network, file, force_weight_mapping=False):
         # allows us to save and load to and from ldm weights

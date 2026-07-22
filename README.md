@@ -2,6 +2,111 @@
 
 AI Toolkit is an easy to use all in one training suite for diffusion models. I try to support all the latest models on consumer grade hardware. Image and video models. It can be run as a GUI or CLI. It is designed to be easy to use but still have every feature imaginable. Free and open source.
 
+---
+
+## Fork Additions (MarcBate)
+
+This is a personal fork of [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit) with the following additions on top of upstream.
+
+### Training / Backend
+
+- **Save before pause** — checkpoint is always saved before stopping; `saveAndPauseJob()` sets `save` + `stop` atomically
+- **Save and Stop Queue** — saves checkpoint, stops job, and re-queues it for later resumption
+- **On-demand save/sample** — trigger a save or sample generation mid-training from the UI without stopping
+- **Stop during quantization** — `JobStoppedException(BaseException)` propagates through quantization loops via `maybe_stop()` hooks so Stop/Pause works even during slow model loading
+- **Abort active sampling** — "Return to Training" button aborts in-progress sample generation and resumes training immediately (`SampleAbortedException` + `stop_sample` DB flag)
+- **Persistent quantized model cache** — `run_ui.py` keeps the quantized model in system RAM between consecutive same-model queued jobs; only LoRA weights reload, skipping the multi-minute re-quantization (works for LTX-2.3, Qwen, Flux, etc.)
+- **Automagic v3 backward compat** — resumes from checkpoints saved by any prior v3 variant (per-row lr tensors, missing `dir_ema`/`prev_sign` keys all handled)
+- **LightX2V for WAN 2.2** — 4-step distilled samples (~40s vs ~6 min); PEFT adapter reuse fix
+- **LTX-2.3 distilled LoRA** — 8-step samples instead of 30
+- **Gemma API for LTX-2.3** — use free Gemma API instead of loading 12B text encoder locally
+- **Sampling LoRA (Krea 2 & Qwen Image)** — apply a LoRA only during sample generation, not training; useful for filter-bypass or style LoRAs (see [Krea 2 Training](#krea-2-training)); fixed crash on quantized Qwen Image models where `QModuleMixin._load_from_state_dict` would raise `KeyError` on `_data` keys belonging to unrelated modules
+- **Corrupt/truncated JSON captions** — graceful fallback with warning instead of crashing the job
+- **Optimizer archiving** — option to archive optimizer state on each save
+- **AceStep 1.5 XL audio LM (`audio_lm_path`)** — set `audio_lm_path` in your model config to a Qwen3 ACE15 safetensors file (e.g. `qwen_4b_ace15.safetensors`) to enable proper `lm_hints` context generation at sample time. Without this the DiT uses silence context and output quality is poor. The FSQ quantizer and AudioTokenDetokenizer are extracted automatically from the AIO base model file. Supports the XL AIO format (`ostris/ace_step_1.5_ComfyUI_files`); non-XL AIO untested.
+
+### UI — Queue & Job Management
+
+- **Drag-to-reorder queue** — drag jobs to reorder training queue; move-to-top button
+- **Queue filter** — filter jobs list by name, model path, or job ref with AND/OR/quoted search
+- **Save and Stop Queue** button in stop modal — saves checkpoint and re-queues the job
+- **Return to Training** button — aborts current sample batch and resumes training
+
+### UI — Settings
+
+- **AI Config Check settings** — API URL, key, model, and web-search toggle stored in DB and editable from the Settings page; no server file access or `.env.local` required; works with any OpenAI-compatible endpoint (Claude, Ollama, etc.)
+
+### UI — Model Config
+
+- **Compile options** — Compile Model checkbox exposes Block Compile, Compile Mode (default/max-autotune/fastest), and Full Graph toggle
+- **Cache quantized model** — skip re-quantization on subsequent runs
+- **Negative Prompt field** — exposed in job config UI
+- **Automagic v3 in optimizer dropdown** — was missing from upstream UI
+
+### UI — Loss Graph
+
+- **Settings persistence** — display settings (smooth/raw/log/clip) saved per job across sessions
+
+### UI — Samples
+
+- **Placeholder grid cells** — placeholders for unsampled slots keep grid aligned
+- **Prompt from file metadata** — reads prompt from PNG/MP4 metadata; falls back to job config
+- **On-demand sampling when idle** — generate samples for a completed job
+- **Step counter on Samples tab** — "Step X of Y" progress shown left of the Generate Samples Now button, updating live
+- **Sample button blocked during startup** — Generate Samples disabled while loading model, quantizing, encoding dataset, etc.; only active once in the training loop
+- **Toolbar sample button hidden on Samples tab** — avoids duplicate camera buttons when already on the Samples page
+
+### UI — Datasets / Captions
+
+- **Find & replace honors caption ext** — find/replace works correctly for JSON captions and respects the selected caption extension type
+- **Find & replace in JSON** — updates the `caption` field inside the JSON structure, preserving other fields
+- **Find & replace captions** — bulk find-and-replace with AND/OR/quoted search
+- **Caption filtering** — filter dataset images by caption content
+
+### UI — Training Alerts
+
+Real-time anomaly detection that writes to the DB and surfaces in the UI without ever pausing training.
+
+- **Loss spike detection** — rolling 50-step deque; flags when current loss > 3× average and > 0.4 absolute floor; 10-step debounce prevents alert storms during sustained divergence
+- **White-noise sample detection** — compares JPEG/PNG file sizes of new samples against the step-0 baseline; flags when current batch avg exceeds baseline by 1.8× (empirically confirmed signal for mode collapse / LR divergence)
+- **OOM crash detection** — `on_error()` catches CUDA out-of-memory errors, collects VRAM stats via `nvidia-smi`, and writes an `oom` alert type with memory details
+- **Dataset stats persistence** — image count and bucket distribution written to DB after each latent-caching phase so the AI Config Check has context without a running trainer
+- **Safe checkpoint snapshot** — on any alert, the most recent checkpoint's `.safetensors` + `.pt` files are copied to `{save_root}/_safe_snapshots/{reason}_step_{N}/` with a `README.txt` before scheduled cleanup can remove them; WAN 2.2 copies both high-noise and low-noise files
+- **Amber alert chip** — job card shows ⚠ N when alerts exist; clicking expands an inline panel with timestamped entries (step, type, message); Clear button resets the list
+- **5-second toast** — job detail page fires an amber toast within one poll cycle when a new alert arrives
+- **OOM auto-trigger** — if Check Config is configured, an OOM alert automatically opens the AI reviewer with `autoRun=true` and the OOM message shown as a red context banner at the top of results
+
+### UI — AI Config Check
+
+"Check Config ✦" button on every job form (new and edit). Assembles training context and asks an LLM for structured, source-cited findings.
+
+**What it sends to the LLM:**
+- Full job config JSON
+- Dataset stats (image count, bucket distribution) from DB
+- Last 200 steps of loss curve from `loss_log.db`
+- Real-time GPU stats (VRAM used/free, utilization, temperature, power) via `nvidia-smi`
+- System RAM stats
+- Optional: recent sample images/frames and training dataset images (vision analysis)
+
+**Findings format:** `{field, current_value, suggested_value, reason, confidence, references, applyable, severity}`
+
+- **Confidence tiers** — High (vendor docs / maintainer posts), Medium (Reddit/Discord/forum), Low (LLM reasoning from analogous models); Low-confidence Apply requires an explicit "I understand this is speculative" checkbox
+- **Per-finding Apply** — patches the config field via dot-path and re-saves the job; disabled on running jobs
+- **Model-type-aware** — three distinct prompt branches: image models (white noise, mode collapse, rank/LR/optimizer), video models (temporal consistency, LightX2V dual-LoRA config, frame-based dataset thresholds), audio models (sample rate, BPM consistency, `audio_lm_path`, no image metrics)
+- **Visual analysis** — optional; sends up to 4 recent sample images (or 4 frames extracted from the latest MP4 via ffmpeg) and up to 6 training dataset images; falls back gracefully to text-only when images are unavailable or ffmpeg is missing
+- **Performance optimization** — uses live GPU/RAM stats to recommend batch size increases when VRAM headroom > 4 GB, always paired with the linear LR scaling rule (batch×2 → LR×2); flags VRAM pressure, thermal throttling, and system RAM shortage
+- **Automagic3 + Qwen Image rule** — hardcoded critical rule: if optimizer is `automagic3` on a Qwen Image job, flags as `severity=error` (confirmed incident: LR ramped 100× by step 1500 producing white-noise outputs; `automagic3` has no `max_lr` clamp)
+- **OOM context** — when triggered by an OOM alert, analysis fires immediately (`autoRun` mode) with the OOM message and VRAM stats included for targeted recommendations
+- **Configurable via Settings page** — API URL, API key, model name, and web-search toggle stored in DB (no server file access required); works with Claude (via Anthropic's OpenAI-compatible endpoint) and Ollama (local models); vision analysis requires a vision-capable model
+- **Ollama web search** — when the API endpoint is an Ollama server and "Enable Ollama Web Search" is toggled on, a `POST /api/web_search` call is made against the Ollama host before the LLM call; results are prepended to the training context so the model can reference current best-practice sources; the same API key (if set) is sent as `Authorization: Bearer` for both the web search and the LLM call
+
+### Infrastructure
+
+- **Claude-assisted merge** — `run_ai_toolkit.sh` offers Claude-assisted upstream merge at startup
+- **CivitAI metadata in PNG/MP4** — A1111-format `parameters` in PNG tEXt chunk; ffmpeg FFMETADATA1 for MP4
+
+---
+
 
 
 ## Supported Models
@@ -304,6 +409,42 @@ To learn more about LoKr, read more about it at [KohakuBlueleaf/LyCORIS](https:/
 ```
 
 Everything else should work the same including layer targeting.
+
+
+## Krea 2 Training
+
+Krea 2 is a high-quality image model available in two variants:
+
+- **Krea 2 Raw** (`krea2_raw`) — the base model; straightforward LoRA training with no extra config needed.
+- **Krea 2 Turbo with Adapter** (`krea2_turbo_with_adapter`) — requires a pre-trained turbo adapter. Set `turbo_model_path` in your model config to the path of the adapter safetensors file.
+
+### Sampling LoRA (filter bypass / style)
+
+Some community LoRAs are designed to be applied only during inference, not training — for example to bypass Krea's content filter or apply a look. You can inject one of these into every sample generation without it affecting your training weights.
+
+In your config's `sample` block:
+
+```yaml
+      sample:
+        sampler: euler
+        sample_every: 500
+        width: 1024
+        height: 1024
+        prompts:
+          - "your prompt here"
+        neg: ""
+        seed: 42
+        steps: 20
+        cfg_scale: 1
+        sample_lora_path: /path/to/krea2filterbypass3.safetensors
+        sample_lora_strength: 4
+```
+
+The LoRA is loaded before each sample batch and removed immediately after, so it never influences the training gradient. `sample_lora_strength` can be tuned — higher values push the bypass harder; typical range is 1–8.
+
+Example community LoRA: [Krea2FilterBypass](https://civitai.red/models/2728234/krea2filterbypass) — apply at strength 4 to reliably bypass the built-in content filter during sampling.
+
+> **UI**: the "Apply LoRA during sampling" checkbox and path/strength fields appear in the Sample card for both Krea 2 variants when creating or editing a job.
 
 
 ## Support My Work

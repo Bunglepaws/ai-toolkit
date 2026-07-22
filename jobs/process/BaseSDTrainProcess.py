@@ -28,7 +28,7 @@ from toolkit.basic import value_map
 from toolkit.buckets import get_bucket_for_image_size
 from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.custom_adapter import CustomAdapter
-from toolkit.data_loader import get_dataloader_from_datasets, trigger_dataloader_setup_epoch
+from toolkit.data_loader import get_dataloader_from_datasets, trigger_dataloader_setup_epoch, validate_control_paths
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.ema import ExponentialMovingAverage
 from toolkit.embedding import Embedding
@@ -272,8 +272,42 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # override in subclass
         return generate_image_config_list
 
+    def _check_white_noise_samples(self, sample_folder: str, wall_time_start: float):
+        """Compare avg JPEG file size of newly-written samples to the step-0 baseline.
+        If the batch is >1.8× larger, it likely contains white-noise frames and fires an alert."""
+        try:
+            new_files = [
+                f for f in glob.glob(os.path.join(sample_folder, "*.jpg"))
+                + glob.glob(os.path.join(sample_folder, "*.jpeg"))
+                + glob.glob(os.path.join(sample_folder, "*.png"))
+                if os.path.getmtime(f) >= wall_time_start - 1
+            ]
+            if not new_files:
+                return
+            avg_bytes = sum(os.path.getsize(f) for f in new_files) / len(new_files)
+            if getattr(self, '_baseline_sample_avg_bytes', None) is None:
+                self._baseline_sample_avg_bytes = avg_bytes
+                return
+            ratio = avg_bytes / self._baseline_sample_avg_bytes
+            if ratio > 1.8:
+                msg = (f"Possible white-noise samples at step {self.step_num}: "
+                       f"avg size {avg_bytes/1024:.0f} KB vs baseline {self._baseline_sample_avg_bytes/1024:.0f} KB "
+                       f"({ratio:.2f}×)")
+                print(f"[AITK] ⚠ {msg}")
+                if hasattr(self, 'append_alert'):
+                    self.append_alert("white_noise_samples", msg, {
+                        "avg_bytes": round(avg_bytes),
+                        "baseline_bytes": round(self._baseline_sample_avg_bytes),
+                        "ratio": round(ratio, 2),
+                        "num_files": len(new_files),
+                    })
+                if hasattr(self, 'preserve_safe_snapshot'):
+                    self.preserve_safe_snapshot("white_noise_samples")
+        except Exception as e:
+            print(f"[AITK] Warning: white-noise check failed: {e}")
+
     def sample(self, step=None, is_first=False):
-        if not self.accelerator.is_main_process:
+        if not self.accelerator.is_main_process and not self.sample_only:
             return
         flush()
         sample_folder = os.path.join(self.save_root, 'samples')
@@ -304,6 +338,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             output_path = os.path.join(sample_folder, filename)
 
             prompt = sample_config.prompts[i]
+            if not prompt:
+                print(f"Warning: sample {i} has an empty prompt, skipping")
+                continue
 
             # add embedding if there is one
             # note: diffusers will automatically expand the trigger to the number of added tokens
@@ -353,6 +390,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 ctrl_img_2=sample_item.ctrl_img_2,
                 ctrl_img_3=sample_item.ctrl_img_3,
                 do_cfg_norm=sample_config.do_cfg_norm,
+                sampler=sample_config.sampler,
                 **extra_args
             ))
 
@@ -367,10 +405,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
         
+        # expose sample_config to the model so it can read sampling-only LoRA paths
+        self.sd.sample_config = sample_config
+
+        # expose latest trained LoRA checkpoint path so turbo inference can merge it.
+        # turbo_lora_path is the *LoRA* safetensors (e.g. job_000011000.safetensors),
+        # NOT the turbo model file (that comes from model_config.turbo_model_path).
+        if self.network is not None:
+            lora_name = self.job.name
+            if hasattr(self, 'named_lora') and self.named_lora:
+                lora_name = f"{lora_name}_LoRA"
+            self.sd.turbo_lora_path = self.get_latest_save_path(lora_name)
+
         # send to be generated
+        _sample_wall_time_start = __import__('time').time()
         self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
-        
+        self._check_white_noise_samples(sample_folder, _sample_wall_time_start)
+
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
 
@@ -434,21 +486,35 @@ class BaseSDTrainProcess(BaseTrainProcess):
             critic_pattern = f"CRITIC_{self.job.name}_*"
             critic_items = glob.glob(os.path.join(self.save_root, critic_pattern))
 
-            # Sort the lists by creation time if they are not empty
+            def get_step_num(p):
+                try:
+                    # matches digits after last underscore before extension
+                    f_name = os.path.basename(p)
+                    # remove extension if present
+                    f_name = os.path.splitext(f_name)[0]
+                    # match last digits
+                    match = re.search(r'_(\d+)$', f_name)
+                    if match:
+                        return int(match.group(1))
+                except Exception:
+                    pass
+                return -1
+
+            # Sort the lists by step number, then by creation time if step number is the same
             if safetensors_files:
-                safetensors_files.sort(key=os.path.getctime)
+                safetensors_files.sort(key=lambda p: (get_step_num(p), os.path.getctime(p)))
             if pt_files:
-                pt_files.sort(key=os.path.getctime)
+                pt_files.sort(key=lambda p: (get_step_num(p), os.path.getctime(p)))
             if directories:
-                directories.sort(key=os.path.getctime)
+                directories.sort(key=lambda p: (get_step_num(p), os.path.getctime(p)))
             if embed_files:
-                embed_files.sort(key=os.path.getctime)
+                embed_files.sort(key=lambda p: (get_step_num(p), os.path.getctime(p)))
             if critic_items:
-                critic_items.sort(key=os.path.getctime)
+                critic_items.sort(key=lambda p: (get_step_num(p), os.path.getctime(p)))
 
             # Combine and sort the lists
             combined_items = safetensors_files + directories + pt_files
-            combined_items.sort(key=os.path.getctime)
+            combined_items.sort(key=lambda p: (get_step_num(p), os.path.getctime(p)))
             
             num_saves_to_keep = self.save_config.max_step_saves_to_keep
             
@@ -477,6 +543,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     shutil.rmtree(item)
                 else:
                     os.remove(item)
+                    # if it's a safetensors file, see if we have an optimizer to remove
+                    if item.endswith('.safetensors'):
+                        # Matches digits after the last underscore (e.g., 'my_model_000001000.safetensors')
+                        match = re.search(r'_(\d+)\.safetensors$', item)
+                        if match:
+                            step_num_str = match.group(1)
+                            optimizer_to_remove = os.path.join(self.save_root, f"optimizer_{step_num_str}.pt")
+                            if os.path.exists(optimizer_to_remove):
+                                print_acc(f"Removing old optimizer: {optimizer_to_remove}")
+                                os.remove(optimizer_to_remove)
+
                 # see if a yaml file with same name exists
                 yaml_file = os.path.splitext(item)[0] + ".yaml"
                 if os.path.exists(yaml_file):
@@ -491,7 +568,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
     
     def done_hook(self):
         pass
-    
+
+    def should_save(self):
+        return False
+
+    def reset_save(self):
+        pass
+
     def end_step_hook(self):
         pass
 
@@ -506,11 +589,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if not os.path.exists(self.save_root):
             os.makedirs(self.save_root, exist_ok=True)
 
+        previous_save_step = self.last_save_step
         step_num = ''
         if step is not None:
             self.last_save_step = step
             # zeropad 9 digits
             step_num = f"_{str(step).zfill(9)}"
+        elif self.save_config.save_with_step_num:
+            # if step is None, use current step
+            step_num = f"_{str(self.step_num).zfill(9)}"
 
         self.update_training_metadata()
         filename = f'{self.job.name}{step_num}.safetensors'
@@ -526,7 +613,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # prepare meta
         save_meta = get_meta_for_safetensors(save_meta, self.job.name)
-        if not self.is_fine_tuning and not self.train_config.merge_network_on_save:
+
+        # set filename again just in case it was changed above (eg. lora, adapter)
+        # but only if it's not fine tuning as that has its own logic
+        if not self.is_fine_tuning:
+            # check if we have a filename already (from lora or adapter)
+            # if not, use the default one
+            if 'filename' not in locals():
+                filename = f'{self.job.name}{step_num}.safetensors'
+                file_path = os.path.join(self.save_root, filename)
+            else:
+                # filename was set by lora or adapter, but we might need to ensure step_num is there
+                # actually lora and adapter logic above already uses step_num
+                pass
+        else:
+            # for fine tuning, we use the original filename and file_path
+            pass
+
+        if not self.is_fine_tuning:
             if self.network is not None:
                 lora_name = self.job.name
                 if self.named_lora:
@@ -651,9 +755,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # reset weights to zero
                 self.network.reset_weights()
                 self.network.is_merged_in = False
-                
+
                 print_acc("Done merging network weights. Saving model...")
-                
+
+
             if self.save_config.save_format == "diffusers":
                 # saving as a folder path
                 file_path = file_path.replace('.safetensors', '')
@@ -693,15 +798,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # save optimizer
         if self.optimizer is not None:
+            optimizer_path = os.path.join(self.save_root, 'optimizer.pt')
+            if self.save_config.archive_optimizer:
+                try:
+                    if os.path.exists(optimizer_path):
+                        # Archive the existing optimizer.pt (which belongs to the previous save)
+                        archive_name = f"optimizer_{previous_save_step:09d}.pt"
+                        archive_path = os.path.join(self.save_root, archive_name)
+
+                        # Archive the existing optimizer if not already archived
+                        if not os.path.exists(archive_path):
+                            print_acc(f"Archiving optimizer to {archive_name}")
+                            os.rename(optimizer_path, archive_path)
+                except Exception as e:
+                    print_acc(f"Error archiving optimizer: {e}")
+
+            # 4. Save the new optimizer.pt (this will be the 'latest' for next time)
             try:
-                filename = f'optimizer.pt'
-                file_path = os.path.join(self.save_root, filename)
                 try:
                     state_dict = unwrap_model(self.optimizer).state_dict()
                 except Exception as e:
                     state_dict = self.optimizer.state_dict()
-                torch.save(state_dict, file_path)
-                print_acc(f"Saved optimizer to {file_path}")
+                from toolkit.network_mixins import _save_with_io_retry
+                _save_with_io_retry(lambda: torch.save(state_dict, optimizer_path))
+                print_acc(f"Saved optimizer to {optimizer_path}")
             except Exception as e:
                 print_acc(e)
                 print_acc("Could not save optimizer")
@@ -729,6 +849,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def hook_before_train_loop(self):
         if self.accelerator.is_main_process:
             self.logger.start()
+            self.logger.record_session_start()
         self.prepare_accelerator()
         
     def sample_step_hook(self, img_num, total_imgs):
@@ -764,7 +885,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.modules_being_trained.append(self.adapter)
         
         # prepare other things
-        self.optimizer = self.accelerator.prepare(self.optimizer)
+        if self.optimizer is not None:
+            self.optimizer = self.accelerator.prepare(self.optimizer)
         if self.lr_scheduler is not None:
             self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
         # self.data_loader = self.accelerator.prepare(self.data_loader)
@@ -841,7 +963,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     paths = [p for p in paths if '_cn' not in p]
 
                 if len(paths) > 0:
-                    latest_path = max(paths, key=os.path.getctime)
+                    def get_step_num(p):
+                        try:
+                            # matches digits after last underscore before extension
+                            f_name = os.path.basename(p)
+                            # remove extension if present
+                            f_name = os.path.splitext(f_name)[0]
+                            # match last digits
+                            match = re.search(r'_(\d+)$', f_name)
+                            if match:
+                                return int(match.group(1))
+                        except Exception:
+                            pass
+                        return -1
+
+                    latest_path = max(paths, key=lambda p: (get_step_num(p), os.path.getctime(p)))
         
         if include_pretrained_lora and latest_path is None and self.network_config is not None and self.network_config.pretrained_lora_path is not None:
             # set pretrained lora path as load path if we do not have a checkpoint to resume from
@@ -855,8 +991,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return latest_path
 
     def load_training_state_from_metadata(self, path):
-        if not self.accelerator.is_main_process:
-            return
         if path is not None and self.network_config is not None and path == self.network_config.pretrained_lora_path:
             # dont load metadata from pretrained lora
             return
@@ -876,6 +1010,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if 'epoch' in meta['training_info']:
                 self.epoch_num = meta['training_info']['epoch']
             self.start_step = self.step_num
+            self.last_save_step = self.step_num
             print_acc(f"Found step {self.step_num} in metadata, starting from there")
 
     def load_weights(self, path):
@@ -1337,19 +1472,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if len(noise.shape) == 5:
                     # if we have a 5d tensor, then we need to do it on a per batch item, per channel basis, per frame
                     s = (noise.shape[0], noise.shape[1], noise.shape[2], 1, 1)
-                
+
                 noise = noise * noise_multiplier
                 
                 if self.train_config.do_signal_correction_noise:
                     batch_noise = latents.clone().to(noise.device, dtype=noise.dtype)
                     scn_scale = torch.randn(
                         batch_noise.shape[0], batch_noise.shape[1], 1, 1,
-                        device=batch_noise.device, 
+                        device=batch_noise.device,
                         dtype=batch_noise.dtype
                     ) * self.train_config.signal_correction_noise_scale
                     batch_noise = batch_noise * scn_scale
-                    noise = noise + batch_noise 
-                
+                    noise = noise + batch_noise
+
                 if self.train_config.do_batch_noise_correction:
                     if latents.shape[0] == 1:
                         # if we only have a batch size of 1, then we cant do batch noise correction, so we skip it
@@ -1364,7 +1499,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         ) * self.train_config.batch_noise_correction_scale
                         batch_noise = batch_noise * batch_noise_scale
                         noise = noise + batch_noise
-                
+
                 if self.train_config.random_noise_shift > 0.0:
                     # get random noise -1 to 1
                     noise_shift = torch.randn(
@@ -1374,7 +1509,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     ) * self.train_config.random_noise_shift
                     # add to noise
                     noise += noise_shift
-                
+
                 if self.train_config.random_noise_multiplier > 0.0:
                     sigma = self.train_config.random_noise_multiplier
                     noise_multiplier = torch.exp(torch.randn(s, device=noise.device, dtype=noise.dtype) * sigma)
@@ -1390,14 +1525,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     latent_multiplier = normalizer
 
                 latents = latents * latent_multiplier
-                
+
                 if self.train_config.do_blank_stabilization:
                     # zero out latents with blank prompts
                     blank_latent = torch.zeros_like(latents)
                     for i, prompt in enumerate(conditioned_prompts):
                         if prompt.strip() == '':
                             latents[i] = blank_latent[i]
-                
+
                 batch.latents = latents
 
                 # normalize latents to a mean of 0 and an std of 1
@@ -1781,20 +1916,60 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 model_config_to_load.refiner_name_or_path = previous_refiner_save
                 self.load_training_state_from_metadata(previous_refiner_save)
 
-        self.sd = ModelClass(
-            # todo handle single gpu and multi gpu here
-            # device=self.device,
-            device=self.accelerator.device,
-            model_config=model_config_to_load,
-            dtype=self.train_config.dtype,
-            custom_pipeline=self.custom_pipeline,
-            noise_scheduler=sampler,
-        )
-        
-        self.hook_after_sd_init_before_load()
-        # run base sd process run
-        self.sd.load_model()
-        
+        _hot = getattr(BaseSDTrainProcess, '_hot_model', None)
+        BaseSDTrainProcess._hot_model = None
+        _hot_arch = getattr(_hot, 'arch', None) or getattr(type(_hot), 'arch', None)
+        _new_arch = getattr(model_config_to_load, 'arch', None)
+        _used_hot = False
+        if _hot is not None and type(_hot) is ModelClass and _hot_arch == _new_arch:
+            try:
+                self.sd = _hot
+                self.sd.model_config = model_config_to_load
+                # Clear hooks registered by the previous job's trainer. They are bound
+                # methods on a trainer object that no longer exists (its thread_pool was
+                # already shut down), so leaving them would crash the next call into
+                # maybe_stop()/status updates with "cannot schedule new futures after shutdown".
+                self.sd._status_update_hooks = []
+                self.sd._maybe_stop_hooks = []
+                self.sd._after_sample_img_hooks = []
+                self.hook_after_sd_init_before_load()
+                validate_control_paths(self.dataset_configs)
+                # If the previous job unloaded the text encoder (stub or empty from API mode)
+                # but the new job needs a local TE, reload it. Transformer stays in RAM.
+                from toolkit.unloader import FakeTextEncoder
+                te = getattr(self.sd, 'text_encoder', None)
+                new_uses_api = getattr(model_config_to_load, 'gemma_api_key', None) is not None
+                te_is_stub = (
+                    isinstance(te, list) and te and any(isinstance(enc, FakeTextEncoder) for enc in te)
+                ) or (te is not None and not isinstance(te, list) and isinstance(te, FakeTextEncoder))
+                te_missing = isinstance(te, list) and len(te) == 0 and not new_uses_api
+                if te_is_stub or te_missing:
+                    print_acc(" - Model cache hit: reusing transformer, reloading text encoder...")
+                    self.sd.reload_text_encoder()
+                else:
+                    print_acc(" - Model cache hit: reusing loaded model (skipping load+quantize)")
+                _used_hot = True
+            except Exception as hot_err:
+                import traceback
+                print_acc(f" - Model cache: hot load failed ({hot_err}); falling back to full load+quantize")
+                print_acc(traceback.format_exc())
+                self.sd = None
+
+        if not _used_hot:
+            self.sd = ModelClass(
+                # todo handle single gpu and multi gpu here
+                # device=self.device,
+                device=self.accelerator.device,
+                model_config=model_config_to_load,
+                dtype=self.train_config.dtype,
+                custom_pipeline=self.custom_pipeline,
+                noise_scheduler=sampler,
+            )
+            self.hook_after_sd_init_before_load()
+            validate_control_paths(self.dataset_configs)
+            # run base sd process run
+            self.sd.load_model()
+
         self.sd.add_after_sample_image_hook(self.sample_step_hook)
 
         dtype = get_torch_dtype(self.train_config.dtype)
@@ -1914,6 +2089,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         flush()
         if not self.is_fine_tuning:
             if self.network_config is not None:
+                print_acc("Setting up LoRA network...")
                 # TODO should we completely switch to LycorisSpecialNetwork?
                 network_kwargs = self.network_config.network_kwargs
                 is_lycoris = False
@@ -2036,6 +2212,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
                     print_acc(f"Loading from {latest_save_path}")
                     extra_weights = self.load_weights(latest_save_path)
+                    self.load_training_state_from_metadata(latest_save_path)
                     self.network.multiplier = 1.0
                 elif self.train_config.merge_network_on_save and self.network_config.pretrained_lora_path is not None:
                     # with merge_network_on_save, saved checkpoints are full models that get loaded as the
@@ -2063,6 +2240,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # load last saved weights
                 if latest_save_path is not None:
                     self.embedding.load_embedding_from_file(latest_save_path, self.device_torch)
+                    self.load_training_state_from_metadata(latest_save_path)
                     if self.embedding.step > 1:
                         self.step_num = self.embedding.step
                         self.start_step = self.step_num
@@ -2144,6 +2322,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
         flush()
 
         ### HOOK ###
+        if self.sample_only:
+            self.hook_before_train_loop()
+            print_acc("#### RUNNING IN SAMPLE ONLY MODE ####")
+            # explicit status update for UI if it has update_status method
+            if hasattr(self, "update_status"):
+                self.update_status("running", "Generating samples")
+            self.sample(self.step_num, is_first=True)
+            print_acc("#### SAMPLE ONLY MODE COMPLETE ####")
+            self.done_hook()
+            return
+
         params = self.hook_add_extra_train_params(params)
         self.params = params
         # self.params = []
@@ -2174,6 +2363,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # check if it exists
         optimizer_state_filename = f'optimizer.pt'
         optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
+
         if os.path.exists(optimizer_state_file_path):
             # try to load
             # previous param groups
@@ -2232,10 +2422,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         ### HOOk ###
         self.before_dataset_load()
+        # some models (e.g. wan22_14b_i2v) need the raw image tensor every step
+        # even when latents are cached to disk
+        if getattr(self.sd, 'requires_pixels_with_cached_latents', False):
+            for ds_list in (self.datasets, self.datasets_reg):
+                if ds_list is not None:
+                    for ds in ds_list:
+                        ds.load_image_when_caching_latents = True
         # load datasets if passed in the root process
-        if self.datasets is not None:
+        if self.datasets is not None and not self.sample_only:
             self.data_loader = get_dataloader_from_datasets(self.datasets, self.train_config.batch_size, self.sd)
-        if self.datasets_reg is not None:
+        if self.datasets_reg is not None and not self.sample_only:
             self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, self.train_config.batch_size,
                                                                 self.sd)
 
@@ -2511,6 +2708,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # TRAIN LOOP
         ###################################################################
 
+        _proc_start = os.environ.get('AITK_PROCESS_START')
+        if _proc_start:
+            import time as _t
+            _elapsed = _t.time() - float(_proc_start)
+            print_acc(f"Time to first step: {_elapsed:.0f}s ({_elapsed / 60:.1f}min)")
 
         start_step_num = self.step_num
         did_first_flush = False
@@ -2722,6 +2924,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         # print above the progress bar
                         if self.train_config.free_u:
                             self.sd.pipeline.disable_freeu()
+                        if getattr(self, 'is_ui_trainer', False):
+                            self.reload_sample_config()
                         self.sample(self.step_num)
                         if self.train_config.unload_text_encoder:
                             # make sure the text encoder is unloaded
@@ -2804,6 +3008,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 # update various steps
                 self.step_num = step + 1
+                self.step = self.step_num
                 self.grad_accumulation_step += 1
                 self.end_step_hook()
 

@@ -24,7 +24,6 @@ export default function JobOverview({ job }: JobOverviewProps) {
   const logRef = useRef<HTMLDivElement>(null);
   // Track whether we should auto-scroll to bottom
   const [isScrolledToBottom, setIsScrolledToBottom] = useState(true);
-  console.log('job.gpu_ids', job.gpu_ids);
   const { gpuList, isGPUInfoLoaded } = useGPUInfo(gpuIds, 5000);
   const { cpuInfo, isCPUInfoLoaded } = useCPUInfo(5000);
   const totalSteps = getTotalSteps(job);
@@ -35,6 +34,11 @@ export default function JobOverview({ job }: JobOverviewProps) {
     // Log is already terminal-rendered by useJobLog — one entry per line.
     let splits: string[] = log.split('\n');
 
+    // Filter out tqdm progress bar lines when not actively training
+    if (job.status !== 'running') {
+      splits = splits.filter(line => !line.match(/^\s*\d+%\|/));
+    }
+
     // only return last 100 lines max
     const maxLines = 1000;
     if (splits.length > maxLines) {
@@ -42,7 +46,7 @@ export default function JobOverview({ job }: JobOverviewProps) {
     }
 
     return splits;
-  }, [log]);
+  }, [log, job.status]);
 
   // Handle scroll events to determine if user has scrolled away from bottom
   const handleScroll = () => {
@@ -88,7 +92,7 @@ export default function JobOverview({ job }: JobOverviewProps) {
   return (
     <div className="grid grid-cols-1 gap-4 md:gap-6 md:grid-cols-3">
       {/* Job Information Panel */}
-      <div className="md:col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col">
+      <div className="md:col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col fill-height">
         <div className="bg-gray-800 px-4 py-3 flex items-center justify-between">
           <h2 className="text-gray-100">
             <Info className="w-5 h-5 mr-2 -mt-1 text-amber-600 dark:text-amber-400 inline-block" /> {job.info}
@@ -166,7 +170,7 @@ export default function JobOverview({ job }: JobOverviewProps) {
         <div className="mt-4">{isGPUInfoLoaded && gpuList.length > 0 && <GPUWidget gpu={gpuList[0]} />}</div>
         {jobType === 'train' && (
           <div className="mt-4">
-            <FilesWidget jobID={job.id} jobName={job.name} />
+            <FilesWidget jobID={job.id} jobName={job.name} jobConfig={job.job_config} />
           </div>
         )}
       </div>

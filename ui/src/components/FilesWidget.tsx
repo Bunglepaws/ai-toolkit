@@ -2,11 +2,23 @@ import React from 'react';
 import useFilesList from '@/hooks/useFilesList';
 import { Loader2, AlertCircle, Download, Box, Brain, Trash2, SlidersHorizontal } from 'lucide-react';
 import { openMergeLoRAsModal } from './MergeLoRAsModal';
+import { openStripAudioModal } from './StripAudioModal';
 import { getFilename, getFoldername } from '@/utils/basic';
 import { openConfirm } from './ConfirmModal';
 import { apiClient } from '@/utils/api';
 
-export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName: string }) {
+const isLtxJob = (jobConfig: string): boolean => {
+  try {
+    const model = JSON.parse(jobConfig)?.config?.process?.[0]?.model ?? {};
+    const nop: string = model.name_or_path ?? '';
+    const arch: string = model.arch ?? '';
+    return /lightricks|ltx/i.test(nop) || /ltx/i.test(arch);
+  } catch {
+    return false;
+  }
+};
+
+export default function FilesWidget({ jobID, jobName, jobConfig }: { jobID: string; jobName: string; jobConfig?: string }) {
   const { files, status, refreshFiles } = useFilesList(jobID, 5000);
 
   const isOptimizerFile = (filePath: string) => getFilename(filePath) === 'optimizer.pt';
@@ -46,34 +58,50 @@ export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName
   };
 
   return (
-    <div className="col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800">
-      <div className="bg-gray-800 px-4 py-3 flex items-center justify-between">
+    <div className="col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden hover:shadow-2xl transition-all duration-300 border border-gray-800 flex flex-col max-h-[400px]">
+      <div className="bg-gray-800 px-4 py-3 flex items-center justify-between flex-shrink-0">
         <div className="flex items-center space-x-2">
           <Brain className="w-5 h-5 text-purple-600 dark:text-purple-400" />
           <h2 className="font-semibold text-gray-100">Checkpoints</h2>
           <span className="px-2 py-0.5 bg-gray-700 rounded-full text-xs text-gray-300">{checkpointFiles.length}</span>
         </div>
         {checkpointFiles.length > 0 && (
-          <span
-            className="px-3 py-1 rounded-full text-sm bg-purple-500/10 text-purple-500 uppercase cursor-pointer hover:bg-purple-500/20"
-            onClick={() => {
-              const outputName = `${jobName}_merged`;
-              openMergeLoRAsModal(
-                getFoldername(checkpointFiles[0].path),
-                outputName,
-                checkpointFiles.map(f => ({ path: f.path })),
-                () => {
-                  refreshFiles();
-                },
-              );
-            }}
-          >
-            merge
-          </span>
+          <div className="flex items-center gap-2">
+            <span
+              className="px-3 py-1 rounded-full text-sm bg-purple-500/10 text-purple-500 uppercase cursor-pointer hover:bg-purple-500/20"
+              onClick={() => {
+                const outputName = `${jobName}_merged`;
+                openMergeLoRAsModal(
+                  getFoldername(checkpointFiles[0].path),
+                  outputName,
+                  checkpointFiles.map(f => ({ path: f.path })),
+                  () => {
+                    refreshFiles();
+                  },
+                );
+              }}
+            >
+              merge
+            </span>
+            {jobConfig && isLtxJob(jobConfig) && (
+              <span
+                className="px-3 py-1 rounded-full text-sm bg-cyan-500/10 text-cyan-400 uppercase cursor-pointer hover:bg-cyan-500/20"
+                onClick={() => {
+                  openStripAudioModal(
+                    getFoldername(checkpointFiles[0].path),
+                    checkpointFiles.map(f => ({ path: f.path })),
+                    refreshFiles,
+                  );
+                }}
+              >
+                strip audio
+              </span>
+            )}
+          </div>
         )}
       </div>
 
-      <div className="p-2">
+      <div className="p-2 overflow-y-auto flex-grow scrollbar-thin scrollbar-thumb-gray-700 scrollbar-track-transparent">
         {status === 'loading' && (
           <div className="flex items-center justify-center py-4">
             <Loader2 className="w-5 h-5 text-gray-400 animate-spin" />
@@ -104,7 +132,7 @@ export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName
                   >
                     <Box className="w-4 h-4 text-purple-600 dark:text-purple-400 flex-shrink-0" />
                     <div className="flex flex-col min-w-0">
-                      <div className="flex text-sm text-gray-200">
+                      <div className="flex text-xs text-gray-200">
                         <span className="overflow-hidden text-ellipsis direction-rtl whitespace-nowrap">
                           {nameWithoutExt}
                         </span>

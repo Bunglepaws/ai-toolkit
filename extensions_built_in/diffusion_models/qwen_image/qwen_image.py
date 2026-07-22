@@ -14,7 +14,7 @@ from toolkit.samplers.custom_flowmatch_sampler import (
 )
 from toolkit.accelerator import get_accelerator, unwrap_model
 from optimum.quanto import freeze, QTensor
-from toolkit.util.quantize import quantize, get_qtype, quantize_model
+from toolkit.util.quantize import quantize, get_qtype, quantize_model, filter_lora_state_dict_for_quantized_model
 import torch.nn.functional as F
 from toolkit.memory_management import MemoryManager
 from safetensors.torch import load_file
@@ -128,6 +128,8 @@ class QwenImageModel(BaseModel):
             quantize_model(self, transformer)
             flush()
 
+        self.maybe_stop()
+
         if (
             self.model_config.layer_offloading
             and self.model_config.layer_offloading_transformer_percent > 0
@@ -170,6 +172,8 @@ class QwenImageModel(BaseModel):
         text_encoder.to(self.device_torch, dtype=dtype)
         flush()
 
+        self.maybe_stop()
+
         if self.model_config.quantize_te:
             self.print_and_status_update("Quantizing Text Encoder")
             quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
@@ -183,21 +187,23 @@ class QwenImageModel(BaseModel):
 
         self.noise_scheduler = QwenImageModel.get_train_scheduler()
 
-        self.print_and_status_update("Making pipe")
-
         kwargs = {}
 
         if self._qwen_image_keep_visual:
+            self.print_and_status_update("Loading processor")
             try:
+                self.print_and_status_update ("model_path: " + model_path)
                 self.processor = Qwen2VLProcessor.from_pretrained(
                     model_path, subfolder="processor"
                 )
             except OSError:
+                self.print_and_status_update ( "base_model_path: " + base_model_path)
                 self.processor = Qwen2VLProcessor.from_pretrained(
                     base_model_path, subfolder="processor"
                 )
             kwargs["processor"] = self.processor
 
+        self.print_and_status_update("Making pipe Qwen Image")
         pipe: QwenImagePipeline = self._qwen_pipeline(
             scheduler=self.noise_scheduler,
             text_encoder=None,
@@ -206,6 +212,7 @@ class QwenImageModel(BaseModel):
             transformer=None,
             **kwargs,
         )
+        self.print_and_status_update("Moving pipe to device")
         # for quantization, it works best to do these after making the pipe
         pipe.text_encoder = text_encoder
         pipe.transformer = transformer
@@ -217,16 +224,19 @@ class QwenImageModel(BaseModel):
 
         # leave it on cpu for now
         if not self.low_vram:
+            self.print_and_status_update(  "Moving model to device")
             pipe.transformer = pipe.transformer.to(self.device_torch)
 
         flush()
         # just to make sure everything is on the right device and dtype
+        self.print_and_status_update("Moving text encoder to device")
         text_encoder[0].to(self.device_torch)
         text_encoder[0].requires_grad_(False)
         text_encoder[0].eval()
         flush()
 
         # save it to the model class
+        self.print_and_status_update("Saving model to class")
         self.vae = vae
         self.text_encoder = text_encoder  # list of text encoders
         self.tokenizer = tokenizer  # list of tokenizers
@@ -276,8 +286,9 @@ class QwenImageModel(BaseModel):
         # flush for low vram if we are doing that
         flush_between_steps = self.model_config.low_vram
 
-        # Fix a bug in diffusers/torch
+        # Fix a bug in diffusers/torch; also check for stop signal between denoising steps
         def callback_on_step_end(pipe, i, t, callback_kwargs):
+            self.maybe_stop()
             if flush_between_steps:
                 flush()
             latents = callback_kwargs["latents"]
@@ -289,32 +300,35 @@ class QwenImageModel(BaseModel):
         gen_config.height = int(gen_config.height // sc * sc)
 
         if self.model_config.low_vram:
-            # set vae to tile decode
             pipeline.vae.enable_tiling()
 
-        img = pipeline(
-            prompt_embeds=conditional_embeds.text_embeds,
-            prompt_embeds_mask=conditional_embeds.attention_mask.to(
-                self.device_torch, dtype=torch.int64
-            ),
-            negative_prompt_embeds=unconditional_embeds.text_embeds,
-            negative_prompt_embeds_mask=unconditional_embeds.attention_mask.to(
-                self.device_torch, dtype=torch.int64
-            ),
-            height=gen_config.height,
-            width=gen_config.width,
-            num_inference_steps=gen_config.num_inference_steps,
-            true_cfg_scale=gen_config.guidance_scale,
-            latents=gen_config.latents,
-            generator=generator,
-            callback_on_step_end=callback_on_step_end,
-            **extra,
-        ).images[0]
+        if getattr(self, '_sampling_lora_ready', False):
+            self._lora_move(pipeline.transformer, "sampling_lora", self.device_torch)
+        try:
+            img = pipeline(
+                prompt_embeds=conditional_embeds.text_embeds,
+                prompt_embeds_mask=conditional_embeds.attention_mask.to(
+                    self.device_torch, dtype=torch.int64
+                ),
+                negative_prompt_embeds=unconditional_embeds.text_embeds,
+                negative_prompt_embeds_mask=unconditional_embeds.attention_mask.to(
+                    self.device_torch, dtype=torch.int64
+                ),
+                height=gen_config.height,
+                width=gen_config.width,
+                num_inference_steps=gen_config.num_inference_steps,
+                true_cfg_scale=gen_config.guidance_scale,
+                latents=gen_config.latents,
+                generator=generator,
+                callback_on_step_end=callback_on_step_end,
+                **extra,
+            ).images[0]
+        finally:
+            if getattr(self, '_sampling_lora_ready', False):
+                self._lora_move(pipeline.transformer, "sampling_lora", "cpu")
 
         if self.model_config.low_vram:
-            # restore no tiling
             pipeline.vae.disable_tiling()
-
         return img
 
     def get_noise_prediction(
@@ -385,6 +399,141 @@ class QwenImageModel(BaseModel):
         pe = PromptEmbeds(prompt_embeds)
         pe.attention_mask = prompt_embeds_mask
         return pe
+
+    @classmethod
+    def validate_sample_lora_paths(cls, model_config, *sample_configs):
+        """Called at job startup — raises FileNotFoundError if any configured LoRA path is missing."""
+        all_configs = [model_config] + list(sample_configs)
+        for cfg in all_configs:
+            if cfg is None:
+                continue
+            path = getattr(cfg, 'sample_lora_path', None)
+            if path and not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"Sampling LoRA path not found (check your config before training starts): {path}"
+                )
+
+    def _has_sampling_lora(self):
+        sc = getattr(self, 'sample_config', None)
+        if sc is not None and getattr(sc, 'sample_lora_path', None):
+            return True
+        return self.model_config.sample_lora_path is not None
+
+    def _lora_move(self, transformer, adapter_name, device):
+        """Move LoRA adapter weights for a transformer to the given device."""
+        for module in transformer.modules():
+            if hasattr(module, 'lora_A') and adapter_name in module.lora_A:
+                module.lora_A[adapter_name].to(device)
+                module.lora_B[adapter_name].to(device)
+
+    def _prepare_sampling_lora(self, pipeline):
+        """Load the sampling LoRA once and park weights on CPU.
+
+        _before_generate_images_loop calls this once before the sample loop.
+        Per-sample code moves weights to GPU and back via _lora_move.
+        """
+        import peft.tuners.lora.model as _peft_lora_model
+
+        sc = getattr(self, 'sample_config', None)
+        lora_path = (getattr(sc, 'sample_lora_path', None) if sc else None) or self.model_config.sample_lora_path
+        strength = (getattr(sc, 'sample_lora_strength', None) if sc else None) or self.model_config.sample_lora_strength
+
+        if not os.path.exists(lora_path):
+            self.print_and_status_update(f"Warning: sampling LoRA not found: {lora_path}")
+            return
+
+        # PEFT 0.18.x bug: dispatch_torchao called without required kwarg on quantized weights
+        _orig_dispatch_torchao = _peft_lora_model.dispatch_torchao
+        _peft_lora_model.dispatch_torchao = lambda *args, **kwargs: None
+
+        try:
+            # Clear any stale adapter registration before loading
+            if hasattr(pipeline.transformer, 'peft_config') and 'sampling_lora' in pipeline.transformer.peft_config:
+                try:
+                    del pipeline.transformer.peft_config['sampling_lora']
+                except Exception:
+                    pass
+            for module in pipeline.transformer.modules():
+                if hasattr(module, 'delete_adapter'):
+                    try:
+                        module.delete_adapter('sampling_lora')
+                    except Exception:
+                        pass
+
+            from safetensors.torch import load_file as _load_safetensors
+            lora_state_dict = _load_safetensors(lora_path)
+            n_before = len(lora_state_dict)
+            lora_state_dict = filter_lora_state_dict_for_quantized_model(
+                pipeline.transformer, lora_state_dict
+            )
+            n_skipped = n_before - len(lora_state_dict)
+            if n_skipped:
+                self.print_and_status_update(
+                    f"Sampling LoRA: skipping {n_skipped} keys for quantized layers to avoid weight corruption"
+                )
+            self.print_and_status_update(f"Loading sampling LoRA (strength={strength})")
+            # Quanto's QModule._load_from_state_dict unconditionally pops weight._data,
+            # raising KeyError when loading a LoRA (which has no _data keys). Patch it to
+            # skip quantized reconstruction when no keys for that module are in the state dict.
+            try:
+                from optimum.quanto.nn.qmodule import QModuleMixin
+                _orig_qload = QModuleMixin._load_from_state_dict
+                def _safe_qload(self, state_dict, prefix, local_metadata, strict,
+                                missing_keys, unexpected_keys, error_msgs):
+                    if not any(k.startswith(prefix) for k in state_dict):
+                        return
+                    return _orig_qload(self, state_dict, prefix, local_metadata, strict,
+                                       missing_keys, unexpected_keys, error_msgs)
+                QModuleMixin._load_from_state_dict = _safe_qload
+                _patched_qmodule = True
+            except Exception:
+                _patched_qmodule = False
+
+            try:
+                pipeline.load_lora_weights(lora_state_dict, adapter_name="sampling_lora")
+            finally:
+                if _patched_qmodule:
+                    QModuleMixin._load_from_state_dict = _orig_qload
+            pipeline.set_adapters(["sampling_lora"], adapter_weights=[strength])
+            # Park on CPU until needed per-sample
+            self._lora_move(pipeline.transformer, "sampling_lora", "cpu")
+        finally:
+            _peft_lora_model.dispatch_torchao = _orig_dispatch_torchao
+
+        self._sampling_lora_ready = True
+
+    def _teardown_sampling_lora(self, pipeline):
+        """Remove the sampling LoRA adapter completely after all sampling is done."""
+        if hasattr(pipeline.transformer, 'peft_config') and 'sampling_lora' in pipeline.transformer.peft_config:
+            try:
+                del pipeline.transformer.peft_config['sampling_lora']
+            except Exception:
+                pass
+        for module in pipeline.transformer.modules():
+            if hasattr(module, 'delete_adapter'):
+                try:
+                    module.delete_adapter('sampling_lora')
+                except Exception:
+                    pass
+        self._sampling_lora_ready = False
+
+    def _validate_sample_config(self, image_configs):
+        if not self._has_sampling_lora():
+            return
+        sc = getattr(self, 'sample_config', None)
+        path = (getattr(sc, 'sample_lora_path', None) if sc else None) or self.model_config.sample_lora_path
+        if path and not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Sample LoRA not found — aborting sample to avoid useless inference: {path}"
+            )
+
+    def _before_generate_images_loop(self, pipeline, image_configs):
+        if self._has_sampling_lora():
+            self._prepare_sampling_lora(pipeline)
+
+    def _after_generate_images_loop(self, pipeline):
+        if getattr(self, '_sampling_lora_ready', False):
+            self._teardown_sampling_lora(pipeline)
 
     def get_model_has_grad(self):
         return False

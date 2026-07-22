@@ -174,6 +174,35 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'model.gemma_api': {
+    title: 'Use Gemma API for Text Encoding',
+    description: (
+      <>
+        Routes all LTX-2.3 text encoding through the free{' '}
+        <a href="https://api.ltx.video" target="_blank" rel="noreferrer">
+          LTX Gemma Text Encoding API
+        </a>{' '}
+        instead of loading the 12B Gemma model locally.
+        <br />
+        <br />
+        <strong>Saves ~24 GB of VRAM</strong> — the text encoder is never loaded. Dataset captions are
+        cached to disk on first run; subsequent runs load from cache without any API calls.
+        Sample prompts are encoded via the API at each sample step, so you can{' '}
+        <strong>edit them live while training</strong> without restarting.
+        <br />
+        <br />
+        Requires a free API key set in <strong>Settings → Lightricks Gemma API Key</strong>.{' '}
+        Generate one at{' '}
+        <a href="https://console.ltx.video" target="_blank" rel="noreferrer">
+          console.ltx.video
+        </a>{' '}
+        (sign up → API section).
+        <br />
+        <br />
+        <em>Note: Cache Text Embeddings is automatically enabled when this option is checked.</em>
+      </>
+    ),
+  },
   'model.multistage': {
     title: 'Stages to Train',
     description: (

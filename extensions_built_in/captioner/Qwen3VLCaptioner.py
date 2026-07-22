@@ -78,6 +78,7 @@ class Qwen3VLCaptioner(BaseCaptioner):
             self.caption_config.model_name_or_path,
             dtype=self.torch_dtype,
             device_map="cpu",
+            ignore_mismatched_sizes=self.caption_config.ignore_mismatched_sizes,
         )
         # swap the slow bf16 Conv3d patch_embed for an equivalent fast linear
         patch_qwen_vl_patch_embed(self.model)
