@@ -14,8 +14,10 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# We only ignore Python packaging dirs at the repo root — bare `lib/` also
+# matched ui/src/lib/ and silently dropped Check Config modules from git.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
