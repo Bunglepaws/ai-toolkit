@@ -20,6 +20,7 @@ import { pathJoin } from '@/utils/basic';
 import AutoCaptionButton from '@/components/AutoCaptionButton';
 import CaptionMonitor from '@/components/CaptionMonitor';
 import { CreatableSelectInput } from '@/components/formInputs';
+import { BucketToolsModal } from '@/components/BucketToolsModal';
 
 export default function DatasetPage({ params }: { params: Promise<{ datasetName: string }> }) {
   const { datasetName } = use(params);
@@ -32,6 +33,7 @@ export default function DatasetPage({ params }: { params: Promise<{ datasetName:
   const [filterDropdownRect, setFilterDropdownRect] = useState<{ top: number; left: number; width: number } | null>(null);
   const filterInputRef = useRef<HTMLInputElement>(null);
   const [isFindReplaceOpen, setIsFindReplaceOpen] = useState(false);
+  const [isBucketToolsOpen, setIsBucketToolsOpen] = useState(false);
   const [findText, setFindText] = useState('');
   const [replaceText, setReplaceText] = useState('');
   const [wholeWord, setWholeWord] = useState(false);
@@ -573,6 +575,12 @@ export default function DatasetPage({ params }: { params: Promise<{ datasetName:
           />
           <Button
             className="text-white bg-slate-600 px-2 sm:px-3 py-1 rounded-md text-sm sm:text-base whitespace-nowrap"
+            onClick={() => setIsBucketToolsOpen(true)}
+          >
+            Bucket Tools
+          </Button>
+          <Button
+            className="text-white bg-slate-600 px-2 sm:px-3 py-1 rounded-md text-sm sm:text-base whitespace-nowrap"
             onClick={() => openImagesModal(datasetName, () => refreshImageList(datasetName))}
           >
             <span className="sm:hidden">+ Add</span>
@@ -718,6 +726,11 @@ export default function DatasetPage({ params }: { params: Promise<{ datasetName:
         </div>
       </FloatingWindow>
       <CaptionDatasetModal />
+      <BucketToolsModal
+        isOpen={isBucketToolsOpen}
+        onClose={() => setIsBucketToolsOpen(false)}
+        datasetName={datasetName}
+      />
     </>
   );
 }

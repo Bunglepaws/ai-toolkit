@@ -59,7 +59,6 @@ async function collectSystemStats(): Promise<Record<string, unknown>> {
 export const runtime = 'nodejs';
 
 function buildWebSearchQuery(processType: string, jobConfig: any): string {
-  // Use the UI label (e.g. "Krea 2 Turbo") for much better search results than the raw process type.
   const arch = modelArchs.find(a => a.name === processType);
   const modelLabel = arch?.label ?? processType;
 
@@ -71,8 +70,6 @@ function buildWebSearchQuery(processType: string, jobConfig: any): string {
   return `${modelLabel} LoRA fine-tuning training ai-toolkit${optimizerSuffix}`;
 }
 
-// Strip /v1 suffix to get the Ollama host base URL.
-// Returns null when the URL is a known non-Ollama provider.
 function getOllamaHost(baseURL: string): string | null {
   if (!baseURL) return null;
   if (baseURL.includes('anthropic.com') || baseURL.includes('openai.com')) return null;
@@ -147,6 +144,10 @@ function closeDb(db: sqlite3.Database) {
   });
 }
 
+function sseEvent(data: Record<string, unknown>): string {
+  return `data: ${JSON.stringify(data)}\n\n`;
+}
+
 export async function POST(request: NextRequest) {
   const baseURL = await getCheckConfigApiBaseUrl();
   if (!baseURL) {
@@ -173,166 +174,197 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Job not found' }, { status: 404 });
   }
 
-  // Collect loss curve if the job has run before
-  let lossPoints: { step: number; value: number }[] = [];
-  if (job.step > 0) {
-    try {
-      const trainingFolder = await getTrainingFolder();
-      const logPath = path.join(trainingFolder, job.name, 'loss_log.db');
-      if (fs.existsSync(logPath)) {
-        const db = openDb(logPath);
-        try {
-          const rows = await all<{ step: number; value: number | null }>(
-            db,
-            `SELECT m.step, m.value_real AS value
-             FROM metrics m
-             WHERE m.key = 'loss'
-             ORDER BY m.step DESC
-             LIMIT 200`,
-          );
-          lossPoints = rows
-            .filter((r) => r.value != null)
-            .map((r) => ({ step: r.step, value: r.value! }))
-            .reverse();
-        } finally {
-          await closeDb(db);
+  const stream = new ReadableStream({
+    async start(controller) {
+      const emit = (data: Record<string, unknown>) => {
+        controller.enqueue(new TextEncoder().encode(sseEvent(data)));
+      };
+
+      try {
+        // Stage 1: system stats
+        emit({ type: 'progress', message: 'Collecting system stats…' });
+        const systemStats = await collectSystemStats();
+
+        // Stage 2: loss curve
+        emit({ type: 'progress', message: 'Reading loss curve…' });
+        let lossPoints: { step: number; value: number }[] = [];
+        if (job.step > 0) {
+          try {
+            const trainingFolder = await getTrainingFolder();
+            const logPath = path.join(trainingFolder, job.name, 'loss_log.db');
+            if (fs.existsSync(logPath)) {
+              const db = openDb(logPath);
+              try {
+                const rows = await all<{ step: number; value: number | null }>(
+                  db,
+                  `SELECT m.step, m.value_real AS value
+                   FROM metrics m
+                   WHERE m.key = 'loss'
+                   ORDER BY m.step DESC
+                   LIMIT 200`,
+                );
+                lossPoints = rows
+                  .filter((r) => r.value != null)
+                  .map((r) => ({ step: r.step, value: r.value! }))
+                  .reverse();
+              } finally {
+                await closeDb(db);
+              }
+            }
+          } catch {
+            // Loss data is optional
+          }
         }
+
+        // Stage 3: visual media
+        const jobConfig = JSON.parse(job.job_config);
+        let datasetStats: Record<string, unknown> = {};
+        try {
+          datasetStats = JSON.parse((job as any).dataset_stats || '{}');
+        } catch { /* ignore */ }
+
+        const processType: string = jobConfig?.config?.process?.[0]?.type ?? '';
+        const modelFamily = getModelFamily(processType);
+
+        let sampleMedia: MediaItem[] = [];
+        let datasetMedia: MediaItem[] = [];
+        let ffmpegUnavailable = false;
+
+        if (includeImages) {
+          emit({ type: 'progress', message: 'Collecting sample images…' });
+          try {
+            const trainingFolder = await getTrainingFolder();
+            const sampleResult = await collectSampleMedia(trainingFolder, job.name, modelFamily);
+            sampleMedia = sampleResult.items;
+            ffmpegUnavailable = sampleResult.ffmpegUnavailable ?? false;
+          } catch { /* best-effort */ }
+
+          emit({ type: 'progress', message: 'Collecting dataset images…' });
+          try {
+            const datasetPaths: string[] = (jobConfig?.config?.process?.[0]?.datasets ?? [])
+              .map((d: any) => d?.folder_path)
+              .filter(Boolean);
+            datasetMedia = await collectDatasetImages(datasetPaths, modelFamily);
+          } catch { /* best-effort */ }
+        }
+
+        const hasImages = sampleMedia.length > 0 || datasetMedia.length > 0;
+
+        const textContext = JSON.stringify(
+          {
+            model_family: modelFamily,
+            job_config: jobConfig,
+            dataset_stats: Object.keys(datasetStats).length > 0 ? datasetStats : null,
+            current_step: job.step,
+            total_steps: job.total_steps,
+            loss_curve_last_200_steps: lossPoints.length > 0 ? lossPoints : null,
+            system_stats: systemStats,
+            visual_analysis_requested: includeImages,
+            visual_analysis_available: hasImages,
+            ...(ffmpegUnavailable && { note: 'ffmpeg unavailable — video frame extraction skipped; config-only analysis for video model' }),
+            ...(!hasImages && includeImages && modelFamily !== 'audio' && { note: 'No sample images found in the samples folder — config-only analysis' }),
+          },
+          null,
+          2,
+        );
+
+        type ContentPart =
+          | { type: 'text'; text: string }
+          | { type: 'image_url'; image_url: { url: string }; label?: string };
+
+        const userContent: ContentPart[] = [{ type: 'text', text: textContext }];
+
+        if (sampleMedia.length > 0) {
+          userContent.push({ type: 'text', text: 'Recent sample outputs from this training run:' });
+          for (const img of sampleMedia) {
+            userContent.push({ type: 'image_url', image_url: { url: img.dataUrl }, label: img.label });
+          }
+        }
+
+        if (datasetMedia.length > 0) {
+          userContent.push({ type: 'text', text: 'Sample images from the training dataset:' });
+          for (const img of datasetMedia) {
+            userContent.push({ type: 'image_url', image_url: { url: img.dataUrl }, label: img.label });
+          }
+        }
+
+        const apiKey = (await getCheckConfigApiKey()) || 'no-key';
+        const model = (await getCheckConfigModel()) || 'claude-sonnet-5';
+        const enableWebSearch = await getCheckConfigEnableWebSearch();
+
+        // Stage 4: web search
+        let finalTextContext = textContext;
+        const ollamaHost = getOllamaHost(baseURL);
+        if (enableWebSearch && ollamaHost) {
+          emit({ type: 'progress', message: 'Running web search…' });
+          const searchQuery = buildWebSearchQuery(processType, jobConfig);
+          const webContext = await fetchOllamaWebSearch(ollamaHost, apiKey, searchQuery);
+          if (webContext) {
+            finalTextContext = `${webContext}\n\n---\n\nJob configuration and training context:\n${textContext}`;
+            if (userContent.length > 0 && userContent[0].type === 'text') {
+              userContent[0] = { type: 'text', text: finalTextContext };
+            }
+          }
+        }
+
+        // Stage 5: AI call
+        emit({ type: 'progress', message: 'Sending to AI model…' });
+        const client = new OpenAI({ baseURL, apiKey });
+
+        // Ollama-specific overrides passed as extra body fields (ignored by other providers).
+        // - think: false  → skip chain-of-thought reasoning (Qwen3 etc.)
+        // - options.num_ctx: 8192 → override the server's global context length (default 262144
+        //   allocates ~36 GB of KV cache, leaving almost no VRAM for model weights)
+        const extraParams = ollamaHost ? { think: false, options: { num_ctx: 8192 } } : {};
+
+        let raw = '';
+        try {
+          const response = await client.chat.completions.create({
+            model,
+            messages: [
+              { role: 'system', content: buildCheckConfigSystemPrompt(modelFamily, hasImages) },
+              { role: 'user', content: hasImages ? userContent : finalTextContext },
+            ],
+            max_tokens: 4096,
+            ...extraParams,
+          } as any);
+          raw = response.choices[0]?.message?.content || '';
+        } catch (err: any) {
+          emit({ type: 'error', message: `LLM API call failed: ${err?.message || String(err)}` });
+          controller.close();
+          return;
+        }
+
+        // Stage 6: parse response
+        emit({ type: 'progress', message: 'Parsing response…' });
+        const stripped = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+
+        let findings: unknown[];
+        try {
+          const parsed = JSON.parse(stripped);
+          findings = Array.isArray(parsed) ? parsed : (parsed?.findings ?? []);
+        } catch {
+          emit({ type: 'error', message: 'Failed to parse AI response', raw } as any);
+          controller.close();
+          return;
+        }
+
+        emit({ type: 'done', findings });
+      } catch (err: any) {
+        emit({ type: 'error', message: err?.message || String(err) });
+      } finally {
+        controller.close();
       }
-    } catch {
-      // Loss data is optional — continue without it
-    }
-  }
-
-  // Build user message with context
-  const jobConfig = JSON.parse(job.job_config);
-  let datasetStats: Record<string, unknown> = {};
-  try {
-    datasetStats = JSON.parse((job as any).dataset_stats || '{}');
-  } catch {
-    // ignore
-  }
-
-  const processType: string = jobConfig?.config?.process?.[0]?.type ?? '';
-  const modelFamily = getModelFamily(processType);
-
-  // Collect visual media only when explicitly requested
-  let sampleMedia: MediaItem[] = [];
-  let datasetMedia: MediaItem[] = [];
-  let ffmpegUnavailable = false;
-
-  if (includeImages) {
-    try {
-      const trainingFolder = await getTrainingFolder();
-      const sampleResult = await collectSampleMedia(trainingFolder, job.name, modelFamily);
-      sampleMedia = sampleResult.items;
-      ffmpegUnavailable = sampleResult.ffmpegUnavailable ?? false;
-
-      const datasetPaths: string[] = (jobConfig?.config?.process?.[0]?.datasets ?? [])
-        .map((d: any) => d?.folder_path)
-        .filter(Boolean);
-      datasetMedia = await collectDatasetImages(datasetPaths, modelFamily);
-    } catch {
-      // media collection is best-effort; proceed without images
-    }
-  }
-
-  const hasImages = sampleMedia.length > 0 || datasetMedia.length > 0;
-
-  const systemStats = await collectSystemStats();
-
-  const textContext = JSON.stringify(
-    {
-      model_family: modelFamily,
-      job_config: jobConfig,
-      dataset_stats: Object.keys(datasetStats).length > 0 ? datasetStats : null,
-      current_step: job.step,
-      total_steps: job.total_steps,
-      loss_curve_last_200_steps: lossPoints.length > 0 ? lossPoints : null,
-      system_stats: systemStats,
-      visual_analysis_requested: includeImages,
-      visual_analysis_available: hasImages,
-      ...(ffmpegUnavailable && { note: 'ffmpeg unavailable — video frame extraction skipped; config-only analysis for video model' }),
-      ...(!hasImages && includeImages && modelFamily !== 'audio' && { note: 'No sample images found in the samples folder — config-only analysis' }),
     },
-    null,
-    2,
-  );
+  });
 
-  // Build content: text + optional image parts
-  type ContentPart =
-    | { type: 'text'; text: string }
-    | { type: 'image_url'; image_url: { url: string }; label?: string };
-
-  const userContent: ContentPart[] = [{ type: 'text', text: textContext }];
-
-  if (sampleMedia.length > 0) {
-    userContent.push({ type: 'text', text: 'Recent sample outputs from this training run:' });
-    for (const img of sampleMedia) {
-      userContent.push({ type: 'image_url', image_url: { url: img.dataUrl }, label: img.label });
-    }
-  }
-
-  if (datasetMedia.length > 0) {
-    userContent.push({ type: 'text', text: 'Sample images from the training dataset:' });
-    for (const img of datasetMedia) {
-      userContent.push({ type: 'image_url', image_url: { url: img.dataUrl }, label: img.label });
-    }
-  }
-
-  const apiKey = (await getCheckConfigApiKey()) || 'no-key';
-  const model = (await getCheckConfigModel()) || 'claude-sonnet-5';
-  const enableWebSearch = await getCheckConfigEnableWebSearch();
-
-  // Prepend Ollama web search results to the context when enabled
-  let finalTextContext = textContext;
-  const ollamaHost = getOllamaHost(baseURL);
-  if (enableWebSearch && ollamaHost) {
-    const searchQuery = buildWebSearchQuery(processType, jobConfig);
-    const webContext = await fetchOllamaWebSearch(ollamaHost, apiKey, searchQuery);
-    if (webContext) {
-      finalTextContext = `${webContext}\n\n---\n\nJob configuration and training context:\n${textContext}`;
-      // Update the first content part if building a multimodal message
-      if (userContent.length > 0 && userContent[0].type === 'text') {
-        userContent[0] = { type: 'text', text: finalTextContext };
-      }
-    }
-  }
-
-  const client = new OpenAI({ baseURL, apiKey });
-
-  let raw = '';
-  try {
-    const response = await client.chat.completions.create({
-      model,
-      messages: [
-        { role: 'system', content: buildCheckConfigSystemPrompt(modelFamily, hasImages) },
-        { role: 'user', content: hasImages ? userContent : finalTextContext },
-      ],
-      max_tokens: 4096,
-    });
-    raw = response.choices[0]?.message?.content || '';
-  } catch (err: any) {
-    return NextResponse.json(
-      { error: `LLM API call failed: ${err?.message || String(err)}` },
-      { status: 502 },
-    );
-  }
-
-  // Strip markdown code fences if model wrapped the JSON
-  const stripped = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
-
-  let findings: unknown[];
-  try {
-    const parsed = JSON.parse(stripped);
-    findings = Array.isArray(parsed) ? parsed : (parsed?.findings ?? []);
-  } catch {
-    return NextResponse.json(
-      { error: 'Failed to parse AI response', raw },
-      { status: 500 },
-    );
-  }
-
-  return NextResponse.json({ findings });
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    },
+  });
 }
 
 export async function GET() {

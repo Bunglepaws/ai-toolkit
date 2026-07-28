@@ -17,8 +17,12 @@ export async function POST(request: NextRequest, { params }: { params: { jobID: 
       data: {
         status: status,
         info: info || null,
-        // If stopping, clear PID as the process is about to exit
-        ...(status === 'stopped' || status === 'paused' ? { pid: null } : {}),
+        // Deliberately keep the PID here. "About to exit" is not "exited" — the
+        // trainer can stay alive for minutes finishing a step, saving, or sitting
+        // in an uninterruptible section. Clearing the PID loses the only handle on
+        // that process, which both hides it from the queue's liveness check and
+        // makes the orphan unkillable. The PID is cleared on confirmed exit
+        // (startJob's exit handler) and stale PIDs are filtered by liveness.
       },
     });
     console.log(`Job ${jobID} status updated to ${status}`);

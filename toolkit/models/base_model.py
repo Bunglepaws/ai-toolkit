@@ -484,7 +484,7 @@ class BaseModel:
                 if network is not None:
                     assert network.is_active
 
-                for i in tqdm(range(len(image_configs)), desc=f"Generating Samples", leave=False):
+                for i in tqdm(range(len(image_configs)), desc=f"Generating Samples", leave=True, position=0):
                     self.maybe_stop()
                     gen_config = image_configs[i]
 

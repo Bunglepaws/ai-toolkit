@@ -252,6 +252,7 @@ def _move_params_to_cpu_and_pin(module: nn.Module):
 
 class _BouncingLinearFn(torch.autograd.Function):
     @staticmethod
+    @torch._dynamo.disable
     def forward(ctx, x, weight_cpu, bias_cpu, device: torch.device):
         # choose compute dtype to match activations
         target_dtype = (
@@ -299,6 +300,7 @@ class _BouncingLinearFn(torch.autograd.Function):
         return out
 
     @staticmethod
+    @torch._dynamo.disable
     def backward(ctx, grad_out):
         x, weight_cpu, bias_cpu = ctx.saved_tensors
         device = ctx.device
@@ -384,6 +386,7 @@ class _BouncingLinearFn(torch.autograd.Function):
 
 class _BouncingConv2dFn(torch.autograd.Function):
     @staticmethod
+    @torch._dynamo.disable
     def forward(
         ctx,
         x,
@@ -442,6 +445,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
         return out
 
     @staticmethod
+    @torch._dynamo.disable
     def backward(ctx, grad_out):
         x, weight_cpu, bias_cpu = ctx.saved_tensors
         device, stride, padding, dilation, groups, target_dtype = ctx.meta

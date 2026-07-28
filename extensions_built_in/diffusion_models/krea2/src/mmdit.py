@@ -62,15 +62,25 @@ def attention(
     # NVIDIA, and the dispatcher falls back to flash/efficient/math elsewhere.
     # (On ROCm gfx11xx the flash path needs
     # TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1; masked attention uses math.)
-    with sdpa_kernel(
-        [
-            SDPBackend.CUDNN_ATTENTION,
-            SDPBackend.FLASH_ATTENTION,
-            SDPBackend.EFFICIENT_ATTENTION,
-            SDPBackend.MATH,
-        ],
-        set_priority=True,
-    ):
+    #
+    # Krea 2 uses GQA (heads != kvheads) together with an explicit padding
+    # mask on every call. cuDNN's fused-attention kernel doesn't reliably
+    # support that combination on all driver/arch pairs: instead of a clean
+    # "no kernel" rejection it can corrupt CUDA state mid-launch, which then
+    # surfaces as a generic "CUDA error: unknown error" (often on a later,
+    # unrelated kernel call). Only offer cuDNN when there's no mask and no
+    # GQA -- the one shape it's known to handle safely -- and fall back to
+    # flash/efficient/math otherwise.
+    backends = (
+        [SDPBackend.CUDNN_ATTENTION]
+        if mask is None and not gqa
+        else []
+    ) + [
+        SDPBackend.FLASH_ATTENTION,
+        SDPBackend.EFFICIENT_ATTENTION,
+        SDPBackend.MATH,
+    ]
+    with sdpa_kernel(backends, set_priority=True):
         x = F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
         )

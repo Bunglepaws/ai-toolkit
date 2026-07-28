@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
 
-const prisma = new PrismaClient();
 const isWindows = process.platform === 'win32';
 
 export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
@@ -33,13 +32,16 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     }
   }
 
+  // Keep the PID. We signalled the process above, but SIGINT is handled
+  // cooperatively — the trainer finishes its step and saves before exiting, which
+  // can take minutes. Until it actually exits it still holds the GPU, so the PID
+  // has to stay so the queue's liveness check can see it.
   await prisma.job.update({
     where: { id: jobID },
     data: {
       stop: true,
       status: 'stopped',
       info: 'Job stopped',
-      pid: null,
     },
   });
 

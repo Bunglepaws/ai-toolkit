@@ -1,0 +1,910 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>feat: Dataset Bucket Consolidation Tool</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #22263a;
+    --border: #2e3352;
+    --text: #e2e8f0;
+    --muted: #8892aa;
+    --accent: #6c8ef7;
+    --accent2: #a78bfa;
+    --green: #4ade80;
+    --amber: #fbbf24;
+    --red: #f87171;
+    --chip-bg: #1e2540;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f8f9fb; --surface: #ffffff; --surface2: #f0f2f8;
+      --border: #d4d8e8; --text: #1e2340; --muted: #6b7280;
+      --accent: #4060e8; --accent2: #7c3aed; --green: #16a34a;
+      --amber: #d97706; --red: #dc2626; --chip-bg: #e8eaf6;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 15px; line-height: 1.65;
+    max-width: 940px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem;
+  }
+  h1 { font-size: 1.75rem; font-weight: 700; line-height: 1.2; margin-bottom: .5rem; }
+  h2 { font-size: 1.05rem; font-weight: 600; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--accent); margin: 2.5rem 0 .8rem; padding-bottom: .35rem;
+       border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1rem; font-weight: 600; color: var(--accent2); margin: 1.5rem 0 .4rem; }
+  h4 { font-size: .82rem; font-weight: 700; color: var(--muted); text-transform: uppercase;
+       letter-spacing: .06em; margin: .9rem 0 .25rem; }
+  p { margin-bottom: .7rem; }
+  ul, ol { margin: .4rem 0 .7rem 1.3rem; }
+  li { margin-bottom: .25rem; }
+  code {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: .82em; background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 4px; padding: .1em .35em; color: var(--accent);
+  }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+
+  .plan-header { background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 1.5rem 1.75rem; margin-bottom: 2rem; }
+  .plan-meta { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .8rem; }
+  .chip { font-size: .75rem; font-weight: 600; padding: .2em .7em; border-radius: 999px;
+    background: var(--chip-bg); color: var(--muted); border: 1px solid var(--border); letter-spacing: .04em; }
+  .chip.green { background: #052e1610; color: var(--green); border-color: #4ade8040; }
+  .chip.amber { background: #44240010; color: var(--amber); border-color: #fbbf2440; }
+  .chip.accent { background: #1e2e6010; color: var(--accent); border-color: #6c8ef740; }
+
+  .summary-box { background: var(--surface); border-left: 3px solid var(--accent);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: .5rem 0 1.5rem; font-size: .95rem; }
+
+  .ktd-table { width: 100%; border-collapse: collapse; margin: .5rem 0 1rem; font-size: .88rem; }
+  .ktd-table th { text-align: left; padding: .5rem .75rem; background: var(--surface2);
+    color: var(--muted); font-weight: 600; font-size: .75rem; text-transform: uppercase;
+    letter-spacing: .06em; border-bottom: 1px solid var(--border); }
+  .ktd-table td { padding: .55rem .75rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .ktd-table tr:last-child td { border-bottom: none; }
+  .ktd-table td:first-child { font-weight: 600; color: var(--accent2); white-space: nowrap; width: 26%; }
+
+  .unit { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1.25rem 1.5rem; margin-bottom: 1.25rem; }
+  .unit-header { display: flex; align-items: baseline; gap: .75rem; margin-bottom: .75rem; }
+  .unit-id { font-family: monospace; font-size: .8rem; font-weight: 700; background: var(--accent);
+    color: #fff; border-radius: 4px; padding: .15em .5em; flex-shrink: 0; }
+  .unit-title { font-size: 1.02rem; font-weight: 600; }
+  .unit-section { margin-top: .75rem; }
+  .files-list { font-family: monospace; font-size: .8rem; list-style: none; padding: 0; }
+  .files-list li { margin-bottom: .15rem; }
+  .files-list .new::before { content: '+ '; color: var(--green); }
+  .files-list .mod::before { content: '~ '; color: var(--amber); }
+
+  .scenarios { list-style: none; margin: .3rem 0 0; padding: 0; }
+  .scenarios li { font-size: .85rem; padding: .3rem .5rem .3rem 1.25rem;
+    border-left: 2px solid var(--border); margin-bottom: .25rem; position: relative; }
+  .scenarios li::before { content: '→'; position: absolute; left: .25rem; color: var(--muted); }
+
+  .dod-list { list-style: none; padding: 0; }
+  .dod-list li { padding: .3rem 0 .3rem 1.5rem; position: relative; font-size: .9rem;
+    border-bottom: 1px solid var(--border); }
+  .dod-list li:last-child { border-bottom: none; }
+  .dod-list li::before { content: '☐'; position: absolute; left: 0; color: var(--accent); }
+
+  .scope-table { width: 100%; border-collapse: collapse; margin: .5rem 0; font-size: .87rem; }
+  .scope-table th { text-align: left; padding: .4rem .75rem; background: var(--surface2);
+    color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .06em;
+    border-bottom: 1px solid var(--border); }
+  .scope-table td { padding: .45rem .75rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .scope-table tr:last-child td { border-bottom: none; }
+  .scope-table .in { color: var(--green); font-weight: 600; }
+  .scope-table .out { color: var(--red); }
+  .scope-table .defer { color: var(--amber); }
+
+  .arch-diagram { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 1.25rem; margin: 1rem 0; overflow-x: auto; }
+  .arch-diagram svg { display: block; max-width: 100%; }
+
+  .oq-item { background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--amber); border-radius: 0 6px 6px 0;
+    padding: .65rem 1rem; margin-bottom: .6rem; font-size: .88rem; }
+  .oq-label { font-size: .72rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .07em; color: var(--amber); margin-bottom: .15rem; }
+
+  .verif-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; margin-top: .5rem; }
+  @media (max-width: 600px) { .verif-grid { grid-template-columns: 1fr; } }
+  .verif-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px;
+    padding: .75rem 1rem; font-size: .85rem; }
+  .verif-card strong { display: block; margin-bottom: .25rem; font-size: .78rem;
+    text-transform: uppercase; letter-spacing: .05em; color: var(--accent); }
+
+  .toc { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 1rem 1.25rem; margin-bottom: 2rem; font-size: .85rem; }
+  .toc h4 { color: var(--muted); margin-bottom: .5rem; }
+  .toc ol { margin-left: 1rem; }
+  .toc li { margin-bottom: .2rem; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<div class="plan-header">
+  <h1>feat: Dataset Bucket Consolidation Tool</h1>
+  <div class="plan-meta">
+    <span class="chip accent">feat</span>
+    <span class="chip">2026-07-11</span>
+    <span class="chip green">implementation-ready</span>
+    <span class="chip amber">5 units</span>
+    <span class="chip">product_contract_source: ce-plan-bootstrap</span>
+  </div>
+</div>
+
+<div class="toc">
+  <h4>Contents</h4>
+  <ol>
+    <li><a href="#summary">Summary</a></li>
+    <li><a href="#problem">Problem Frame</a></li>
+    <li><a href="#ktd">Key Technical Decisions</a></li>
+    <li><a href="#htd">Architecture Overview</a></li>
+    <li><a href="#units">Implementation Units</a> (U1–U5)</li>
+    <li><a href="#scope">Scope Boundaries</a></li>
+    <li><a href="#openq">Open Questions / Deferred</a></li>
+    <li><a href="#verif">Verification Contract</a></li>
+    <li><a href="#dod">Definition of Done</a></li>
+  </ol>
+</div>
+
+<!-- ─── SUMMARY ─────────────────────────────────────────────── -->
+<h2 id="summary">Summary</h2>
+<div class="summary-box">
+  A dataset preprocessing tool — accessible from the dataset detail page — that scans image dimensions, shows the current bucket distribution, lets the user pick a target resolution and operation mode (resize-only or crop-to-ratio), optionally uses the configured vision LLM to detect the focal point of each image that needs cropping, then presents a per-image review grid where crop anchors can be overridden before the final Pillow-based processing run that writes output to a new sibling dataset folder.
+</div>
+<p>
+  Motivated by training runs where a dataset's images spread across many aspect-ratio buckets — e.g. a mix of 16:9 video exports, 1:1 product shots, and 3:4 portraits — causing the trainer to maintain many small per-bucket batches, slowing caching and reducing effective batch size. Consolidating to one or two target buckets fixes this without sacrificing important image content, provided the crop is guided by where the subject actually sits in the frame.
+</p>
+<p>
+  Reference implementation: <a href="https://github.com/mnslarcher/resize-and-crop-for-bucketing">github.com/mnslarcher/resize-and-crop-for-bucketing</a> — MIT-licensed, uses the same resize-then-center-crop approach. We borrow the crop math and add anchor offset support + vision LLM guidance on top.
+</p>
+
+<hr>
+
+<!-- ─── PROBLEM FRAME ──────────────────────────────────────── -->
+<h2 id="problem">Problem Frame</h2>
+<p>When a dataset's images have varied aspect ratios, the ai-toolkit trainer creates a separate latent bucket for each distinct <code>WxH</code> output resolution. A dataset with 200 images spread across 12 buckets means some buckets have &lt;20 images, making per-bucket batches tiny and VRAM efficiency low. The AI Config Check already detects and flags this; this tool closes the loop by fixing it.</p>
+<p>The naive fix — center-crop everything — risks cutting off the subject. A portrait with the person on the left side of a wide frame becomes headless after a center crop. The correct fix is to know where the subject is and crop from the opposite side.</p>
+<p>Constraints that shape the solution:</p>
+<ul>
+  <li>Must be non-destructive (new folder, never touch originals)</li>
+  <li>Must work independently of whether a training job has been run (no dependency on <code>Job.dataset_stats</code>)</li>
+  <li>Must use ai-toolkit's own bucket algorithm (<code>toolkit/buckets.py</code>) to guarantee output images land in the expected training bucket</li>
+  <li>Vision LLM calls are slow per-image; progress must be streamed</li>
+  <li>The tool should be usable without any LLM configured (falls back to center crop + user override)</li>
+</ul>
+
+<hr>
+
+<!-- ─── KEY TECHNICAL DECISIONS ──────────────────────────────── -->
+<h2 id="ktd">Key Technical Decisions</h2>
+<table class="ktd-table">
+  <thead><tr><th>Decision</th><th>Choice</th><th>Rationale</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>KTD-1: Image dimension scanning</td>
+      <td>Python script via <code>spawn(resolvePythonPath(), ...)</code> — same pattern as <code>/api/scripts</code></td>
+      <td><code>sharp</code> is not installed in the project. The Python venv has PIL, and <code>toolkit/buckets.py</code> is importable from the toolkit root. A scan script avoids adding a new Node dependency and reuses existing Python infrastructure. Script placed in <code>ui_scripts/</code> so the existing <code>/api/scripts</code> route can invoke it directly.</td>
+    </tr>
+    <tr>
+      <td>KTD-2: Bucketing algorithm</td>
+      <td><code>toolkit.buckets.get_bucket_for_image_size(w, h, resolution, divisibility=8)</code> — the trainer's own function</td>
+      <td>Must match what the trainer does at training time to guarantee that output images land in the intended bucket. The mnslarcher reference script uses a different approach (all-combos → closest aspect ratio, <code>divisible_by=64</code>). Using the trainer's function directly avoids any bucket mismatch.</td>
+    </tr>
+    <tr>
+      <td>KTD-3: Crop math</td>
+      <td>Borrow mnslarcher's resize-then-crop approach; replace the hardcoded <code>// 2</code> center offset with <code>* anchor_factor</code></td>
+      <td>The reference implementation's crop logic is correct and well-tested: resize so the short side matches the target, then crop the excess from the long side. We parameterise the crop offset: anchor 0.0 = crop from far end, 0.5 = center, 1.0 = crop from near end. The 3×3 grid maps to (anchorX, anchorY) pairs — e.g. <code>top-left → (0.0, 0.0)</code>, <code>center → (0.5, 0.5)</code>, <code>bottom-right → (1.0, 1.0)</code>.</td>
+    </tr>
+    <tr>
+      <td>KTD-4: Focal point detection transport</td>
+      <td>New SSE route <code>POST /api/datasets/focal-points</code> using <code>ReadableStream</code> + <code>text/event-stream</code></td>
+      <td>Focal point detection calls the LLM in Node.js (using the already-installed <code>openai</code> SDK with the configured Ollama endpoint). SSE is the right transport for per-image progress since it's a long-running server push. The client reads the stream via <code>fetch()</code> + <code>response.body.getReader()</code>. <em>Not</em> using <code>/api/scripts</code> for this — the LLM calls are Node-native and shouldn't go through Python.</td>
+    </tr>
+    <tr>
+      <td>KTD-5: Crop preview overlay</td>
+      <td>CSS clip-path polygon "hole" approach — one <code>div</code> with a clip-path that cuts out the kept region, revealing the image with darkened surroundings</td>
+      <td>Pure CSS, no canvas, no extra libraries. The kept-region rectangle is expressed as a percentage of the thumbnail dimensions. A single absolutely-positioned overlay with <code>clip-path: polygon(outer-rect, inner-hole)</code> darkens the discarded regions without touching the image element.</td>
+    </tr>
+    <tr>
+      <td>KTD-6: Processing script</td>
+      <td><code>ui_scripts/crop_resize_dataset.py</code> — invoked via <code>/api/scripts</code> with <code>stream: true</code> (NDJSON)</td>
+      <td>The existing <code>/api/scripts</code> route already provides buffered + streaming Python execution with NDJSON output. The crop/resize script accepts a JSON file path for per-image decisions (anchor + mode), reads it once at startup, then processes each image and emits a progress NDJSON line. Using <code>/api/scripts</code> avoids duplicating the subprocess + stream plumbing.</td>
+    </tr>
+    <tr>
+      <td>KTD-7: Modal UX structure</td>
+      <td>Single multi-step modal, 5 named steps: Scan → Configure → Detect → Review → Process/Done</td>
+      <td>Keeps all state in one component and one place. Step skipping is clean: resize-only mode jumps from Configure directly to Process, skipping Detect and Review. A separate modal for the review grid would require passing a large decisions object between modals.</td>
+    </tr>
+    <tr>
+      <td>KTD-8: Output folder naming</td>
+      <td><code>{datasetsRoot}/{datasetName}_bucket_{W}x{H}/</code></td>
+      <td>Unambiguous, sortable, reveals the target bucket at a glance. If a same-named folder already exists, append <code>_2</code>, <code>_3</code>, etc. — checked by the processing API route before spawning the script.</td>
+    </tr>
+    <tr>
+      <td>KTD-9: Caption file handling</td>
+      <td>Python script copies all sidecar files (<code>.txt</code>, <code>.json</code>, <code>.caption</code>) alongside each processed image</td>
+      <td>A processed image without its caption is useless for training. Copying all three caption extensions covers every captioning workflow the UI supports without requiring the user to specify which one they used.</td>
+    </tr>
+  </tbody>
+</table>
+
+<hr>
+
+<!-- ─── ARCHITECTURE OVERVIEW ─────────────────────────────────── -->
+<h2 id="htd">Architecture Overview</h2>
+
+<h3>Data flow — bucket analysis</h3>
+<div class="arch-diagram">
+<svg viewBox="0 0 760 120" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,sans-serif" font-size="12">
+  <defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3z" fill="#6c8ef7"/></marker></defs>
+  <rect x="10" y="35" width="140" height="44" rx="6" fill="#22263a" stroke="#6c8ef7" stroke-width="1.5"/>
+  <text x="80" y="55" text-anchor="middle" fill="#e2e8f0" font-weight="600">BucketToolsModal</text>
+  <text x="80" y="70" text-anchor="middle" fill="#8892aa" font-size="10">clicks "Scan"</text>
+  <line x1="150" y1="57" x2="195" y2="57" stroke="#6c8ef7" stroke-width="1.5" marker-end="url(#a)"/>
+  <rect x="195" y="35" width="175" height="44" rx="6" fill="#22263a" stroke="#a78bfa" stroke-width="1.5"/>
+  <text x="282" y="55" text-anchor="middle" fill="#a78bfa" font-weight="600">POST /api/scripts</text>
+  <text x="282" y="70" text-anchor="middle" fill="#8892aa" font-size="10">scan_dataset_buckets.py</text>
+  <line x1="370" y1="57" x2="415" y2="57" stroke="#6c8ef7" stroke-width="1.5" marker-end="url(#a)"/>
+  <rect x="415" y="35" width="170" height="44" rx="6" fill="#22263a" stroke="#4ade80" stroke-width="1.5"/>
+  <text x="500" y="55" text-anchor="middle" fill="#4ade80" font-weight="600">PIL + toolkit.buckets</text>
+  <text x="500" y="70" text-anchor="middle" fill="#8892aa" font-size="10">returns JSON last line</text>
+  <line x1="585" y1="57" x2="630" y2="57" stroke="#6c8ef7" stroke-width="1.5" marker-end="url(#a)"/>
+  <rect x="630" y="35" width="120" height="44" rx="6" fill="#22263a" stroke="#fbbf24" stroke-width="1.5"/>
+  <text x="690" y="55" text-anchor="middle" fill="#fbbf24" font-weight="600">Bucket chart</text>
+  <text x="690" y="70" text-anchor="middle" fill="#8892aa" font-size="10">Step 1 UI</text>
+</svg>
+</div>
+
+<h3>Data flow — focal point detection (SSE)</h3>
+<div class="arch-diagram">
+<svg viewBox="0 0 760 140" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,sans-serif" font-size="12">
+  <defs><marker id="b" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3z" fill="#6c8ef7"/></marker></defs>
+  <rect x="10" y="50" width="140" height="44" rx="6" fill="#22263a" stroke="#6c8ef7" stroke-width="1.5"/>
+  <text x="80" y="70" text-anchor="middle" fill="#e2e8f0" font-weight="600">Modal Step 3</text>
+  <text x="80" y="85" text-anchor="middle" fill="#8892aa" font-size="10">fetch + ReadableStream</text>
+  <line x1="150" y1="72" x2="195" y2="72" stroke="#6c8ef7" stroke-width="1.5" marker-end="url(#b)"/>
+  <rect x="195" y="50" width="185" height="44" rx="6" fill="#22263a" stroke="#a78bfa" stroke-width="1.5"/>
+  <text x="287" y="70" text-anchor="middle" fill="#a78bfa" font-weight="600">POST /api/datasets/</text>
+  <text x="287" y="85" text-anchor="middle" fill="#a78bfa" font-weight="600">focal-points</text>
+  <line x1="380" y1="72" x2="425" y2="72" stroke="#6c8ef7" stroke-width="1.5" marker-end="url(#b)"/>
+  <rect x="425" y="28" width="165" height="88" rx="6" fill="#22263a" stroke="#4ade80" stroke-width="1.5"/>
+  <text x="507" y="55" text-anchor="middle" fill="#4ade80" font-weight="600">OpenAI SDK</text>
+  <text x="507" y="72" text-anchor="middle" fill="#8892aa" font-size="10">getCheckConfigApiBaseUrl()</text>
+  <text x="507" y="87" text-anchor="middle" fill="#8892aa" font-size="10">vision model per image</text>
+  <text x="507" y="102" text-anchor="middle" fill="#8892aa" font-size="10">stream SSE ← anchor</text>
+  <line x1="590" y1="72" x2="635" y2="72" stroke="#6c8ef7" stroke-width="1.5" marker-end="url(#b)"/>
+  <rect x="635" y="50" width="115" height="44" rx="6" fill="#22263a" stroke="#fbbf24" stroke-width="1.5"/>
+  <text x="692" y="70" text-anchor="middle" fill="#fbbf24" font-weight="600">Review grid</text>
+  <text x="692" y="85" text-anchor="middle" fill="#8892aa" font-size="10">Step 4 UI</text>
+</svg>
+</div>
+
+<h3>Crop math</h3>
+<div class="arch-diagram">
+<svg viewBox="0 0 760 180" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,sans-serif" font-size="12">
+  <!-- Source image (wide) -->
+  <rect x="20" y="30" width="200" height="120" rx="4" fill="#22263a" stroke="#8892aa" stroke-width="1"/>
+  <text x="120" y="22" text-anchor="middle" fill="#8892aa" font-size="10">source: wider than target ratio</text>
+  <!-- Kept region highlight -->
+  <rect x="20" y="30" width="150" height="120" rx="0" fill="none" stroke="#6c8ef7" stroke-width="2" stroke-dasharray="4,2"/>
+  <!-- Discarded right strip -->
+  <rect x="170" y="30" width="50" height="120" rx="0" fill="#f8717133" stroke="none"/>
+  <text x="195" y="97" text-anchor="middle" fill="#f87171" font-size="10">cut</text>
+  <!-- Anchor label -->
+  <text x="72" y="97" text-anchor="middle" fill="#6c8ef7" font-size="10">kept</text>
+  <text x="72" y="112" text-anchor="middle" fill="#8892aa" font-size="10">anchor=top-left</text>
+  <!-- Arrow -->
+  <line x1="240" y1="90" x2="285" y2="90" stroke="#6c8ef7" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="262" y="84" text-anchor="middle" fill="#8892aa" font-size="10">resize H→</text>
+  <text x="262" y="96" text-anchor="middle" fill="#8892aa" font-size="10">target_H, crop W</text>
+  <!-- Output image -->
+  <rect x="285" y="50" width="110" height="80" rx="4" fill="#22263a" stroke="#4ade80" stroke-width="1.5"/>
+  <text x="340" y="97" text-anchor="middle" fill="#4ade80" font-size="10">output</text>
+  <text x="340" y="112" text-anchor="middle" fill="#8892aa" font-size="10">target WxH</text>
+  <!-- Anchor offset formula -->
+  <rect x="430" y="30" width="310" height="120" rx="6" fill="#1a1d27" stroke="#2e3352"/>
+  <text x="585" y="52" text-anchor="middle" fill="#a78bfa" font-weight="600" font-size="11">Anchor offset formula</text>
+  <text x="450" y="74" fill="#e2e8f0" font-size="11">excess_w = new_width − target_width</text>
+  <text x="450" y="92" fill="#e2e8f0" font-size="11">left = excess_w × anchor_x</text>
+  <text x="450" y="110" fill="#8892aa" font-size="10">anchor_x: top-left=0.0, center=0.5, top-right=1.0</text>
+  <text x="450" y="128" fill="#8892aa" font-size="10">(same logic for excess_h × anchor_y)</text>
+  <text x="450" y="146" fill="#fbbf24" font-size="10">mnslarcher hardcodes // 2 (anchor=0.5 always)</text>
+</svg>
+</div>
+
+<h3>3×3 anchor grid → (anchor_x, anchor_y)</h3>
+<div class="arch-diagram">
+<svg viewBox="0 0 380 160" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,sans-serif" font-size="11">
+  <text x="190" y="18" text-anchor="middle" fill="#8892aa" font-size="10">anchor_x increases left→right, anchor_y increases top→bottom</text>
+  <text x="190" y="32" text-anchor="middle" fill="#8892aa" font-size="10">(keep subject in top-left → anchor=0,0 → crop bottom and right)</text>
+  <!-- Grid cells -->
+  <rect x="40" y="45" width="90" height="35" rx="4" fill="#22263a" stroke="#2e3352"/>
+  <text x="85" y="60" text-anchor="middle" fill="#e2e8f0">top-left</text>
+  <text x="85" y="73" text-anchor="middle" fill="#6c8ef7" font-size="10">(0.0, 0.0)</text>
+  <rect x="135" y="45" width="90" height="35" rx="4" fill="#22263a" stroke="#2e3352"/>
+  <text x="180" y="60" text-anchor="middle" fill="#e2e8f0">top-center</text>
+  <text x="180" y="73" text-anchor="middle" fill="#6c8ef7" font-size="10">(0.5, 0.0)</text>
+  <rect x="230" y="45" width="90" height="35" rx="4" fill="#22263a" stroke="#2e3352"/>
+  <text x="275" y="60" text-anchor="middle" fill="#e2e8f0">top-right</text>
+  <text x="275" y="73" text-anchor="middle" fill="#6c8ef7" font-size="10">(1.0, 0.0)</text>
+  <rect x="40" y="85" width="90" height="35" rx="4" fill="#22263a" stroke="#2e3352"/>
+  <text x="85" y="100" text-anchor="middle" fill="#e2e8f0">center-left</text>
+  <text x="85" y="113" text-anchor="middle" fill="#6c8ef7" font-size="10">(0.0, 0.5)</text>
+  <rect x="135" y="85" width="90" height="35" rx="4" fill="#4ade8020" stroke="#4ade8080"/>
+  <text x="180" y="100" text-anchor="middle" fill="#4ade80">center</text>
+  <text x="180" y="113" text-anchor="middle" fill="#6c8ef7" font-size="10">(0.5, 0.5)</text>
+  <rect x="230" y="85" width="90" height="35" rx="4" fill="#22263a" stroke="#2e3352"/>
+  <text x="275" y="100" text-anchor="middle" fill="#e2e8f0">center-right</text>
+  <text x="275" y="113" text-anchor="middle" fill="#6c8ef7" font-size="10">(1.0, 0.5)</text>
+  <rect x="40" y="125" width="90" height="35" rx="4" fill="#22263a" stroke="#2e3352"/>
+  <text x="85" y="140" text-anchor="middle" fill="#e2e8f0">bottom-left</text>
+  <text x="85" y="153" text-anchor="middle" fill="#6c8ef7" font-size="10">(0.0, 1.0)</text>
+  <rect x="135" y="125" width="90" height="35" rx="4" fill="#22263a" stroke="#2e3352"/>
+  <text x="180" y="140" text-anchor="middle" fill="#e2e8f0">bottom-center</text>
+  <text x="180" y="153" text-anchor="middle" fill="#6c8ef7" font-size="10">(0.5, 1.0)</text>
+  <rect x="230" y="125" width="90" height="35" rx="4" fill="#22263a" stroke="#2e3352"/>
+  <text x="275" y="140" text-anchor="middle" fill="#e2e8f0">bottom-right</text>
+  <text x="275" y="153" text-anchor="middle" fill="#6c8ef7" font-size="10">(1.0, 1.0)</text>
+</svg>
+</div>
+
+<h3>Modal step flow</h3>
+<div class="arch-diagram">
+<svg viewBox="0 0 760 80" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,sans-serif" font-size="11">
+  <defs><marker id="c" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3z" fill="#6c8ef7"/></marker></defs>
+  <!-- Steps -->
+  <rect x="5" y="20" width="110" height="40" rx="6" fill="#22263a" stroke="#6c8ef7" stroke-width="1.5"/>
+  <text x="60" y="37" text-anchor="middle" fill="#e2e8f0" font-weight="600">1 · Scan</text>
+  <text x="60" y="52" text-anchor="middle" fill="#8892aa" font-size="10">+ Configure</text>
+  <line x1="115" y1="40" x2="145" y2="40" stroke="#6c8ef7" stroke-width="1.5" marker-end="url(#c)"/>
+  <rect x="145" y="20" width="110" height="40" rx="6" fill="#22263a" stroke="#a78bfa" stroke-width="1.5"/>
+  <text x="200" y="37" text-anchor="middle" fill="#a78bfa" font-weight="600">2 · Detect</text>
+  <text x="200" y="52" text-anchor="middle" fill="#8892aa" font-size="10">focal points (SSE)</text>
+  <text x="130" y="18" text-anchor="middle" fill="#fbbf24" font-size="9">crop mode only ↓</text>
+  <line x1="255" y1="40" x2="285" y2="40" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#c)"/>
+  <rect x="285" y="20" width="110" height="40" rx="6" fill="#22263a" stroke="#a78bfa" stroke-width="1.5"/>
+  <text x="340" y="37" text-anchor="middle" fill="#a78bfa" font-weight="600">3 · Review</text>
+  <text x="340" y="52" text-anchor="middle" fill="#8892aa" font-size="10">per-image grid</text>
+  <line x1="395" y1="40" x2="425" y2="40" stroke="#6c8ef7" stroke-width="1.5" marker-end="url(#c)"/>
+  <!-- Skip arrow for resize-only -->
+  <path d="M115,30 Q230,5 425,30" fill="none" stroke="#4ade80" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#c)"/>
+  <text x="252" y="10" text-anchor="middle" fill="#4ade80" font-size="9">resize-only: skip steps 2+3</text>
+  <rect x="425" y="20" width="110" height="40" rx="6" fill="#22263a" stroke="#6c8ef7" stroke-width="1.5"/>
+  <text x="480" y="37" text-anchor="middle" fill="#e2e8f0" font-weight="600">4 · Process</text>
+  <text x="480" y="52" text-anchor="middle" fill="#8892aa" font-size="10">NDJSON progress</text>
+  <line x1="535" y1="40" x2="565" y2="40" stroke="#6c8ef7" stroke-width="1.5" marker-end="url(#c)"/>
+  <rect x="565" y="20" width="110" height="40" rx="6" fill="#22263a" stroke="#4ade80" stroke-width="1.5"/>
+  <text x="620" y="37" text-anchor="middle" fill="#4ade80" font-weight="600">5 · Done</text>
+  <text x="620" y="52" text-anchor="middle" fill="#8892aa" font-size="10">link to new dataset</text>
+</svg>
+</div>
+
+<hr>
+
+<!-- ─── IMPLEMENTATION UNITS ──────────────────────────────── -->
+<h2 id="units">Implementation Units</h2>
+
+<!-- U1 -->
+<div class="unit">
+  <div class="unit-header">
+    <span class="unit-id">U1</span>
+    <span class="unit-title">Bucket scan — Python script + API route</span>
+  </div>
+
+  <div class="unit-section">
+    <h4>Goal</h4>
+    <p>Scan all images in a dataset folder, compute each image's dimensions via PIL, determine its bucket at a given resolution using ai-toolkit's own algorithm, and return the distribution as JSON.</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Dependencies</h4>
+    <p>None — first unit to build.</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Files</h4>
+    <ul class="files-list">
+      <li class="new"><code>ui_scripts/scan_dataset_buckets.py</code></li>
+      <li class="new"><code>ui/src/app/api/datasets/[datasetName]/scan-buckets/route.ts</code></li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Approach</h4>
+    <p><strong>Python script (<code>ui_scripts/scan_dataset_buckets.py</code>):</strong></p>
+    <ul>
+      <li>CLI args: <code>--dataset-dir PATH</code>, <code>--resolution INT</code> (default 1024), <code>--divisibility INT</code> (default 8)</li>
+      <li>Scans <code>dataset-dir</code> recursively for <code>.png .jpg .jpeg .webp</code> files (same extensions as <code>listImages</code> route)</li>
+      <li>For each image: open with PIL, read <code>image.size</code>, call <code>get_bucket_for_image_size(w, h, resolution, divisibility)</code> from <code>toolkit.buckets</code> (importable since cwd is <code>TOOLKIT_ROOT</code>)</li>
+      <li>Accumulates <code>{images: [{path, width, height, bucket_w, bucket_h, needs_crop}], buckets: {WxH: count}}</code> where <code>needs_crop</code> is true when the image's aspect ratio differs from the target bucket's aspect ratio beyond a small tolerance (meaning a crop, not just a resize, will occur)</li>
+      <li>Emits the result dict as the final line of stdout (JSON) — compatible with the existing <code>parseResult</code> function in <code>/api/scripts</code></li>
+      <li>Uses <code>Image.open(...).size</code> only (no decode) for speed; PIL lazy-loads image data</li>
+    </ul>
+    <p><strong>API route (<code>POST /api/datasets/[datasetName]/scan-buckets</code>):</strong></p>
+    <ul>
+      <li>Body: <code>{resolution: number, divisibility?: number}</code></li>
+      <li>Resolves dataset path via <code>getDatasetsRoot()</code></li>
+      <li>Spawns <code>resolvePythonPath()</code> directly (same pattern as <code>/api/scripts</code> <code>runBuffered</code>), passing <code>--dataset-dir</code> and <code>--resolution</code></li>
+      <li>Returns the parsed <code>result</code> field from the script output (the JSON dict)</li>
+      <li>Timeout: 60 s (datasets should scan in &lt;5 s even at 1000 images)</li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Patterns to follow</h4>
+    <p><code>ui/src/app/api/scripts/route.ts</code> — <code>runBuffered</code> function and <code>parseResult</code>. <code>ui/src/app/api/datasets/listImages/route.ts</code> — path resolution pattern.</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Test scenarios</h4>
+    <ul class="scenarios">
+      <li>Dataset with 10 images, all 1024×1024: single bucket <code>1024x1024</code>, count=10, no image has <code>needs_crop=true</code></li>
+      <li>Dataset with 5 landscape (1920×1080) + 5 portrait (720×1280) at resolution=1024: two buckets; landscape maps to ~<code>1024x576</code>, portrait to ~<code>576x1024</code></li>
+      <li>Dataset folder does not exist: route returns 404</li>
+      <li>PIL fails on a corrupt image: script logs a warning and skips the file; other images still return correctly</li>
+      <li>Empty dataset folder: returns <code>{images: [], buckets: {}}</code> with 200 status</li>
+      <li>resolution=512, divisibility=64: buckets are multiples of 64; verify against manual calculation</li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Verification</h4>
+    <p>Call the route via curl against a real dataset folder; compare bucket counts to what the trainer reports in its log after latent caching with the same resolution.</p>
+  </div>
+</div>
+
+<!-- U2 -->
+<div class="unit">
+  <div class="unit-header">
+    <span class="unit-id">U2</span>
+    <span class="unit-title">Focal point detection — SSE route</span>
+  </div>
+
+  <div class="unit-section">
+    <h4>Goal</h4>
+    <p>For a list of image paths that need cropping, call the configured vision LLM once per image to detect the focal point (3×3 grid position), stream one SSE event per image as results arrive, and fall back to <code>center</code> on any failure.</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Dependencies</h4>
+    <p>None — can build in parallel with U1.</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Files</h4>
+    <ul class="files-list">
+      <li class="new"><code>ui/src/app/api/datasets/focal-points/route.ts</code></li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Approach</h4>
+    <ul>
+      <li>Method: <code>POST</code>. Body: <code>{imagePaths: string[]}</code> (absolute paths from the scan result)</li>
+      <li>Read LLM config via <code>getCheckConfigApiBaseUrl()</code>, <code>getCheckConfigApiKey()</code>, <code>getCheckConfigModel()</code>. If base URL is empty, emit <code>center</code> for all images immediately and close the stream.</li>
+      <li>Returns <code>Content-Type: text/event-stream; charset=utf-8</code> with <code>Cache-Control: no-cache</code></li>
+      <li>For each image (sequential, not parallel — Ollama handles one vision request at a time reliably):
+        <ol>
+          <li>Read file from disk as Buffer, convert to base64 <code>data:image/jpeg;base64,…</code></li>
+          <li>Call <code>openai.chat.completions.create</code> with the multimodal message:
+            <ul>
+              <li>System: <em>"You detect the position of the main subject in images. Reply with ONLY one of these exact words: top-left, top-center, top-right, center-left, center, center-right, bottom-left, bottom-center, bottom-right. No other text."</em></li>
+              <li>User: <code>[{type: "image_url", image_url: {url: dataUrl}}, {type: "text", text: "Where is the main subject?"}]</code></li>
+            </ul>
+          </li>
+          <li>Parse response — strip whitespace, lowercase, check against the 9 valid values. If invalid or API error, use <code>center</code></li>
+          <li>Emit SSE event: <code>data: {"path":"...","anchor":"top-left","source":"ai"|"fallback"}\n\n</code></li>
+        </ol>
+      </li>
+      <li>Emit final event: <code>data: {"done":true}\n\n</code> then close the stream</li>
+      <li>Resize images to max 512px on the long side before base64 encoding — reduces API payload dramatically while retaining enough information for subject position detection</li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Patterns to follow</h4>
+    <p><code>ui/src/app/api/jobs/check-config/route.ts</code> — OpenAI SDK setup, <code>getCheckConfigApiBaseUrl()</code> usage, multimodal content array. <code>ui/src/app/api/scripts/route.ts</code> <code>runStreaming</code> — <code>ReadableStream</code> constructor + <code>TextEncoder</code> pattern for SSE.</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Test scenarios</h4>
+    <ul class="scenarios">
+      <li>API base URL not configured: all images receive <code>center</code> fallback immediately; stream closes with <code>done</code></li>
+      <li>Valid vision model + 3 images: stream emits 3 data events then done; each event has <code>path</code>, <code>anchor</code>, and <code>source:"ai"</code></li>
+      <li>Model returns "bottom right" (with space, wrong format): route normalizes to <code>bottom-right</code> correctly; if normalization fails, falls back to <code>center</code></li>
+      <li>LLM API returns 400/500: image gets <code>center</code> fallback + <code>source:"fallback"</code>; stream continues with remaining images</li>
+      <li>Image file does not exist (path stale): skip with fallback, log warning, continue</li>
+      <li>5-image dataset: progress arrives sequentially, not batched; each event appears within ~2 s of the previous</li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Verification</h4>
+    <p>Call the route with 3–5 real images from a dataset where the subject position is obvious (clear portrait, clear landscape subject). Confirm the AI-detected anchor matches human expectation for at least 3/5 images with Qwen3-VL-8B.</p>
+  </div>
+</div>
+
+<!-- U3 -->
+<div class="unit">
+  <div class="unit-header">
+    <span class="unit-id">U3</span>
+    <span class="unit-title">Crop/resize Python script + processing API route</span>
+  </div>
+
+  <div class="unit-section">
+    <h4>Goal</h4>
+    <p>Python script that processes a dataset to a new folder using per-image crop anchor decisions, with streaming NDJSON progress. API route that invokes it and relays the stream to the UI.</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Dependencies</h4>
+    <p>U1 (output folder naming established by the API route, which extends the U1 pattern).</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Files</h4>
+    <ul class="files-list">
+      <li class="new"><code>ui_scripts/crop_resize_dataset.py</code></li>
+      <li class="new"><code>ui/src/app/api/datasets/[datasetName]/process-buckets/route.ts</code></li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Approach</h4>
+    <p><strong>Python script (<code>ui_scripts/crop_resize_dataset.py</code>):</strong></p>
+    <ul>
+      <li>CLI args: <code>--input-dir PATH</code>, <code>--output-dir PATH</code>, <code>--resolution INT</code>, <code>--divisibility INT</code>, <code>--mode resize|crop</code>, <code>--decisions PATH</code> (path to a JSON file with <code>{absoluteImagePath: {anchor_x: float, anchor_y: float}}</code>)</li>
+      <li>Creates output dir if missing</li>
+      <li>For each image:
+        <ul>
+          <li><strong>resize mode</strong>: compute bucket via <code>get_bucket_for_image_size</code>, then resize with <code>Image.LANCZOS</code> to fit within the bucket — scale by <code>min(target_w/w, target_h/h)</code> so image fits without cropping, preserving aspect ratio. Final size may not exactly equal bucket dims; trainer handles this.</li>
+          <li><strong>crop mode</strong>: compute bucket, apply mnslarcher-style resize-then-crop with anchor offset: resize so the short side matches target, then <code>left = int(excess_w * anchor_x)</code>, <code>top = int(excess_h * anchor_y)</code>; look up (anchor_x, anchor_y) from decisions dict; default to (0.5, 0.5) if image not in dict</li>
+        </ul>
+      </li>
+      <li>Save output image preserving original format (.jpg → .jpg, .png → .png); convert RGBA→RGB before saving as JPEG</li>
+      <li>Copy sidecar caption files: for each of <code>.txt</code>, <code>.json</code>, <code>.caption</code> that exist alongside the source image, copy to output dir with same stem</li>
+      <li>After each image, emit NDJSON progress: <code>{"type":"progress","current":N,"total":M,"name":"filename.jpg"}</code></li>
+      <li>On completion, emit <code>{"type":"done","output_dir":"/abs/path/to/output","total":M,"skipped":K}</code> as the final stdout line</li>
+      <li>On per-image error: emit <code>{"type":"warning","name":"file.jpg","error":"..."}</code> and continue</li>
+    </ul>
+    <p><strong>API route (<code>POST /api/datasets/[datasetName]/process-buckets</code>):</strong></p>
+    <ul>
+      <li>Body: <code>{resolution, divisibility?, mode: "resize"|"crop", decisions: {[path]: {anchor_x, anchor_y}}}</code></li>
+      <li>Resolves output dir: <code>{datasetsRoot}/{datasetName}_bucket_{W}x{H}</code> where W×H is the target bucket at the given resolution for a 1:1 image. Appends <code>_2</code>, <code>_3</code>, etc. if folder already exists.</li>
+      <li>Writes the decisions object to a temp file (<code>os.tmpdir()/decisions-{uuid}.json</code>)</li>
+      <li>Spawns the Python script in streaming mode (same as <code>/api/scripts</code> <code>runStreaming</code>) and returns the <code>ReadableStream</code> response with NDJSON content-type</li>
+      <li>Cleans up the temp JSON file in the stream's <code>cancel()</code> callback</li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Patterns to follow</h4>
+    <p><code>ui/src/app/api/scripts/route.ts</code> — <code>runStreaming</code> function exactly. mnslarcher's <code>resize_and_crop.py</code> for the crop math (borrow, then add anchor offset). <code>toolkit/buckets.py</code> <code>get_bucket_for_image_size</code> for bucket assignment.</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Test scenarios</h4>
+    <ul class="scenarios">
+      <li>Resize mode, 10 images: all 10 emitted as progress events; output images are smaller but preserve aspect ratio; no crop artifacts</li>
+      <li>Crop mode, anchor=center (0.5, 0.5): output matches mnslarcher's center-crop output for same inputs</li>
+      <li>Crop mode, anchor=top-left (0.0, 0.0) for a wide image: output keeps left portion, discards right — verify with PIL crop coordinates in test</li>
+      <li>Output folder already exists: route appends <code>_2</code> suffix; script creates the new folder</li>
+      <li>Image has RGBA mode (PNG with alpha): saved as JPEG without error (RGB conversion applied)</li>
+      <li>Caption sidecar present (<code>.txt</code>): copied alongside output image</li>
+      <li>Caption sidecar absent: no error, no empty file created</li>
+      <li>Script receives a corrupt image: emits warning NDJSON, continues to next image; final <code>done</code> event reflects correct <code>skipped</code> count</li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Verification</h4>
+    <p>Run the script directly from WSL on a test dataset with known anchors. Inspect output images visually and verify the correct sides are cropped. Confirm caption files copied. Confirm NDJSON progress lines are valid JSON.</p>
+  </div>
+</div>
+
+<!-- U4 -->
+<div class="unit">
+  <div class="unit-header">
+    <span class="unit-id">U4</span>
+    <span class="unit-title">BucketToolsModal — all five steps</span>
+  </div>
+
+  <div class="unit-section">
+    <h4>Goal</h4>
+    <p>Single multi-step modal component managing the full bucket consolidation workflow: scan, configure, detect, review, process, done.</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Dependencies</h4>
+    <p>U1, U2, U3 (all routes must exist before the UI can call them).</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Files</h4>
+    <ul class="files-list">
+      <li class="new"><code>ui/src/components/BucketToolsModal.tsx</code></li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Approach — Step 1: Scan + Configure</h4>
+    <ul>
+      <li>On open: immediately call <code>POST /api/datasets/[datasetName]/scan-buckets</code> with default resolution 1024. Show a spinner while scanning.</li>
+      <li>On result: display a bar-style bucket distribution — each bucket as a labeled bar showing <code>WxH: N images</code>. Highlight buckets with &lt;10 images in amber.</li>
+      <li>Resolution presets: 512, 768, 1024 (default), 1280, custom. Changing the preset re-calls the scan route and re-renders the distribution.</li>
+      <li>Mode picker: "Resize only" (radio) vs "Crop to ratio" (radio). Resize-only note: <em>"Images keep their original aspect ratio — trainer handles multiple sizes within the pixel budget."</em></li>
+      <li>"Continue" button advances to Step 2 (crop mode) or Step 4 (resize mode). Disabled while scanning.</li>
+    </ul>
+
+    <h4>Approach — Step 2: Focal point detection</h4>
+    <ul>
+      <li>Show only images where <code>needs_crop: true</code> (from scan result). If zero such images, skip directly to Step 3 (review, showing only the resize-only count).</li>
+      <li>Connect to <code>POST /api/datasets/focal-points</code> via <code>fetch()</code> + <code>response.body.getReader()</code> + <code>TextDecoder</code>. Parse SSE <code>data:</code> lines as JSON.</li>
+      <li>Show a progress bar: <em>"Detecting focal points: N / M images"</em>. Each SSE event increments the counter and adds the result to a <code>decisions</code> state map.</li>
+      <li>While detecting: show a "Skip detection (use center crop)" button that aborts the fetch reader, fills remaining images with <code>center</code> anchor, and advances to Step 3.</li>
+      <li>If no LLM configured: skip this step automatically with a banner <em>"No vision model configured — defaulting to center crop. You can override below."</em></li>
+    </ul>
+
+    <h4>Approach — Step 3: Per-image review grid</h4>
+    <ul>
+      <li>Grid of thumbnail cards — only images with <code>needs_crop: true</code>. Images that only need resizing appear as a summary line: <em>"N images will be resized (no crop needed)."</em></li>
+      <li>Each card (approx. 200px wide):
+        <ul>
+          <li>Shows the image via the existing <code>/api/img/[...imagePath]</code> route (the same route used by <code>DatasetImageCard</code>)</li>
+          <li>Overlays the crop region using an absolutely-positioned <code>div</code> with <code>clip-path</code>: the overlay is <code>rgba(0,0,0,0.55)</code> with a "hole" cut at the kept crop rectangle. The hole's position and size are computed from the anchor (anchor_x, anchor_y) and the image's aspect ratio vs. target aspect ratio.</li>
+          <li>Shows the AI anchor label: <em>"AI: top-left"</em> or <em>"Fallback: center"</em></li>
+          <li>3×3 button grid picker below the thumbnail: 9 small buttons (grid CSS) labelled with arrows or position names. Active button highlighted in blue. Clicking updates <code>decisions[imagePath]</code> state.</li>
+        </ul>
+      </li>
+      <li>Crop overlay CSS clip-path formula (directional, not code): outer polygon covers 0%–100% of both axes; inner "hole" polygon is defined by the crop rectangle as percentages: left%=(anchorX × (1 - cropW/origW) × 100), top%=(anchorY × (1 - cropH/origH) × 100), right%=left%+(cropW/origW × 100), bottom%=top%+(cropH/origH × 100). Winding rule: outer clockwise, inner counter-clockwise.</li>
+      <li>"Process N images" button at the bottom of Step 3 advances to Step 4.</li>
+    </ul>
+
+    <h4>Approach — Step 4: Processing</h4>
+    <ul>
+      <li>On enter: call <code>POST /api/datasets/[datasetName]/process-buckets</code> with <code>{resolution, mode, decisions}</code>. The decisions object is <code>{[absolutePath]: {anchor_x, anchor_y}}</code> built from the Step 3 state.</li>
+      <li>Read NDJSON stream: each <code>progress</code> event updates a progress bar (<em>"Processing: N / M"</em>) and shows the current file name.</li>
+      <li><code>warning</code> events: collect and display below the progress bar as amber text.</li>
+      <li>On <code>done</code> event: advance to Step 5.</li>
+    </ul>
+
+    <h4>Approach — Step 5: Done</h4>
+    <ul>
+      <li>Show summary: <em>"Processed M images → {outputDatasetName}"</em>. If warnings: <em>"K images had errors (see below)."</em></li>
+      <li>"Open dataset" button: navigates to <code>/datasets/{outputDatasetName}</code> and closes the modal.</li>
+      <li>"Close" button: closes modal without navigating.</li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>State shape</h4>
+    <p>Key state in the modal component:</p>
+    <ul>
+      <li><code>step: 1|2|3|4|5</code></li>
+      <li><code>scanResult: {images, buckets} | null</code></li>
+      <li><code>resolution: number</code></li>
+      <li><code>mode: "resize"|"crop"</code></li>
+      <li><code>decisions: Record&lt;string, {anchor_x: number, anchor_y: number}&gt;</code></li>
+      <li><code>detectProgress: {current, total}</code></li>
+      <li><code>processProgress: {current, total, warnings: string[]}</code></li>
+      <li><code>outputDatasetName: string | null</code></li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Patterns to follow</h4>
+    <p><code>ui/src/components/Modal.tsx</code> — use the existing <code>Modal</code> component with <code>size="xl"</code>. <code>ui/src/app/datasets/[datasetName]/page.tsx</code> — <code>apiClient</code> pattern, <code>Button</code> from headlessui, Tailwind classes. The <code>SampleImageViewer</code> fetch-stream pattern for NDJSON if needed. VirtuosoGrid is available for the review grid if image count is large, but plain CSS grid is fine for &lt;200 images.</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Test scenarios</h4>
+    <ul class="scenarios">
+      <li>Step 1 — resolution change from 1024 to 512: re-scan fires and bucket distribution updates; button stays disabled during re-scan</li>
+      <li>Step 1 — resize mode selected: "Continue" → jumps directly to Step 4, no Step 2 or 3</li>
+      <li>Step 2 — 5 images need crop: progress bar reaches 5/5 then auto-advances; "Skip" button aborts mid-detection and fills center</li>
+      <li>Step 3 — user changes anchor from AI suggestion: overlay re-renders showing new crop region; decisions map updated</li>
+      <li>Step 3 — all images have same aspect ratio as target (no crop needed): no images shown in grid; "0 images need cropping" label shown; Process button visible</li>
+      <li>Step 4 — NDJSON warning emitted by script: amber warning text appears below progress bar</li>
+      <li>Step 5 — "Open dataset" click: navigates to <code>/datasets/{name}</code></li>
+      <li>Modal escape/backdrop close: if processing (Step 4), confirm dialog first; otherwise close freely</li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Verification</h4>
+    <p>Open modal on a dataset with mixed aspect ratios. Walk through all 5 steps with a real Ollama vision model. Confirm crop overlays match the selected anchor visually. Confirm the output folder contains correctly processed images and caption sidecars.</p>
+  </div>
+</div>
+
+<!-- U5 -->
+<div class="unit">
+  <div class="unit-header">
+    <span class="unit-id">U5</span>
+    <span class="unit-title">Dataset page — TopBar button integration</span>
+  </div>
+
+  <div class="unit-section">
+    <h4>Goal</h4>
+    <p>Add a "Bucket Tools" button to the dataset detail page TopBar and render the <code>BucketToolsModal</code>.</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Dependencies</h4>
+    <p>U4 (modal must exist).</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Files</h4>
+    <ul class="files-list">
+      <li class="mod"><code>ui/src/app/datasets/[datasetName]/page.tsx</code></li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Approach</h4>
+    <ul>
+      <li>Add <code>isBucketToolsOpen</code> boolean state</li>
+      <li>Place a "Bucket Tools" <code>Button</code> in the TopBar's right button cluster, between Find/Replace and AutoCaptionButton</li>
+      <li>Render <code>&lt;BucketToolsModal isOpen={isBucketToolsOpen} onClose={() =&gt; setIsBucketToolsOpen(false)} datasetName={datasetName} /&gt;</code> at the bottom of the return (alongside <code>AddImagesModal</code>, <code>CaptionDatasetModal</code>)</li>
+      <li>When the modal's "Open dataset" action fires with a new dataset name, call <code>window.location.href = /datasets/{name}</code> (full navigation, since it's a different dataset)</li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Patterns to follow</h4>
+    <p>Existing TopBar buttons in <code>ui/src/app/datasets/[datasetName]/page.tsx</code> — use the same <code>Button</code> from headlessui with <code>className="text-white bg-slate-600 px-2 sm:px-3 py-1 rounded-md text-sm"</code>.</p>
+  </div>
+
+  <div class="unit-section">
+    <h4>Test scenarios</h4>
+    <ul class="scenarios">
+      <li>Bucket Tools button visible in TopBar on the dataset page</li>
+      <li>Clicking button opens modal over the dataset page</li>
+      <li>Modal close (Escape or backdrop or Close button): modal closes, dataset page unchanged</li>
+      <li>TypeScript type-check passes with <code>npx tsc --noEmit</code></li>
+    </ul>
+  </div>
+
+  <div class="unit-section">
+    <h4>Verification</h4>
+    <p>Load the dataset page in the browser. Confirm the button appears without layout breakage at desktop and mobile widths.</p>
+  </div>
+</div>
+
+<hr>
+
+<!-- ─── SCOPE BOUNDARIES ──────────────────────────────────── -->
+<h2 id="scope">Scope Boundaries</h2>
+<table class="scope-table">
+  <thead><tr><th>Item</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td>Bucket scan via Python + PIL using ai-toolkit's own bucket algorithm</td><td class="in">✓ In scope</td></tr>
+    <tr><td>Resize-only mode (preserve aspect ratio, scale to pixel budget)</td><td class="in">✓ In scope</td></tr>
+    <tr><td>Crop-to-ratio mode with AI-guided anchor detection</td><td class="in">✓ In scope</td></tr>
+    <tr><td>Per-image anchor override via 3×3 grid in review step</td><td class="in">✓ In scope</td></tr>
+    <tr><td>CSS clip-path crop overlay on thumbnails</td><td class="in">✓ In scope</td></tr>
+    <tr><td>SSE streaming focal point detection progress</td><td class="in">✓ In scope</td></tr>
+    <tr><td>NDJSON streaming processing progress</td><td class="in">✓ In scope</td></tr>
+    <tr><td>Caption sidecar copy (.txt, .json, .caption)</td><td class="in">✓ In scope</td></tr>
+    <tr><td>Output to new sibling dataset folder, non-destructive</td><td class="in">✓ In scope</td></tr>
+    <tr><td>Fallback to center crop when no LLM configured or call fails</td><td class="in">✓ In scope</td></tr>
+    <tr><td>Video files in dataset (MP4, AVI, etc.)</td><td class="out">✗ Out — images only; video crop is a different problem</td></tr>
+    <tr><td>Batch applying to multiple datasets at once</td><td class="out">✗ Out — one dataset at a time</td></tr>
+    <tr><td>In-place overwrite of original images</td><td class="out">✗ Out — always non-destructive</td></tr>
+    <tr><td>Custom divisibility != 8 exposed in UI</td><td class="defer">→ Deferred — use ai-toolkit default of 8; can expose later</td></tr>
+    <tr><td>Auto-applying the output dataset to a training job config</td><td class="defer">→ Deferred — out of scope for this feature</td></tr>
+    <tr><td>Undo / restore from output folder back to source</td><td class="defer">→ Deferred — manual file copy is sufficient</td></tr>
+  </tbody>
+</table>
+
+<hr>
+
+<!-- ─── OPEN QUESTIONS / DEFERRED ────────────────────────── -->
+<h2 id="openq">Open Questions / Deferred to Implementation</h2>
+
+<div class="oq-item">
+  <div class="oq-label">Deferred to implementation</div>
+  <strong>needs_crop threshold</strong> — how much aspect ratio difference warrants a crop warning vs treating as "resize only". Suggest: if <code>|bucket_ar - image_ar| / image_ar &gt; 0.02</code> (2% relative difference) then <code>needs_crop=true</code>. Tune during implementation.
+</div>
+<div class="oq-item">
+  <div class="oq-label">Deferred to implementation</div>
+  <strong>Review grid virtualization</strong> — if a dataset has &gt;200 images needing crop, the review grid could be slow. Implement as plain CSS grid first; add <code>react-virtuoso</code> (already installed) if render time is noticeable during testing.
+</div>
+<div class="oq-item">
+  <div class="oq-label">Deferred to implementation</div>
+  <strong>Resize-mode output size</strong> — in resize-only mode, should output images be scaled to exactly the bucket WxH (with padding/letterboxing) or to "fit within" (shorter dimension may not reach the target)? Plan says "fit within" (no padding). If padding is ever wanted, that's a new mode.
+</div>
+<div class="oq-item">
+  <div class="oq-label">Deferred to implementation</div>
+  <strong>Confirm close during processing</strong> — if user presses Escape or clicks backdrop during Step 4, add a "Processing is running. Close anyway and continue in background?" confirmation. Implement with a simple <code>window.confirm</code> in the modal's <code>onClose</code> guard.
+</div>
+<div class="oq-item">
+  <div class="oq-label">Deferred to implementation</div>
+  <strong>LLM response normalization</strong> — some models return <em>"The subject is in the top-left"</em> instead of just <em>"top-left"</em>. Add a simple regex search for the 9 valid anchor strings before declaring a fallback. If found anywhere in the response, use it.
+</div>
+
+<hr>
+
+<!-- ─── VERIFICATION CONTRACT ─────────────────────────────── -->
+<h2 id="verif">Verification Contract</h2>
+<div class="verif-grid">
+  <div class="verif-card">
+    <strong>Scan round-trip</strong>
+    Call <code>POST .../scan-buckets</code> against a known test dataset (10 images, 5 landscape 1920×1080 + 5 portrait 720×1280). Confirm response has exactly 2 buckets matching the expected ai-toolkit bucket sizes at resolution=1024, and that all 10 paths appear in <code>images</code>.
+  </div>
+  <div class="verif-card">
+    <strong>Bucket algorithm matches trainer</strong>
+    Run a training job on the same dataset and record the bucket sizes from the trainer log. Compare to what the scan API returns. They must match exactly.
+  </div>
+  <div class="verif-card">
+    <strong>Focal point SSE streaming</strong>
+    Open the browser network panel while running Step 2 on a 5-image dataset. Confirm 5 <code>data:</code> SSE events arrive sequentially, each with a valid anchor value. Confirm the final <code>done</code> event arrives.
+  </div>
+  <div class="verif-card">
+    <strong>Crop correctness — anchor=top-left</strong>
+    Process a 1920×1080 image targeting 1024×576 (16:9) with anchor=top-left. The output image should be 1024×576 pixels. The left column of pixels in the output should equal the left column of pixels in the source (after scaling). Verify with PIL in a quick test script.
+  </div>
+  <div class="verif-card">
+    <strong>Crop correctness — anchor=bottom-right</strong>
+    Same image, anchor=bottom-right. Right and bottom edges of output should match the source (after scaling). The left portion should be discarded.
+  </div>
+  <div class="verif-card">
+    <strong>Crop overlay accuracy</strong>
+    In the review grid, change the anchor from center to top-left for a 16:9 image targeting 1:1 crop. The overlay should darken the right side of the thumbnail. Change to bottom-right — overlay should darken the left side. Confirm visually.
+  </div>
+  <div class="verif-card">
+    <strong>Caption sidecar copy</strong>
+    Process a dataset where 5 images have <code>.txt</code> captions. In the output folder, confirm all 5 <code>.txt</code> files are present alongside the processed images.
+  </div>
+  <div class="verif-card">
+    <strong>Non-destructive output</strong>
+    After processing, open the source dataset folder. All original images and captions must be unchanged (no modification date change, no deletion).
+  </div>
+  <div class="verif-card">
+    <strong>Output folder naming</strong>
+    Run processing twice with the same target resolution. Second run must create <code>{name}_bucket_{W}x{H}_2</code> without error.
+  </div>
+  <div class="verif-card">
+    <strong>LLM fallback</strong>
+    Configure an invalid API base URL. Open the modal and proceed to Step 2. All images should receive <code>center</code> fallback immediately; the modal should auto-advance to Step 3 with a "No vision model configured" banner.
+  </div>
+</div>
+
+<hr>
+
+<!-- ─── DEFINITION OF DONE ────────────────────────────────── -->
+<h2 id="dod">Definition of Done</h2>
+<ul class="dod-list">
+  <li>Bucket scan script produces correct bucket assignments matching ai-toolkit's <code>get_bucket_for_image_size</code> for all tested images</li>
+  <li>Scan API route returns 200 with bucket distribution for a valid dataset; 404 for non-existent dataset</li>
+  <li>Focal point route streams SSE events with valid anchor strings; falls back to center on LLM error or missing config</li>
+  <li>Processing script correctly crops wide images to target width using anchor offset (verified for all 4 corner anchors and center)</li>
+  <li>Processing script correctly copies caption sidecar files alongside output images</li>
+  <li>Processing script emits valid NDJSON progress + done events readable by the route</li>
+  <li>BucketToolsModal renders without errors; all 5 steps reachable via normal user flow</li>
+  <li>Resize-only mode skips Steps 2 and 3, proceeds directly to processing</li>
+  <li>Crop overlay changes correctly when the user changes the anchor picker (correct side darkened)</li>
+  <li>Output folder is sibling to dataset with <code>_bucket_{W}x{H}</code> suffix; second run appends <code>_2</code></li>
+  <li>Original dataset images are unmodified after processing</li>
+  <li>Bucket Tools button appears in dataset page TopBar without layout regression</li>
+  <li><code>npx tsc --noEmit</code> passes with zero errors</li>
+</ul>
+
+<p style="margin-top: 2.5rem; color: var(--muted); font-size: .8rem;">
+  artifact_contract: ce-unified-plan/v1 · artifact_readiness: implementation-ready · execution: code · product_contract_source: ce-plan-bootstrap · Created: 2026-07-11
+</p>
+
+</body>
+</html>

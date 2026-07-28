@@ -1,8 +1,9 @@
 import Link from 'next/link';
-import { Eye, Trash2, Pen, Play, Pause, Cog, X, Copy, Save, OctagonX, Image, Camera, ArrowLeft } from 'lucide-react';
+import { Eye, Trash2, Pen, Play, Pause, Cog, X, Copy, Save, OctagonX, Camera, ArrowLeft, History, Image } from 'lucide-react';
 import { Button } from '@headlessui/react';
 import { openConfirm } from '@/components/ConfirmModal';
 import { openSaveSnapshotModal } from '@/components/SaveSnapshotModal';
+import { openResumeFromCheckpointModal } from '@/components/ResumeFromCheckpointModal';
 import { openStopJobModal } from '@/components/StopJobModal';
 import { Job } from '@prisma/client';
 import {
@@ -14,6 +15,7 @@ import {
   saveJob,
   sampleJob,
   stopSampleJob,
+  sampleJobNow,
 } from '@/utils/jobs';
 import { startQueue } from '@/utils/queue';
 import { Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
@@ -252,6 +254,17 @@ export default function JobActionBar({
               >
                 <Image className="w-4 h-4" />
                 Sample Next Step
+              </div>
+            </MenuItem>
+          )}
+          {job.job_type === 'train' && (canStart || job.status === 'queued') && (
+            <MenuItem>
+              <div
+                className="cursor-pointer px-4 py-1 hover:bg-gray-800 rounded flex items-center gap-2"
+                onClick={() => openResumeFromCheckpointModal({ job, onRefresh })}
+              >
+                <History className="w-4 h-4" />
+                Resume From Checkpoint…
               </div>
             </MenuItem>
           )}

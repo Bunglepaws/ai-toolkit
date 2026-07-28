@@ -45,7 +45,7 @@ model Job {
   stop_sample     Boolean  @default(false) // if true, abort active sample generation and resume training
   alerts          String   @default("[]") // JSON array of alert objects {timestamp, step, type, message, data}
   dataset_stats   String   @default("{}") // JSON object {total_images, buckets: {WxH: count}}
-  sample_now      Boolean  @default(false) // if true, the job will be sampled on the next step
+  sample_now      Boolean  @default(false) // if true, the job will be sampled on the next step (lightweight, no save/config reload)
 
   @@index([status])
   @@index([gpu_ids])

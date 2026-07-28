@@ -2,7 +2,6 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { Dialog, DialogBackdrop, DialogPanel, DialogTitle } from '@headlessui/react';
-import { apiClient } from '@/utils/api';
 import { JobConfig } from '@/types';
 import { setNestedValue } from '@/utils/hooks';
 
@@ -58,6 +57,7 @@ export default function CheckConfigModal({ isOpen, onClose, jobId, jobConfig, on
   const [speculativeOk, setSpeculativeOk] = useState(false);
   const [applied, setApplied] = useState<Set<string>>(new Set());
   const [applyingField, setApplyingField] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string>('');
 
   // Auto-fire analysis when modal opens with autoRun=true (e.g. triggered by OOM)
   useEffect(() => {
@@ -82,24 +82,66 @@ export default function CheckConfigModal({ isOpen, onClose, jobId, jobConfig, on
     }, 200);
   };
 
-  const runAnalysis = () => {
+  const runAnalysis = async () => {
     if (!jobId) return;
     setPhase('loading');
     setFindings([]);
     setError(null);
     setSpeculativeOk(false);
     setApplied(new Set());
+    setStatusMessage('Starting…');
 
-    apiClient
-      .post('/api/jobs/check-config', { jobId, includeImages })
-      .then(res => {
-        setFindings(res.data.findings ?? []);
-        setPhase('results');
-      })
-      .catch(err => {
-        setError(err.response?.data?.error || 'Failed to reach Check Config API');
-        setPhase('results');
+    try {
+      const res = await fetch('/api/jobs/check-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId, includeImages }),
       });
+
+      if (!res.ok || !res.body) {
+        const text = await res.text().catch(() => '');
+        let msg = 'Failed to reach Check Config API';
+        try { msg = JSON.parse(text)?.error ?? msg; } catch { /* ignore */ }
+        setError(msg);
+        setPhase('results');
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE lines are separated by \n\n; each starts with "data: "
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() ?? '';
+
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith('data:')) continue;
+          const json = line.slice('data:'.length).trim();
+          let evt: any;
+          try { evt = JSON.parse(json); } catch { continue; }
+
+          if (evt.type === 'progress') {
+            setStatusMessage(evt.message ?? '');
+          } else if (evt.type === 'done') {
+            setFindings(evt.findings ?? []);
+            setPhase('results');
+          } else if (evt.type === 'error') {
+            setError(evt.message ?? 'Check Config failed');
+            setPhase('results');
+          }
+        }
+      }
+    } catch (err: any) {
+      setError(err?.message || 'Failed to reach Check Config API');
+      setPhase('results');
+    }
   };
 
   const handleApply = async (finding: CheckFinding) => {
@@ -239,7 +281,7 @@ export default function CheckConfigModal({ isOpen, onClose, jobId, jobConfig, on
             {phase === 'loading' && (
               <div className="flex flex-col items-center justify-center h-40 gap-3 text-gray-400">
                 <div className="w-8 h-8 border-2 border-purple-500 border-t-transparent rounded-full animate-spin" />
-                <p className="text-sm">{includeImages ? 'Collecting images and analysing…' : 'Analysing config…'}</p>
+                <p className="text-sm">{statusMessage || 'Starting…'}</p>
               </div>
             )}
 

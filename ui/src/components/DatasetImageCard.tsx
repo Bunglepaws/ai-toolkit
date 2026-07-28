@@ -1,5 +1,5 @@
 import React, { useEffect, useState, ReactNode, KeyboardEvent, useRef } from 'react';
-import { FaTrashAlt } from 'react-icons/fa';
+import { FaTrashAlt, FaExpandAlt } from 'react-icons/fa';
 import { openConfirm } from './ConfirmModal';
 import classNames from 'classnames';
 import { apiClient } from '@/utils/api';
@@ -320,6 +320,18 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
           )}
           {children && <div className="absolute inset-0 flex items-center justify-center">{children}</div>}
           <div className="absolute top-1 right-1 flex space-x-2 z-10">
+            {isItAudio && onImageClick && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                title="Open song editor"
+                onClick={e => {
+                  e.stopPropagation();
+                  onImageClick();
+                }}
+              >
+                <FaExpandAlt />
+              </button>
+            )}
             <button
               className="bg-gray-800 rounded-full p-2"
               onClick={() => {
@@ -361,30 +373,46 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
         })}
       >
         {effectivelyLoaded ? (
-          <form
-            onSubmit={e => {
-              e.preventDefault();
-              saveCaption();
-            }}
-            onBlur={e => {
-              saveCaption(e.currentTarget.querySelector('textarea')?.value);
-              setIsEditing(false);
-            }}
-          >
-            <textarea
-              ref={textAreaRef}
-              className={classNames('w-full bg-transparent resize-none outline-none focus:ring-0 focus:outline-none', {
-                'opacity-50 cursor-not-allowed': isAutoCaptioning,
-              })}
-              style={effectivelyEditing ? ({ fieldSizing: 'content', minHeight: '75px' } as any) : {}}
-              value={caption}
-              rows={effectivelyEditing ? undefined : 3}
-              readOnly={isAutoCaptioning}
-              onChange={e => handleCaptionChange(e.target.value)}
-              onKeyDown={handleKeyDown}
-              onFocus={() => setIsEditing(true)}
-            />
-          </form>
+          isItAudio && onImageClick ? (
+            // Songs embed long lyrics/tag captions that don't fit this card well and
+            // caused the in-card textarea to collapse or fail to open reliably. Send
+            // editing to the full dialog instead, which has room for it.
+            <div
+              className="w-full h-full cursor-text whitespace-pre-wrap opacity-90"
+              onClick={onImageClick}
+              title="Click to edit caption"
+            >
+              {caption || <span className="text-gray-500">Click to add a caption...</span>}
+            </div>
+          ) : (
+            <form
+              onSubmit={e => {
+                e.preventDefault();
+                saveCaption();
+              }}
+              onBlur={e => {
+                saveCaption(e.currentTarget.querySelector('textarea')?.value);
+                setIsEditing(false);
+              }}
+            >
+              <textarea
+                ref={textAreaRef}
+                className={classNames(
+                  'w-full bg-transparent resize-none outline-none focus:ring-0 focus:outline-none',
+                  {
+                    'opacity-50 cursor-not-allowed': isAutoCaptioning,
+                  },
+                )}
+                style={effectivelyEditing ? ({ fieldSizing: 'content', minHeight: '75px' } as any) : {}}
+                value={caption}
+                rows={effectivelyEditing ? undefined : 3}
+                readOnly={isAutoCaptioning}
+                onChange={e => handleCaptionChange(e.target.value)}
+                onKeyDown={handleKeyDown}
+                onFocus={() => setIsEditing(true)}
+              />
+            </form>
+          )
         ) : (
           <div className="w-full h-full flex items-center justify-center text-gray-400">Loading caption...</div>
         )}

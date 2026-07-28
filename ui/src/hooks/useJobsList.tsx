@@ -1,9 +1,13 @@
 'use client';
 
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Job } from '@prisma/client';
 import { apiClient } from '@/utils/api';
-import usePollLoop from '@/hooks/usePollLoop';
+
+// how soon the next poll fires after a manual refresh (e.g. after reordering
+// the queue), so position/status changes show up quickly instead of waiting
+// out the full reloadInterval
+const FAST_FOLLOWUP_INTERVAL = 1000;
 
 type UseJobsListProps = {
   onlyActive?: boolean;
@@ -19,9 +23,10 @@ export default function useJobsList({
   const [jobs, setJobs] = useState<Job[]>([]);
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const isFetchingRef = useRef(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const refreshJobs = () => {
-    if (isFetchingRef.current) return;
+  const fetchJobs = () => {
+    if (isFetchingRef.current) return Promise.resolve();
     isFetchingRef.current = true;
     setStatus('loading');
     const params: Record<string, string> = {};
@@ -53,17 +58,31 @@ export default function useJobsList({
       });
   };
 
-  useEffect(() => {
-    refreshJobs();
+  // schedules the next poll only after the current one settles, so a slow
+  // server can't stack overlapping requests the way setInterval does
+  const scheduleNext = (delay: number) => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    if (!reloadInterval) return;
+    timerRef.current = setTimeout(async () => {
+      await fetchJobs();
+      scheduleNext(reloadInterval);
+    }, delay);
+  };
 
-    if (reloadInterval) {
-      const interval = setInterval(() => {
-        refreshJobs();
-      }, reloadInterval);
-      return () => clearInterval(interval);
-    }
+  useEffect(() => {
+    fetchJobs();
+    scheduleNext(reloadInterval || 0);
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // manual refresh (e.g. after reordering the queue) also fast-tracks the next poll
+  const refreshJobs = () => {
+    fetchJobs();
+    scheduleNext(FAST_FOLLOWUP_INTERVAL);
+  };
 
   return { jobs, setJobs, status, refreshJobs };
 }

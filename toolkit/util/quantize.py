@@ -12,9 +12,11 @@ from optimum.quanto.tensor import Optimizer, qtype, qtypes
 from torchao.quantization.quant_api import (
     quantize_ as torchao_quantize_,
     Float8WeightOnlyConfig,
-    UIntXWeightOnlyConfig,
+    IntxWeightOnlyConfig,
     Int8WeightOnlyConfig
 )
+from torchao.quantization.granularity import PerAxis
+from torchao.quantization.quant_primitives import MappingType
 from optimum.quanto import freeze
 from tqdm import tqdm
 from safetensors.torch import load_file, save_file
@@ -97,13 +99,15 @@ def filter_lora_state_dict_for_quantized_model(
 
 torchao_qtypes = {
     # "int4": Int4WeightOnlyConfig(),
-    "uint2": UIntXWeightOnlyConfig(torch.uint2),
-    "uint3": UIntXWeightOnlyConfig(torch.uint3),
-    "uint4": UIntXWeightOnlyConfig(torch.uint4),
-    "uint5": UIntXWeightOnlyConfig(torch.uint5),
-    "uint6": UIntXWeightOnlyConfig(torch.uint6),
-    "uint7": UIntXWeightOnlyConfig(torch.uint7),
-    "uint8": UIntXWeightOnlyConfig(torch.uint8),
+    # UIntXWeightOnlyConfig was removed in torchao 0.17; IntxWeightOnlyConfig with
+    # asymmetric mapping is the replacement (torchao has no unsigned intx dtypes).
+    "uint2": IntxWeightOnlyConfig(torch.int2, granularity=PerAxis(0), mapping_type=MappingType.ASYMMETRIC),
+    "uint3": IntxWeightOnlyConfig(torch.int3, granularity=PerAxis(0), mapping_type=MappingType.ASYMMETRIC),
+    "uint4": IntxWeightOnlyConfig(torch.int4, granularity=PerAxis(0), mapping_type=MappingType.ASYMMETRIC),
+    "uint5": IntxWeightOnlyConfig(torch.int5, granularity=PerAxis(0), mapping_type=MappingType.ASYMMETRIC),
+    "uint6": IntxWeightOnlyConfig(torch.int6, granularity=PerAxis(0), mapping_type=MappingType.ASYMMETRIC),
+    "uint7": IntxWeightOnlyConfig(torch.int7, granularity=PerAxis(0), mapping_type=MappingType.ASYMMETRIC),
+    "uint8": IntxWeightOnlyConfig(torch.int8, granularity=PerAxis(0), mapping_type=MappingType.ASYMMETRIC),
     "int8": Int8WeightOnlyConfig(),
     "float8": Float8WeightOnlyConfig(),
 }
@@ -336,12 +340,14 @@ def _load_from_quant_cache(
 
     # Rebuild QLinear module structure from the qmap.
     #
-    # The naive approach calls _quantize_submodule per module, which quantizes
-    # the existing full-size weight — that's as slow as re-quantizing from scratch.
-    # Instead, replace each weight with a 1×1 dummy before the call so the
-    # quantization math is instant.  quanto's _load_from_state_dict then
-    # reconstructs the full QBytesTensor from _data/_scale in the cache,
-    # completely replacing the dummy regardless of its shape.
+    # The naive approach calls _quantize_submodule per module, which builds the
+    # replacement QLinear via nn.Linear.__init__ — that allocates a real,
+    # full-size weight tensor and runs kaiming_uniform_ init over it, even
+    # though the values are immediately discarded once the cached weights are
+    # loaded below. That RNG fill (not the tensor copy) is what made this loop
+    # slow. Building the placeholder on the 'meta' device skips both the
+    # allocation and the init entirely (meta ops only track shape/dtype), so
+    # qcreate() completes in effectively zero time regardless of layer size.
     quantized_items = [
         (name, m) for name, m in model_to_quantize.named_modules()
         if name in qmap
@@ -356,14 +362,12 @@ def _load_from_quant_cache(
         weights_qt = get_qtype(w) if w != "none" else None
         activations_qt = get_qtype(a) if a != "none" else None
         if weights_qt is not None and not isinstance(weights_qt, aotype):
-            # Temporarily swap in a 1×1 dummy weight so _quantize_submodule
-            # runs the quantization math on a single element (instant) instead
-            # of the full multi-MB weight tensor.  in_features/out_features are
-            # read from module attributes, not weight shape, so QLinear metadata
-            # stays correct.  The real weights come from load_state_dict below.
+            # in_features/out_features are read from module attributes, not
+            # weight shape, so QLinear metadata stays correct with a meta
+            # placeholder. The real weights are assigned from the cache below.
             if hasattr(m, 'weight') and m.weight is not None:
                 m.weight = torch.nn.Parameter(
-                    torch.zeros(1, 1, dtype=m.weight.dtype, device='cpu'),
+                    torch.zeros(1, 1, dtype=m.weight.dtype, device='meta'),
                     requires_grad=False,
                 )
             _quantize_submodule(model_to_quantize, name, m, weights=weights_qt, activations=activations_qt)
@@ -379,7 +383,18 @@ def _load_from_quant_cache(
     print_acc(f" - cache file read: {time.time() - t_load:.1f}s")
     t_apply = time.time()
     print_acc(" - applying weights to model...")
-    model_to_quantize.load_state_dict(state_dict, strict=False)
+    # Quantized modules were rebuilt on the meta device above, so their params
+    # have no real storage yet and MUST be loaded with assign=True (which
+    # replaces the Parameter outright instead of copy_-ing into it — copy_
+    # into a meta tensor silently discards the data). This has to be a single
+    # call over the FULL state dict: nn.Module.load_state_dict() walks every
+    # submodule of the target regardless of which keys are in the dict passed
+    # in, so a second call for "everything else" would revisit the
+    # already-loaded QModuleMixin instances too — their _load_from_state_dict
+    # unconditionally does state_dict.pop(prefix + "_data"/"_scale") with no
+    # existence check, which KeyErrors since those keys were only ever in the
+    # first dict. A single assign=True pass avoids that entirely.
+    model_to_quantize.load_state_dict(state_dict, strict=False, assign=True)
     print_acc(f" - weights applied: {time.time() - t_apply:.1f}s")
     freeze(model_to_quantize)
 

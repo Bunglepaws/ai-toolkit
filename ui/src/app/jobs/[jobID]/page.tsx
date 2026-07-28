@@ -1,15 +1,14 @@
 'use client';
 
 import { useState, useEffect, useRef, use } from 'react';
-import { useState, use } from 'react';
 import { FaChevronLeft } from 'react-icons/fa';
 import { MdDashboard, MdImage, MdShowChart, MdCode, MdExtension } from 'react-icons/md';
 import { Button } from '@headlessui/react';
 import { TopBar, MainContent } from '@/components/layout';
 import useJob from '@/hooks/useJob';
-import usePollLoop from '@/hooks/usePollLoop';
 import useJobsList from '@/hooks/useJobsList';
 import useSampleImages from '@/hooks/useSampleImages';
+import usePollLoop from '@/hooks/usePollLoop';
 import SampleImages, { SampleImagesMenu } from '@/components/SampleImages';
 import JobOverview from '@/components/JobOverview';
 import { redirect } from 'next/navigation';

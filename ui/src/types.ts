@@ -166,6 +166,7 @@ export interface TrainConfig {
   audio_loss_multiplier?: number;
   max_loss?: number | null;
   validation_config?: ValidationConfig;
+  combine_datasets?: boolean;
 }
 
 export interface QuantizeKwargsConfig {

@@ -67,6 +67,7 @@ export interface ModelArch {
   additionalSections?: AdditionalSections[];
   accuracyRecoveryAdapters?: { [key: string]: string };
   sampleTags?: SampleTags;
+  gateUrl?: string;
 }
 
 const defaultNameOrPath = '';
@@ -108,6 +109,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].train.noise_scheduler': ['flowmatch', 'flowmatch'],
     },
     disableSections: ['network.conv'],
+    gateUrl: 'https://huggingface.co/black-forest-labs/FLUX.1-dev',
   },
   {
     name: 'flux_kontext',
@@ -124,6 +126,7 @@ export const modelArchs: ModelArch[] = [
     },
     disableSections: ['network.conv'],
     additionalSections: ['datasets.control_path', 'sample.ctrl_img'],
+    gateUrl: 'https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev',
   },
   {
     name: 'flex1',
@@ -633,6 +636,7 @@ export const modelArchs: ModelArch[] = [
       'model.layer_offloading',
       'model.qie.match_target_res',
     ],
+    gateUrl: 'https://huggingface.co/black-forest-labs/FLUX.2-dev',
   },
   {
     name: 'zimage:turbo',
@@ -839,6 +843,7 @@ export const modelArchs: ModelArch[] = [
       'model.layer_offloading',
       'model.qie.match_target_res',
     ],
+    gateUrl: 'https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B',
   },
   {
     name: 'ace_step_15_xl',
@@ -1051,6 +1056,7 @@ export const modelArchs: ModelArch[] = [
       'model.unconditional_lora_path',
     ],
     hasMultiLinePrompts: true,
+    gateUrl: 'https://huggingface.co/ideogram-ai/ideogram-4-fp8',
   },
   {
     name: 'prx_pixel',
@@ -1077,6 +1083,7 @@ export const modelArchs: ModelArch[] = [
     name: 'krea2',
     label: 'Krea 2 (raw)',
     group: 'image',
+    gateUrl: 'https://huggingface.co/krea/Krea-2-Raw',
     defaults: {
       'config.process[0].model.name_or_path': ['krea/Krea-2-Raw', defaultNameOrPath],
       'config.process[0].model.quantize': [true, false],
@@ -1099,6 +1106,7 @@ export const modelArchs: ModelArch[] = [
     name: 'krea2:turbo',
     label: 'Krea 2 Turbo (w/ Training Adapter)',
     group: 'image',
+    gateUrl: 'https://huggingface.co/krea/Krea-2-Turbo',
     defaults: {
       'config.process[0].model.name_or_path': ['krea/Krea-2-Turbo', defaultNameOrPath],
       'config.process[0].model.quantize': [true, false],
@@ -1127,6 +1135,7 @@ export const modelArchs: ModelArch[] = [
   {
     name: 'krea2:o_edit',
     label: 'Krea 2 (raw) [Edit Training]',
+    gateUrl: 'https://huggingface.co/krea/Krea-2-Raw',
     group: 'experimental',
     defaults: {
       'config.process[0].model.name_or_path': ['krea/Krea-2-Raw', defaultNameOrPath],
@@ -1161,6 +1170,7 @@ export const modelArchs: ModelArch[] = [
   {
     name: 'krea2:o_edit_turbo',
     label: 'Krea 2 Turbo (w/ Training Adapter) [Edit Training]',
+    gateUrl: 'https://huggingface.co/krea/Krea-2-Turbo',
     group: 'experimental',
     defaults: {
       'config.process[0].model.name_or_path': ['krea/Krea-2-Turbo', defaultNameOrPath],

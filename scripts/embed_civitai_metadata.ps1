@@ -1,10 +1,12 @@
 # ── SETTINGS ── edit these, then just hit Run in PowerShell ISE ───────────────
 
-$folder            = "D:\Data\iCloudDrive\Comfy\260710"
+#$folder            = "D:\Data\iCloudDrive\Comfy\260712"
 #$folder            = "D:\Data\iCloudDrive\Comfy\camera_lab"
+$folder            = 'D:\Data\iCloudDrive\Comfy\A&F\LTX-2.3'
+
 $overwriteMetadata = $false    # re-embed even if a parameters chunk already exists
 $includeVideos     = $true    # also process .mp4 files (ffmpeg/ffprobe required)
-$recursive         = $false    # also process files in subfolders
+$recursive         = $true # also process files in subfolders
 
 # embed_civitai_metadata.ps1
 #
@@ -76,6 +78,11 @@ if ($wslFolder -match '^([A-Za-z]):(.*)') {
     $rest  = $Matches[2]
     $wslFolder = "/mnt/$drive$rest"
 }
+
+# wsl.exe joins all trailing args into one string and runs it via `bash -c`,
+# so shell metacharacters in the path (e.g. "&") must be single-quoted here
+# or they get interpreted as shell syntax instead of passed through literally.
+$wslFolderQuoted = "'" + ($wslFolder -replace "'", "'\''") + "'"
 
 # ── PYTHON SCRIPT (piped to python via stdin) ─────────────────────────────────
 
@@ -743,4 +750,4 @@ Write-Host ""
 # Pipe the Python script directly to Python's stdin ("-" = read from stdin).
 # This avoids writing a temp file via the UNC share, which fails when WSL
 # hasn't been started yet (\\wsl.localhost isn't mounted until first wsl call).
-$pythonScript | wsl -d $wslDistro -- $pythonExe - $wslFolder $wslOverwrite $wslVideos $wslRecursive
+$pythonScript | wsl -d $wslDistro -- $pythonExe - $wslFolderQuoted $wslOverwrite $wslVideos $wslRecursive

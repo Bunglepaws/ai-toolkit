@@ -120,7 +120,7 @@ const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
       CUDA_DEVICE_ORDER: 'PCI_BUS_ID',
       CUDA_VISIBLE_DEVICES: `${job.gpu_ids}`,
       IS_AI_TOOLKIT_UI: '1',
-      PYTHONUNBUFFERED: '1', // write Python output immediately so it is not lost on a crash
+      PYTHONUNBUFFERED: '1', // write Python output immediately so log tail isn't lost on a crash
     };
 
     if (sampleOnly) {
@@ -150,10 +150,7 @@ const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
     // Add the --log argument to the command
     const args = [runFilePath, configPath, '--log', logPath];
 
-    let logFd: number | null = null;
     try {
-      // Capture errors that occur before run.py can initialize file logging.
-      logFd = fs.openSync(logPath, 'a');
       let subprocess;
 
       if (isWindows) {
@@ -166,13 +163,13 @@ const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
           cwd: TOOLKIT_ROOT,
           detached: true,
           windowsHide: true,
-          stdio: ['ignore', logFd, logFd], // don't tie stdio to parent; log fd passed as stdout and stderr
+          stdio: 'ignore', // don't tie stdio to parent; run_ui.py writes its own --log file
         });
       } else {
         // For non-Windows platforms, fully detach and ignore stdio so it survives daemon-like
         subprocess = spawn(pythonPath, args, {
           detached: true,
-          stdio: ['ignore', logFd, logFd], // don't tie stdio to parent; log fd passed as stdout and stderr
+          stdio: 'ignore', // don't tie stdio to parent; run_ui.py writes its own --log file
           env: {
             ...process.env,
             ...additionalEnv,
@@ -247,10 +244,6 @@ const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
         },
       });
       return;
-    } finally {
-      if (logFd !== null) {
-        fs.closeSync(logFd);
-      }
     }
     // Resolve the promise immediately after starting the process
     resolve();

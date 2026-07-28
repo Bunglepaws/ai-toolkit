@@ -52,8 +52,9 @@ class DiffusionTrainer(SDTrainer):
         self._loss_history: deque = deque(maxlen=50)
         self._last_step_loss: float = 0.0
         self._last_spike_step: int = -1
+        self._spike_streak: int = 0
         self._baseline_sample_avg_bytes: float | None = None
-    
+
     def start_stop_watcher(self, interval_sec: float = 5.0):
         """
         Start a daemon thread that periodically checks should_stop()
@@ -245,18 +246,6 @@ class DiffusionTrainer(SDTrainer):
             if self.progress_bar is not None:
                 self.progress_bar.unpause()
 
-    def should_sample(self):
-        if not self.is_ui_trainer:
-            return False
-        def _check_sample():
-            with self._db_connect() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT sample_now FROM Job WHERE id = ?", (self.job_id,))
-                sample_now = cursor.fetchone()
-                return False if sample_now is None else sample_now[0] == 1
-
-        return self._retry_db_operation(_check_sample)
 
     def reload_sample_config(self):
         """Re-read sample config from the DB in case prompts were edited while running."""
@@ -279,23 +268,52 @@ class DiffusionTrainer(SDTrainer):
                             self.cache_sample_prompts()
         except Exception as e:
             print(f"Warning: Could not reload sample config from DB: {e}")
+    def should_sample(self):
+        if not self.is_ui_trainer:
+            return False
+        def _check_sample():
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT sample FROM Job WHERE id = ?", (self.job_id,))
+                sample = cursor.fetchone()
+                return False if sample is None else sample[0] == 1
+        return self._retry_db_operation(_check_sample)
 
+    def should_sample_now(self):
+        """Check the lightweight sample_now flag (no config reload or save)."""
+        if not self.is_ui_trainer:
+            return False
+        def _check_sample_now():
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT sample_now FROM Job WHERE id = ?", (self.job_id,))
+                sample_now = cursor.fetchone()
+                return False if sample_now is None else sample_now[0] == 1
+
+        return self._retry_db_operation(_check_sample_now)
     def maybe_sample(self):
         if not self.is_ui_trainer:
             return
         if self.should_sample():
-            # From HEAD
+            self.reload_sample_config()
+            self.reset_sample()
+            # save model and optimizer first as requested
+            self.save(self.step_num)
+            # then sample
+            self.sample(self.step_num)
+
+    def maybe_sample_now(self):
+        """Lightweight on-demand sample triggered by the 'Sample Next Step' gear menu item.
+        Unlike maybe_sample(), does not reload config or save first."""
+        if not self.is_ui_trainer:
+            return
+        if self.should_sample_now():
             self.update_db_key("sample_now", 0)
             if self.progress_bar is not None:
                 self.progress_bar.pause()
             print_acc(f"\nSampling at step {self.step_num}")
-
-            # From incoming branch (setup before actual sampling logic)
-            self.reload_sample_config()
-            self.reset_sample()
-            self.save(self.step_num) # This saves the model *before* sampling
-
-            # From HEAD (sampling specific setup)
             # clear any grads
             self.optimizer.zero_grad()
             if self.train_config.free_u:
@@ -306,7 +324,6 @@ class DiffusionTrainer(SDTrainer):
 
             # From HEAD (sampling specific teardown)
             if self.train_config.unload_text_encoder:
-                # make sure the text encoder is unloaded
                 self.sd.text_encoder_to('cpu')
             self.ensure_params_requires_grad()
             flush()
@@ -522,28 +539,19 @@ class DiffusionTrainer(SDTrainer):
         super(DiffusionTrainer, self).on_error(e)
         if self.is_ui_trainer:
             try:
-                is_intentional = self.is_stopping or isinstance(e, (KeyboardInterrupt, JobStoppedException)) or "Job stopped" in str(e)
-                if self.accelerator.is_main_process and not is_intentional:
-                    if self._is_oom_error(e):
-                        import torch as _torch
-                        vram_info = ""
-                        try:
-                            alloc = _torch.cuda.memory_allocated() / 1024**3
-                            reserved = _torch.cuda.memory_reserved() / 1024**3
-                            total = _torch.cuda.get_device_properties(0).total_memory / 1024**3
-                            vram_info = f" (VRAM: {alloc:.1f}GB alloc / {reserved:.1f}GB reserved / {total:.1f}GB total)"
-                        except Exception:
-                            pass
-                        self.append_alert("oom", f"Out of memory at step {self.step_num}{vram_info}", {
-                            "step": self.step_num,
-                            "error": str(e)[:300],
-                        })
+                if self.accelerator.is_main_process and not self.is_stopping:
                     self.update_status("error", str(e))
                     self.update_db_key("step", self.last_save_step)
                 else:
                     # If it's a KeyboardInterrupt, mark as stopped instead of error
                     if not self.is_stopping and (isinstance(e, KeyboardInterrupt) or "Job stopped" in str(e)):
                         self.update_status("stopped", "Job stopped by user")
+                    if isinstance(e, KeyboardInterrupt):
+                        # silence the bar so tqdm doesn't repaint it at interpreter exit
+                        progress_bar = getattr(self, "progress_bar", None)
+                        if progress_bar is not None:
+                            progress_bar.disable = True
+                            progress_bar.close()
                     # On intentional stop/pause (including SIGINT), preserve the current step count
                     self.update_db_key("step", self.step_num)
                 asyncio.run(self.wait_for_all_async())
@@ -579,7 +587,13 @@ class DiffusionTrainer(SDTrainer):
             self.thread_pool.shutdown(wait=True)
 
     def _check_loss_spike(self):
-        """Update rolling loss history and fire an alert if a spike is detected."""
+        """Update rolling loss history and fire an alert if a sustained spike is detected.
+
+        A single high-loss step is normal per-sample variance (small dataset, diverse
+        bucket sizes, weighted timestep sampling).  We only alert when the elevated loss
+        persists for 3+ consecutive steps, which indicates a genuine training instability
+        rather than one hard image.
+        """
         loss = getattr(self, '_last_step_loss', 0.0)
         # Compute rolling avg from history BEFORE appending so the spike doesn't
         # inflate its own detection threshold.
@@ -590,15 +604,22 @@ class DiffusionTrainer(SDTrainer):
         self._loss_history.append(loss)
         if rolling_avg is None:
             return
-        if (loss > rolling_avg * 3 and loss > 0.4
+        if loss > rolling_avg * 3 and loss > 0.4:
+            self._spike_streak += 1
+        else:
+            self._spike_streak = 0
+        if (self._spike_streak >= 3
                 and self.step_num - self._last_spike_step > 10):
             self._last_spike_step = self.step_num
-            msg = f"Loss spike at step {self.step_num}: {loss:.4f} (rolling avg {rolling_avg:.4f}, {loss/rolling_avg:.1f}×)"
-            print(f"[AITK] ⚠ {msg}")
+            msg = (f"Sustained loss spike at step {self.step_num}: {loss:.4f} "
+                   f"(rolling avg {rolling_avg:.4f}, {loss/rolling_avg:.1f}×, "
+                   f"{self._spike_streak} consecutive steps)")
+            print(f"\n[AITK] ⚠ {msg}")
             self.append_alert("loss_spike", msg, {
                 "current_loss": loss,
                 "rolling_avg": rolling_avg,
                 "ratio": round(loss / rolling_avg, 2),
+                "streak": self._spike_streak,
             })
             self.preserve_safe_snapshot("loss_spike")
 
@@ -613,6 +634,7 @@ class DiffusionTrainer(SDTrainer):
             # cleanly. maybe_sample() is our on-demand sample feature.
             self.maybe_save()
             self.maybe_sample()
+            self.maybe_sample_now()
             self.maybe_stop()
             self.maybe_sample()
 

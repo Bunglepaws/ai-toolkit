@@ -39,6 +39,7 @@ def setup_log_to_file(filename):
             os.makedirs(os.path.dirname(filename))
     # Close previous log file handles before replacing them (persistent process
     # handing off between jobs would otherwise leak one fd per job forever).
+    # Both wrappers share a single handle, so closing stdout's covers stderr too.
     if isinstance(sys.stdout, Logger):
         try:
             sys.stdout.log.close()

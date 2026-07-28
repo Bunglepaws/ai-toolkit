@@ -2431,7 +2431,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         ds.load_image_when_caching_latents = True
         # load datasets if passed in the root process
         if self.datasets is not None and not self.sample_only:
-            self.data_loader = get_dataloader_from_datasets(self.datasets, self.train_config.batch_size, self.sd)
+            self.data_loader = get_dataloader_from_datasets(
+                self.datasets, self.train_config.batch_size, self.sd,
+                combine_datasets=self.train_config.combine_datasets,
+            )
         if self.datasets_reg is not None and not self.sample_only:
             self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, self.train_config.batch_size,
                                                                 self.sd)
@@ -2496,6 +2499,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # ====================================================
                 # BLOCK COMPILE
                 # ====================================================
+                # torchao 0.10.0 + PyTorch 2.9 AOT autograd causes infinite recursion in
+                # _dispatch__torch_function__ when block_compile is used with torchao-quantized
+                # tensors. Disable block_compile for torchao-quantized models as a workaround.
+                if block_compile and is_unet_quantized:
+                    try:
+                        from toolkit.util.quantize import get_torchao_config
+                        if get_torchao_config(getattr(self.model_config, 'qtype', None)) is not None:
+                            print_acc(
+                                "WARNING: block_compile is incompatible with torchao quantization "
+                                "(torchao _dispatch__torch_function__ recursion under PyTorch 2.9). "
+                                "Disabling block_compile for this run. "
+                                "Upgrade torchao to fix this, or use compile=true without block_compile."
+                            )
+                            block_compile = False
+                    except ImportError:
+                        pass
+
                 if block_compile:
                     BLOCK_LIST_ATTRS = self.sd.get_transformer_block_names()
 
@@ -2713,6 +2733,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             import time as _t
             _elapsed = _t.time() - float(_proc_start)
             print_acc(f"Time to first step: {_elapsed:.0f}s ({_elapsed / 60:.1f}min)")
+            if self.accelerator.is_main_process:
+                self.logger.record_startup_time(_elapsed)
 
         start_step_num = self.step_num
         did_first_flush = False

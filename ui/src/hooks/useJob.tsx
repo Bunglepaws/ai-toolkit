@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Job } from '@prisma/client';
 import { apiClient } from '@/utils/api';
-import usePollLoop from '@/hooks/usePollLoop';
 
 // how soon the next poll fires after a manual refresh (e.g. after clicking Stop),
 // so status changes show up quickly instead of waiting out the full reloadInterval
@@ -30,11 +29,13 @@ export default function useJob(jobID: string, reloadInterval: null | number = nu
       });
   };
 
+  // schedules the next poll only after the current one settles, so a slow
+  // server can't stack overlapping requests the way setInterval does
   const scheduleNext = (delay: number) => {
     if (timerRef.current) clearTimeout(timerRef.current);
     if (!reloadInterval) return;
-    timerRef.current = setTimeout(() => {
-      fetchJob();
+    timerRef.current = setTimeout(async () => {
+      await fetchJob();
       scheduleNext(reloadInterval);
     }, delay);
   };

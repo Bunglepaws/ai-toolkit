@@ -111,6 +111,7 @@ class UILogger:
 
         self._first_commit_done = False
         self._current_sample_row_id: Optional[int] = None
+        self._current_session_row_id: Optional[int] = None
 
     # start logging the training
     def start(self):
@@ -214,9 +215,20 @@ class UILogger:
     def record_session_start(self):
         if not self._started or self._con is None:
             return
-        self._con.execute(
+        cur = self._con.execute(
             "INSERT INTO training_sessions(start_time) VALUES(?);",
             (time.time(),),
+        )
+        self._current_session_row_id = cur.lastrowid
+
+    def record_startup_time(self, seconds: float):
+        if not self._started or self._con is None:
+            return
+        if self._current_session_row_id is None:
+            return
+        self._con.execute(
+            "UPDATE training_sessions SET startup_seconds=? WHERE id=?;",
+            (float(seconds), self._current_session_row_id),
         )
 
     def record_sample_start(self):
@@ -278,10 +290,21 @@ class UILogger:
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS training_sessions (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                start_time REAL NOT NULL
+                id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_time                REAL NOT NULL,
+                startup_seconds           REAL,
+                training_seconds_override REAL
             );
         """)
+
+        # older DBs may be missing columns added after initial release
+        existing_cols = {
+            row[1] for row in con.execute("PRAGMA table_info(training_sessions);").fetchall()
+        }
+        if "startup_seconds" not in existing_cols:
+            con.execute("ALTER TABLE training_sessions ADD COLUMN startup_seconds REAL;")
+        if "training_seconds_override" not in existing_cols:
+            con.execute("ALTER TABLE training_sessions ADD COLUMN training_seconds_override REAL;")
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS sampling_periods (

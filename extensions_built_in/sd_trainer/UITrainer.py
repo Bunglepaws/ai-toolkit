@@ -261,20 +261,28 @@ class UITrainer(SDTrainer):
             return
 
         def _do_update():
+            # Re-assert our pid whenever we report running. The UI clears pid as
+            # soon as a stop is requested, but this process can stay alive for
+            # minutes inside an uninterruptible section (model load, quantization,
+            # sampling). Without this the row ends up running-with-no-pid, which
+            # hides us from the queue's liveness check and lets a second job start
+            # on the same GPU.
+            sets = ["status = ?"]
+            values = [status]
+            if info is not None:
+                sets.append("info = ?")
+                values.append(info)
+            if status == "running":
+                sets.append("pid = ?")
+                values.append(os.getpid())
+            values.append(self.job_id)
+            update_query = f"UPDATE Job SET {', '.join(sets)} WHERE id = ?"
+
             with self._db_connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute("BEGIN IMMEDIATE")
                 try:
-                    if info is not None:
-                        cursor.execute(
-                            "UPDATE Job SET status = ?, info = ? WHERE id = ?",
-                            (status, info, self.job_id)
-                        )
-                    else:
-                        cursor.execute(
-                            "UPDATE Job SET status = ? WHERE id = ?",
-                            (status, self.job_id)
-                        )
+                    cursor.execute(update_query, tuple(values))
                 finally:
                     cursor.execute("COMMIT")
 

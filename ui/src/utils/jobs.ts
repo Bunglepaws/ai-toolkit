@@ -230,6 +230,14 @@ export const clearJobAlerts = (jobID: string): Promise<void> => {
   return apiClient.get(`/api/jobs/${jobID}/clear_alerts`).then(() => undefined);
 };
 
+export const listCheckpoints = (jobID: string) => {
+  return apiClient.get(`/api/jobs/${jobID}/checkpoints`);
+};
+
+export const resumeFromCheckpoint = (jobID: string, step: number, deleteSamples = false) => {
+  return apiClient.post(`/api/jobs/${jobID}/resume-from`, { step, deleteSamples });
+};
+
 export const getJobConfig = (job: Job) => {
   return JSON.parse(job.job_config) as JobConfig;
 };

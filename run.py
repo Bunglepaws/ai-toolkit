@@ -144,21 +144,20 @@ def main():
             if not args.recover:
                 print_end_message(jobs_completed, jobs_failed)
                 raise e
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as e:
             print_acc(f"Job stopped by user")
             if is_ui and job_id:
                 update_job_status_to_ui(job_id, 'stopped', "Job stopped by user")
             try:
-                job.process[0].on_error(KeyboardInterrupt())
+                job.process[0].on_error(e)
             except Exception as e2:
                 print_acc(f"Error running on_error: {e2}")
             if not args.recover:
-                print_end_message(jobs_completed, jobs_failed)
-                # Exit cleanly on keyboard interrupt when running from UI
-                if is_ui:
-                    sys.exit(0)
-                else:
-                    raise KeyboardInterrupt
+                print_acc("")
+                print_acc("========================================")
+                print_acc("Job stopped")
+                print_acc("========================================")
+                sys.exit(0)
 
 
 if __name__ == '__main__':

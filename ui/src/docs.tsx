@@ -380,6 +380,36 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'model.cache_quantized_model': {
+    title: 'Cache Quantized Model',
+    description: (
+      <>
+        Skip re-quantization on subsequent runs of the same model by saving the quantized weights to disk after the
+        first run. On later runs, the cached quantized model is loaded directly instead of quantizing from scratch,
+        which can save several minutes of startup time for large models.
+      </>
+    ),
+  },
+  'model.block_compile': {
+    title: 'Block Compile',
+    description: (
+      <>
+        Compile each transformer block separately instead of compiling the whole model as one graph. This is more
+        compatible with quantized and multi-part models (such as models with two transformers), and avoids the very
+        long first-step compile time that whole-model compilation can require. Recommended in most cases.
+      </>
+    ),
+  },
+  'model.compile_fullgraph': {
+    title: 'Full Graph',
+    description: (
+      <>
+        Forces torch.compile to capture the entire model as a single graph with no graph breaks. This is a stricter,
+        potentially faster compile mode, but it may fail with quantized or layer-offloaded models, which often require
+        graph breaks to work correctly.
+      </>
+    ),
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

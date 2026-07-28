@@ -418,6 +418,7 @@ class TrainConfig:
         self.max_denoising_steps: int = kwargs.get('max_denoising_steps', 999)
         self.batch_size: int = kwargs.get('batch_size', 1)
         self.orig_batch_size: int = self.batch_size
+        self.combine_datasets: bool = kwargs.get('combine_datasets', False)
         self.dtype: str = kwargs.get('dtype', 'fp32')
         self.xformers = kwargs.get('xformers', False)
         self.sdp = kwargs.get('sdp', False)

@@ -183,7 +183,9 @@ class BaseCaptioner(BaseExtensionProcess):
                 )
                 has_caption = False
                 if os.path.exists(caption_file_path):
-                    with open(caption_file_path, "r", encoding="utf-8") as f:
+                    with open(
+                        caption_file_path, "r", encoding="utf-8", errors="replace"
+                    ) as f:
                         has_caption = f.read().strip() != ""
                 if not has_caption:
                     filtered_file_paths.append(file_path)

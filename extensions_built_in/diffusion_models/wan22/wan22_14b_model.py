@@ -109,6 +109,33 @@ class DualWanTransformer3DModel(torch.nn.Module):
         self.transformer_1.enable_gradient_checkpointing()
         self.transformer_2.enable_gradient_checkpointing()
 
+    @torch._dynamo.disable
+    def _prepare_transformer(self, hidden_states: torch.Tensor, timestep: torch.LongTensor) -> None:
+        """Select and device-swap the active transformer.
+
+        Decorated with @torch._dynamo.disable because QBytesTensor.detach() (called
+        internally by .to()) raises under TorchDynamo tracing when the model is
+        quantized with optimum-quanto.  The .item() call at the timestep boundary
+        check already causes a graph break; keeping the entire swap logic outside
+        the compiler avoids the subsequent re-trace failure."""
+        with torch.no_grad():
+            t_name = "transformer_1" if timestep.float().mean().item() > self.boundary else "transformer_2"
+
+            if t_name != self._active_transformer_name:
+                if self.low_vram:
+                    getattr(self, self._active_transformer_name).to("cpu")
+                    getattr(self, t_name).to(self.device_torch)
+                    torch.cuda.empty_cache()
+                self._active_transformer_name = t_name
+
+        if self.transformer.device != hidden_states.device:
+            if self.low_vram:
+                other_tname = (
+                    "transformer_1" if self._active_transformer_name == "transformer_2" else "transformer_2"
+                )
+                getattr(self, other_tname).to("cpu")
+            self.transformer.to(hidden_states.device)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -119,33 +146,7 @@ class DualWanTransformer3DModel(torch.nn.Module):
         attention_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
-        # determine if doing high noise or low noise by meaning the timestep.
-        # timesteps are in the range of 0 to 1000, so we can use a threshold
-        with torch.no_grad():
-            if timestep.float().mean().item() > self.boundary:
-                t_name = "transformer_1"
-            else:
-                t_name = "transformer_2"
-
-            # check if we are changing the active transformer, if so, we need to swap the one in
-            # vram if low_vram is enabled
-            # todo swap the loras as well
-            if t_name != self._active_transformer_name:
-                if self.low_vram:
-                    getattr(self, self._active_transformer_name).to("cpu")
-                    getattr(self, t_name).to(self.device_torch)
-                    torch.cuda.empty_cache()
-                self._active_transformer_name = t_name
-
-        if self.transformer.device != hidden_states.device:
-            if self.low_vram:
-                # move other transformer to cpu
-                other_tname = (
-                    "transformer_1" if t_name == "transformer_2" else "transformer_2"
-                )
-                getattr(self, other_tname).to("cpu")
-
-            self.transformer.to(hidden_states.device)
+        self._prepare_transformer(hidden_states, timestep)
 
         return self.transformer(
             hidden_states=hidden_states,
@@ -210,6 +211,26 @@ class Wan2214bModel(Wan21):
         # if we are only training one or the other, the target LoRA modules will be the wan transformer class
         if not self.train_high_noise or not self.train_low_noise:
             self.target_lora_modules = ["WanTransformer3DModel"]
+
+    def get_transformer_block_names(self):
+        # This is called from two different places against two different roots:
+        #  - quantize_model() is called once per bare transformer (transformer_1 /
+        #    transformer_2) during load_model(), before they're combined — the
+        #    right answer there is just "blocks" (relative to that transformer).
+        #  - block_compile targets self.unet, which by the time training starts
+        #    IS the combined DualWanTransformer3DModel wrapper holding
+        #    transformer_1/transformer_2, each with their own .blocks.
+        # self.model is only swapped to the wrapper once both transformers are
+        # loaded and quantized, so checking it here tells us which caller this is.
+        model = getattr(self, 'model', None)
+        if isinstance(model, DualWanTransformer3DModel):
+            block_names = []
+            if self.train_high_noise:
+                block_names.append("transformer_1.blocks")
+            if self.train_low_noise:
+                block_names.append("transformer_2.blocks")
+            return block_names
+        return ["blocks"]
 
     def get_quantization_exclude_modules(self):
         # the timestep/text conditioning embedders and the final projection feed

@@ -24,6 +24,10 @@ This is a personal fork of [ostris/ai-toolkit](https://github.com/ostris/ai-tool
 - **Corrupt/truncated JSON captions** — graceful fallback with warning instead of crashing the job
 - **Optimizer archiving** — option to archive optimizer state on each save
 - **AceStep 1.5 XL audio LM (`audio_lm_path`)** — set `audio_lm_path` in your model config to a Qwen3 ACE15 safetensors file (e.g. `qwen_4b_ace15.safetensors`) to enable proper `lm_hints` context generation at sample time. Without this the DiT uses silence context and output quality is poor. The FSQ quantizer and AudioTokenDetokenizer are extracted automatically from the AIO base model file. Supports the XL AIO format (`ostris/ace_step_1.5_ComfyUI_files`); non-XL AIO untested.
+- **Combine Datasets for Bucketing** — `combine_datasets: true` in `train` config (or checkbox in UI when 2+ datasets) merges all dataset file lists (after `num_repeats` expansion) into one pool and runs bucket assignment once globally, identical to having all images in a single folder; each item retains its own per-dataset settings (caption dropout, trigger words, etc.); requires all datasets to share the same `resolution`, `buckets`, and `square_crop` settings.
+- **Video-only files auto-fixed** — dataset videos with no audio stream at all (common with some video generators) used to crash the whole job on `torchaudio.load()`; a silent stereo AAC track is now muxed in automatically the first time the file is loaded, in place, via ffmpeg
+- **`torch.compile` + CPU/GPU layer-offloading stream fix** — the offloading autograd functions (`_BouncingLinearFn`, `_BouncingConv2dFn`) manage raw CUDA streams/events directly; newer PyTorch Dynamo's stream tracing mis-codegenned `torch.ops.streams.record_event` on them under `compile: true` + `low_vram: true`, crashing with `RuntimeError: expected event to be a torch.Event object`. Their `forward`/`backward` are now marked `@torch._dynamo.disable` so Dynamo treats them as an opaque call instead of tracing into them
+- **`block_compile` + torchao guard** — block-level `torch.compile` is automatically disabled (with a warning) when the model is torchao-quantized, avoiding an infinite-recursion crash in `torchao.utils._dispatch__torch_function__` under PyTorch 2.9+'s AOT autograd path
 
 ### UI — Queue & Job Management
 
@@ -31,6 +35,8 @@ This is a personal fork of [ostris/ai-toolkit](https://github.com/ostris/ai-tool
 - **Queue filter** — filter jobs list by name, model path, or job ref with AND/OR/quoted search
 - **Save and Stop Queue** button in stop modal — saves checkpoint and re-queues the job
 - **Return to Training** button — aborts current sample batch and resumes training
+- **Resume From Checkpoint** — gear-menu action on any job that can be (re)started; lists saved checkpoint/optimizer pairs, rolls back to the selected step by deleting newer safetensors and optimizer archives, restores the matching optimizer state, and prunes `loss_log.db` past that step so the graph is accurate immediately; handles WAN 2.2's `_high_noise`/`_low_noise` split checkpoints
+- **Checkpoint delete cleans up optimizer archive** — deleting a `.safetensors` checkpoint from the Checkpoints panel also removes its matching `optimizer_{step}.pt` archive (previously left 4GB+ orphan files behind)
 
 ### UI — Settings
 
@@ -46,6 +52,11 @@ This is a personal fork of [ostris/ai-toolkit](https://github.com/ostris/ai-tool
 ### UI — Loss Graph
 
 - **Settings persistence** — display settings (smooth/raw/log/clip) saved per job across sessions
+- **Training time grid** — expandable panel below the loss graph shows per-session timing broken into three components: startup (model load), sampling (inference), and pure training time, plus a total column. Subtotals row at top with grand total. Columns: Start, End (time-only when same calendar day), Start Step, Startup, Sampling, Training, Total.
+  - **Startup time persisted** — `startup_seconds` is written to `training_sessions` in `loss_log.db` once the first training step completes; backfilled from `logs/N_log.txt` files for up to 30 days of history via `scripts/backfill_startup_times.py`
+  - **Sampling time from `sampling_periods`** — already tracked; now surfaced per-session instead of just subtracted from training
+  - **Pure training time** — computed as step-span minus sampling time so the three components sum correctly to wall-clock elapsed
+  - **Manual override** — click any Training cell to type a corrected value (`2h 15m`, `135m`, etc.); Enter/blur saves via `PUT /api/jobs/[jobID]/sessions/[sessionId]`; overridden cells shown in blue with `*`; blank input clears the override; stored in `training_seconds_override` column
 
 ### UI — Samples
 
@@ -127,14 +138,18 @@ Real-time anomaly detection that writes to the DB and surfaces in the UI without
 - [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) (Z-Image Turbo)
 - [Tongyi-MAI/Z-Image](https://huggingface.co/Tongyi-MAI/Z-Image) (Z-Image)
 - [ostris/Z-Image-De-Turbo](https://huggingface.co/ostris/Z-Image-De-Turbo) (Z-Image De-Turbo)
+- [zhen-nan/L2P](https://huggingface.co/zhen-nan/L2P) (Z-Image L2P)
 - [stabilityai/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) (SDXL)
 - [stable-diffusion-v1-5/stable-diffusion-v1-5](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5) (SD 1.5)
 - [baidu/ERNIE-Image](https://huggingface.co/baidu/ERNIE-Image) (ERNIE-Image)
 - [NucleusAI/Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image) (Nucleus-Image)
 - [Boogu/Boogu-Image-0.1-Base](https://huggingface.co/Boogu/Boogu-Image-0.1-Base) (Boogu Image 0.1)
 - [HiDream-ai/HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image) (HiDream O1)
+- [ideogram-ai/ideogram-4-fp8](https://huggingface.co/ideogram-ai/ideogram-4-fp8) (Ideogram 4 FP8)
 - [Photoroom/prxpixel-t2i](https://huggingface.co/Photoroom/prxpixel-t2i) (PRXPixel)
 - [circlestone-labs/Anima-Base-v1.0-Diffusers](https://huggingface.co/circlestone-labs/Anima-Base-v1.0-Diffusers) (Anima)
+- [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2)
+- [krea/Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) (Krea 2 Turbo)
 
 ### Instruction / Edit
 - [black-forest-labs/FLUX.1-Kontext-dev](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev) (FLUX.1-Kontext-dev)
@@ -143,6 +158,8 @@ Real-time anomaly detection that writes to the DB and surfaces in the UI without
 - [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) (Qwen-Image-Edit-2511)
 - [HiDream-ai/HiDream-E1-1](https://huggingface.co/HiDream-ai/HiDream-E1-1) (HiDream E1)
 - [Boogu/Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit) (Boogu Image Edit)
+- [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2 Edit Training)
+- [krea/Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) (Krea 2 Turbo Edit Training)
 
 ### Video
 - [Wan-AI/Wan2.1-T2V-1.3B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) (Wan 2.1 1.3B)
@@ -154,7 +171,6 @@ Real-time anomaly detection that writes to the DB and surfaces in the UI without
 - [Wan-AI/Wan2.2-TI2V-5B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) (Wan 2.2 TI2V 5B)
 - [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) (LTX-2)
 - [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) (LTX-2.3)
-- [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2)
 
 ### Audio
 - [ACE-Step/Ace-Step1.5](https://huggingface.co/ACE-Step/Ace-Step1.5) (Ace Step 1.5)
@@ -162,7 +178,6 @@ Real-time anomaly detection that writes to the DB and surfaces in the UI without
 
 ### Experimental
 - [lodestones/Zeta-Chroma](https://huggingface.co/lodestones/Zeta-Chroma) (Zeta Chroma)
-- [ideogram-ai/ideogram-4-fp8](https://huggingface.co/ideogram-ai/ideogram-4-fp8) (Ideogram 4 FP8)
 
 ## Installation
 

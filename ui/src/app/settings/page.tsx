@@ -4,6 +4,43 @@ import { useEffect, useState } from 'react';
 import useSettings from '@/hooks/useSettings';
 import { TopBar, MainContent } from '@/components/layout';
 import { apiClient } from '@/utils/api';
+import { CircleHelp } from 'lucide-react';
+import { openDoc } from '@/components/DocModal';
+
+const aiConfigCheckDoc = {
+  title: 'AI Config Check',
+  description: (
+    <div className="space-y-3 text-sm">
+      <p>
+        The <strong>Check Config ✦</strong> button appears on each training job and sends your job configuration
+        to an LLM for analysis. It assembles multiple data sources before making the call:
+      </p>
+      <ul className="list-disc ml-4 space-y-1">
+        <li><strong>Job configuration</strong> — all training parameters (LR, rank, steps, optimizer, network type, etc.)</li>
+        <li><strong>Dataset stats</strong> — image count and resolution bucket distribution (written to DB after caching). The LLM checks whether your configured training resolution matches your actual image dimensions, flags upscaling risk, uneven bucket distributions, and buckets with too few images to train stably</li>
+        <li><strong>Loss curve</strong> — last 200 loss data points if the job has run before, so the LLM can spot divergence trends</li>
+        <li><strong>System stats</strong> — GPU VRAM total/used/free and system RAM. Used to flag OOM risk based on your configured resolution (higher resolution = exponentially more VRAM), thermal throttling, and whether you have headroom to increase batch size or resolution</li>
+        <li><strong>Sample images</strong> — recent generated sample images (or MP4 frames for video models) so it can assess output quality, white noise, mode collapse, oversaturation, or temporal inconsistency</li>
+        <li><strong>Dataset images</strong> — a sample of your training images so it can check quantity, resolution fit, style consistency, and watermarks</li>
+      </ul>
+      <p>
+        The LLM returns structured findings, each with a <strong>severity</strong> (info / warning / error),
+        a <strong>confidence level</strong> (high = official docs, medium = community sources, low = inferred),
+        and a <strong>references</strong> list showing where the advice comes from. High-confidence findings
+        have an Apply button that patches the config field directly.
+      </p>
+      <p>
+        Works with any OpenAI-compatible endpoint — Anthropic Claude, local Ollama, or any other provider.
+        For visual sample analysis a vision-capable model is required (e.g. Qwen2.5-VL or Qwen3-VL via Ollama).
+        Text-only config analysis works with any model.
+      </p>
+      <p className="text-gray-400">
+        Web search (Ollama only) fetches up-to-date community guidance about your specific model architecture
+        before the LLM call, which helps with newer models the LLM may not have training data on.
+      </p>
+    </div>
+  ),
+};
 
 export default function Settings() {
   const { settings, setSettings } = useSettings();
@@ -156,7 +193,12 @@ export default function Settings() {
           </div>
 
           <div className="border-t border-gray-700 pt-6">
-            <h2 className="text-base font-semibold mb-4">AI Config Check</h2>
+            <h2 className="text-base font-semibold mb-4 flex items-center gap-1">
+              AI Config Check
+              <span className="inline-block ml-1 text-xs text-gray-500 cursor-pointer" onClick={() => openDoc(aiConfigCheckDoc)}>
+                <CircleHelp className="inline-block w-4 h-4 cursor-pointer" />
+              </span>
+            </h2>
             <div className="space-y-4">
               <div>
                 <label htmlFor="CHECK_CONFIG_API_BASE_URL" className="block text-sm font-medium mb-2">
@@ -183,7 +225,8 @@ export default function Settings() {
                 <label htmlFor="CHECK_CONFIG_API_KEY" className="block text-sm font-medium mb-2">
                   API Key
                   <div className="text-gray-500 text-sm ml-1">
-                    Your Anthropic or provider API key. Leave blank for Ollama (no auth required).
+                    Your Anthropic or provider API key. For Ollama, leave blank or enter your Ollama
+                    API key if your server requires one (also used for web search authentication).
                   </div>
                 </label>
                 <input
@@ -231,8 +274,7 @@ export default function Settings() {
                     <div className="text-gray-500 text-sm font-normal mt-1">
                       When using an Ollama endpoint, perform a web search before the LLM call and
                       inject the results as additional context. Requires the Ollama server to have
-                      web search enabled (Bearer token via the API Key field above if required).
-                      Has no effect when using Anthropic or other non-Ollama providers.
+                      web search enabled. Has no effect when using Anthropic or other non-Ollama providers.
                     </div>
                   </span>
                 </label>

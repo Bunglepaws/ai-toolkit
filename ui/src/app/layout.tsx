@@ -16,6 +16,7 @@ import MergeLoRAsModal from '@/components/MergeLoRAsModal';
 import StripAudioModal from '@/components/StripAudioModal';
 import UpsamplePromptsModal from '@/components/UpsamplePromptsModal';
 import PromptBoxEditorModal from '@/components/PromptBoxEditorModal';
+import ResumeFromCheckpointModal from '@/components/ResumeFromCheckpointModal';
 import { Toaster } from 'sonner';
 
 export const dynamic = 'force-dynamic';
@@ -77,6 +78,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <StripAudioModal />
         <UpsamplePromptsModal />
         <PromptBoxEditorModal />
+        <ResumeFromCheckpointModal />
         <Toaster position="bottom-right" richColors closeButton />
       </body>
     </html>
