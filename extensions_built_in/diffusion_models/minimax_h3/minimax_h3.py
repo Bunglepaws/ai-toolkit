@@ -567,13 +567,31 @@ class MinimaxH3Model(BaseModel):
         # was trained with. It is NOT safe to assume alpha == rank here: the
         # fl2v_turbo releases ship alpha 8 against rank 128, so treating them
         # as scale 1.0 would apply the adapter 16x too strongly.
+        #
+        # But a "baked_scale" key means the opposite trap: the ref2va turbo
+        # release is an SVD resize of an original rank-128/alpha-8 LoRA down to
+        # per-module ranks from 2 to 164, with the scale folded directly into
+        # lora_B's values and its own metadata saying so explicitly
+        # ("alpha folded into lora_B; scale N baked as a flat multiplier").
+        # Applying the stale top-level alpha against each module's own (now
+        # unrelated) resized rank would scale different modules by very
+        # different, all-wrong amounts -- ~4x too strong on a rank-2 module,
+        # ~20x too weak on a rank-164 one. baked_scale present means: trust the
+        # weights, not the leftover alpha; fall through to the alpha-less path
+        # below (alpha == rank per module, scale 1.0), which is what a
+        # pre-scaled file needs.
         file_alpha = None
         try:
             from safetensors import safe_open
 
             with safe_open(path, framework="pt") as f:
                 metadata = f.metadata() or {}
-            if metadata.get("alpha") is not None:
+            if metadata.get("baked_scale") is not None:
+                self.print_and_status_update(
+                    " - file scale is pre-baked into the weights "
+                    f"({metadata['baked_scale']}); ignoring the file's alpha metadata"
+                )
+            elif metadata.get("alpha") is not None:
                 file_alpha = float(metadata["alpha"])
         except Exception:
             pass

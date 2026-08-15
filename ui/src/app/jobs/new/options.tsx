@@ -911,6 +911,7 @@ export const modelArchs: ModelArch[] = [
       'datasets.audio_preserve_pitch',
       'train.audio_loss_multiplier',
       'datasets.auto_frame_count',
+      'sample.minimax_h3_turbo_lora',
     ],
     modelNotes: (
       <div className="space-y-2">
