@@ -15,11 +15,26 @@ param(
 
 $repo = Split-Path -Parent $PSScriptRoot
 
+# `concurrently` (npm run start's supervisor) does not consistently pass its
+# children full paths -- observed in practice as a bare "node  dist/cron/
+# worker.js" with no repo path anywhere in CommandLine, which orphaned that
+# process past every check here for hours: it never showed up as a kill
+# candidate, and separately never got climbed-through as a parent, because
+# both checks required the repo path to be present. dist/cron/worker.js and
+# dist/cron/fileServer.js are unique enough filenames that matching on them
+# alone, with no repo-path requirement, is not a real false-positive risk.
+function Test-ToolkitCommandLine([string]$cmdline) {
+    if (-not $cmdline) { return $false }
+    if ($cmdline -match 'dist[\\/]cron[\\/](worker|fileServer)\.js') { return $true }
+    return (
+        $cmdline -match [regex]::Escape($repo) -and
+        $cmdline -match 'dist[\\/]cron|concurrently|npm-cli\.js|npm\.cmd|next'
+    )
+}
+
 function Get-ToolkitProcesses {
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-        $_.CommandLine -and
-        $_.CommandLine -match [regex]::Escape($repo) -and
-        $_.CommandLine -match 'dist[\\/]cron|concurrently|npm-cli\.js|npm\.cmd|next'
+        Test-ToolkitCommandLine $_.CommandLine
     }
 }
 
@@ -58,7 +73,7 @@ foreach ($p in $procs) {
         $parent = $byId[[int]$cur.ParentProcessId]
         if (-not $parent) { break }
         # keep climbing while the parent still belongs to this repo's stack
-        if ($parent.CommandLine -and $parent.CommandLine -match [regex]::Escape($repo)) {
+        if (Test-ToolkitCommandLine $parent.CommandLine) {
             $cur = $parent
             continue
         }
