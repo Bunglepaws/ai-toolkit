@@ -260,12 +260,27 @@ class UITrainer(SDTrainer):
                 self.save(self.step_num)
             self.sample(self.step_num)
 
+    def _reset_control_flags(self):
+        """Clear the on-demand control flags (and the launcher-owned `pid`) once
+        this job has committed to a terminal state (stopped/queued). Node never
+        clears these on a clean, self-reported exit -- see the comment on
+        watchDetachedJob in ui/cron/actions/startJob.ts -- so if we don't do it
+        here they persist forever and the UI keeps treating the row as busy/in
+        flight (stale pid, stop/save/save_now still set)."""
+        if self.accelerator.is_main_process:
+            self.update_db_key("stop", False)
+            self.update_db_key("save", False)
+            self.update_db_key("save_now", 0)
+            self.update_db_key("return_to_queue", False)
+            self.update_db_key("pid", None)
+
     def maybe_stop(self):
         # Hard stop: the user asked to stop now, nothing to wait for.
         if self.should_stop():
             self.is_stopping = True
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
+            self._reset_control_flags()
             raise JobStoppedException("Job stopped")
         # Cooperative stops must never pre-empt a pending save -- see the
         # matching note in DiffusionTrainer.maybe_stop().
@@ -275,12 +290,14 @@ class UITrainer(SDTrainer):
             self.is_stopping = True
             self._run_async_operation(
                 self._update_status("queued", "Job queued"))
+            self._reset_control_flags()
             raise JobStoppedException("Job returning to queue")
         if self.should_stop_after_save():
             self.reset_stop_after_save()
             self.is_stopping = True
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
+            self._reset_control_flags()
             raise JobStoppedException("Job stopped")
 
     async def _update_key(self, key, value):

@@ -313,6 +313,20 @@ class DiffusionTrainer(SDTrainer):
             self.reset_skip_sample()
             raise SampleSkippedException("Sample skipped by user")
 
+    def _reset_control_flags(self):
+        """Clear the on-demand control flags (and the launcher-owned `pid`) once
+        this job has committed to a terminal state (stopped/queued). Node never
+        clears these on a clean, self-reported exit -- see the comment on
+        watchDetachedJob in ui/cron/actions/startJob.ts -- so if we don't do it
+        here they persist forever and the UI keeps treating the row as busy/in
+        flight (stale pid, stop/save/save_now still set)."""
+        if self.accelerator.is_main_process and self.is_ui_trainer:
+            self.update_db_key("stop", False)
+            self.update_db_key("save", False)
+            self.update_db_key("save_now", 0)
+            self.update_db_key("return_to_queue", False)
+            self.update_db_key("pid", None)
+
     def maybe_stop(self):
         if not self.is_ui_trainer:
             return
@@ -320,6 +334,7 @@ class DiffusionTrainer(SDTrainer):
         if self.should_stop():
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
+            self._reset_control_flags()
             self.is_stopping = True
             raise JobStoppedException("Job stopped")
         # Cooperative stops below must never pre-empt a pending save --
@@ -331,12 +346,14 @@ class DiffusionTrainer(SDTrainer):
         if self.should_return_to_queue():
             self._run_async_operation(
                 self._update_status("queued", "Job queued"))
+            self._reset_control_flags()
             self.is_stopping = True
             raise JobStoppedException("Job returning to queue")
         if self.should_stop_after_save():
             self.reset_stop_after_save()
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
+            self._reset_control_flags()
             self.is_stopping = True
             raise JobStoppedException("Job stopped")
 
