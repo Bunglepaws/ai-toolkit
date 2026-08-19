@@ -13,7 +13,7 @@ import { CgSpinner } from 'react-icons/cg';
 import useGPUInfo from '@/hooks/useGPUInfo';
 import { ChevronUp, ChevronDown, ChevronsUp, GripVertical, Trash2 } from 'lucide-react';
 import { openConfirm } from '@/components/ConfirmModal';
-import { deleteJob, getTotalSteps, reorderJob, reorderJobToIndex, stopJob } from '@/utils/jobs';
+import { deleteJob, getEpochInfo, getTotalSteps, reorderJob, reorderJobToIndex, stopJob } from '@/utils/jobs';
 import JobAlertsPanel, { JobAlert } from '@/components/JobAlertsPanel';
 
 interface JobsTableProps {
@@ -353,10 +353,18 @@ export default function JobsTable({ onlyActive = false, filter = '', job_type = 
           return <></>;
         }
 
+        const epochInfo = getEpochInfo(row);
+
         return (
           <div>
             <div className="text-xs text-gray-400">
               {row.step} / {totalSteps}
+              {epochInfo && (
+                <span className="ml-2 text-gray-500">
+                  ep {epochInfo.completed}
+                  {epochInfo.total !== null && `/~${epochInfo.total}`}
+                </span>
+              )}
             </div>
             <div className="bg-gray-700 rounded-full h-1.5">
               <div

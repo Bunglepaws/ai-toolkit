@@ -1,5 +1,6 @@
 import copy
 import gc
+import inspect
 import json
 import random
 import shutil
@@ -38,6 +39,7 @@ from toolkit.sampler import get_sampler
 from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscreteScheduler
 from toolkit.saving import save_ldm_model_from_diffusers, get_ldm_state_dict_from_diffusers
 from toolkit.sd_device_states_presets import empty_preset
+from toolkit.ui_utils import SampleSkippedException
 from toolkit.train_tools import get_torch_dtype, apply_noise_offset
 from einops import rearrange, repeat
 import torch
@@ -203,6 +205,9 @@ class StableDiffusion:
         self._after_sample_img_hooks = []
         self._status_update_hooks = []
         self._maybe_stop_hooks = []
+        # skip: abandon only the image currently rendering, not the whole batch
+        # -- see add_maybe_skip_hook / maybe_skip_sample below
+        self._maybe_skip_hooks = []
         # todo update this based on the model
         self.is_transformer = False
         
@@ -1171,6 +1176,17 @@ class StableDiffusion:
         for hook in self._maybe_stop_hooks:
             hook()
 
+    def add_maybe_skip_hook(self, func):
+        self._maybe_skip_hooks.append(func)
+
+    def maybe_skip_sample(self):
+        """Mirrors BaseModel.maybe_skip_sample for the legacy (sd/sdxl) model
+        class. A hook raises SampleSkippedException to abandon the image
+        currently rendering; generate_images catches it and moves on to the
+        next prompt."""
+        for hook in self._maybe_skip_hooks:
+            hook()
+
     @torch.no_grad()
     def generate_images(
             self,
@@ -1413,6 +1429,12 @@ class StableDiffusion:
 
                 for i in tqdm(range(len(image_configs)), desc=f"Generating Images", leave=False):
                     self.maybe_stop()
+                    try:
+                        # a skip requested while the previous image was saving
+                        # lands here, before we start work on this one
+                        self.maybe_skip_sample()
+                    except SampleSkippedException:
+                        continue
                     gen_config = image_configs[i]
 
                     extra = {}
@@ -1590,24 +1612,39 @@ class StableDiffusion:
                                 **gen_config.extra_kwargs,
                             }
 
-                        img = pipeline(
-                            # prompt=gen_config.prompt,
-                            # prompt_2=gen_config.prompt_2,
-                            prompt_embeds=conditional_embeds.text_embeds,
-                            pooled_prompt_embeds=conditional_embeds.pooled_embeds,
-                            negative_prompt_embeds=unconditional_embeds.text_embeds,
-                            negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
-                            # negative_prompt=gen_config.negative_prompt,
-                            # negative_prompt_2=gen_config.negative_prompt_2,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            guidance_rescale=grs,
-                            latents=gen_config.latents,
-                            generator=generator,
-                            **extra
-                        ).images[0]
+                        # checked every denoise step so a skip lands within one
+                        # step of being clicked, not after this image finishes
+                        def _skip_callback(pipe, step, t, callback_kwargs):
+                            self.maybe_skip_sample()
+                            return {}
+
+                        # some samplers swap in a pipeline that has no
+                        # step callback; fall back to the per-image check
+                        if 'callback_on_step_end' in inspect.signature(pipeline.__call__).parameters:
+                            extra['callback_on_step_end'] = _skip_callback
+
+                        try:
+                            img = pipeline(
+                                # prompt=gen_config.prompt,
+                                # prompt_2=gen_config.prompt_2,
+                                prompt_embeds=conditional_embeds.text_embeds,
+                                pooled_prompt_embeds=conditional_embeds.pooled_embeds,
+                                negative_prompt_embeds=unconditional_embeds.text_embeds,
+                                negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
+                                # negative_prompt=gen_config.negative_prompt,
+                                # negative_prompt_2=gen_config.negative_prompt_2,
+                                height=gen_config.height,
+                                width=gen_config.width,
+                                num_inference_steps=gen_config.num_inference_steps,
+                                guidance_scale=gen_config.guidance_scale,
+                                guidance_rescale=grs,
+                                latents=gen_config.latents,
+                                generator=generator,
+                                **extra
+                            ).images[0]
+                        except SampleSkippedException:
+                            flush()
+                            continue
                     elif self.is_v3:
                         img = pipeline(
                             prompt_embeds=conditional_embeds.text_embeds,
@@ -1718,19 +1755,32 @@ class StableDiffusion:
                             **extra
                         ).images[0]
                     else:
-                        img = pipeline(
-                            # prompt=gen_config.prompt,
-                            prompt_embeds=conditional_embeds.text_embeds,
-                            negative_prompt_embeds=unconditional_embeds.text_embeds,
-                            # negative_prompt=gen_config.negative_prompt,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            latents=gen_config.latents,
-                            generator=generator,
-                            **extra
-                        ).images[0]
+                        # checked every denoise step so a skip lands within one
+                        # step of being clicked, not after this image finishes
+                        def _skip_callback(pipe, step, t, callback_kwargs):
+                            self.maybe_skip_sample()
+                            return {}
+
+                        if 'callback_on_step_end' in inspect.signature(pipeline.__call__).parameters:
+                            extra['callback_on_step_end'] = _skip_callback
+
+                        try:
+                            img = pipeline(
+                                # prompt=gen_config.prompt,
+                                prompt_embeds=conditional_embeds.text_embeds,
+                                negative_prompt_embeds=unconditional_embeds.text_embeds,
+                                # negative_prompt=gen_config.negative_prompt,
+                                height=gen_config.height,
+                                width=gen_config.width,
+                                num_inference_steps=gen_config.num_inference_steps,
+                                guidance_scale=gen_config.guidance_scale,
+                                latents=gen_config.latents,
+                                generator=generator,
+                                **extra
+                            ).images[0]
+                        except SampleSkippedException:
+                            flush()
+                            continue
 
                     if self.refiner_unet is not None and gen_config.refiner_start_at < 1.0:
                         # slide off just the last 1280 on the last dim as refiner does not use first text encoder

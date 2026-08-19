@@ -250,8 +250,15 @@ class SDTrainer(BaseSDTrainProcess):
         return True
 
     def cache_sample_prompts(self):
-        if self.train_config.disable_sampling:
-            return
+        # NB: deliberately NOT gated on train_config.disable_sampling. That flag only
+        # suppresses *scheduled* sampling; the UI's sample button stays live, and
+        # unticking the box mid-run never reaches the trainer (reload_sample_config
+        # only re-reads the `sample` block, disable_sampling lives under `train`).
+        # Skipping the cache here left sample_prompts_cache None, the text encoder was
+        # then unloaded, and the first on-demand sample died in the live-encode
+        # fallback with "'FakeTextEncoder' object has no attribute 'model'".
+        # Encoding a handful of prompts once, straight to the disk cache, is cheap
+        # insurance against that.
         # After the text encoder is unloaded (replaced with FakeTextEncoder) we can no
         # longer encode prompts, so a rebuild is impossible. Bail out and keep whatever
         # cache we already have rather than throwing "fake text encoder" errors on every

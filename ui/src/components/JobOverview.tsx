@@ -4,8 +4,8 @@ import useCPUInfo from '@/hooks/useCPUInfo';
 import GPUWidget from '@/components/GPUWidget';
 import CPUWidget from '@/components/CPUWidget';
 import FilesWidget from '@/components/FilesWidget';
-import { getTotalSteps } from '@/utils/jobs';
-import { Cpu, HardDrive, Info, Gauge } from 'lucide-react';
+import { getTotalSteps, getEpochInfo } from '@/utils/jobs';
+import { Cpu, HardDrive, Info, Gauge, Repeat } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import useJobLog from '@/hooks/useJobLog';
 import SamplePreview from '@/components/SamplePreview';
@@ -29,6 +29,7 @@ export default function JobOverview({ job }: JobOverviewProps) {
   const { cpuInfo, isCPUInfoLoaded } = useCPUInfo(5000);
   const totalSteps = getTotalSteps(job);
   const progress = (job.step / totalSteps) * 100;
+  const epochInfo = getEpochInfo(job);
   const isStopping = job.stop && job.status === 'running';
 
   const logLines: string[] = useMemo(() => {
@@ -114,6 +115,12 @@ export default function JobOverview({ job }: JobOverviewProps) {
                 <span className="text-gray-400">Progress</span>
                 <span className="text-gray-200">
                   Step {job.step} of {totalSteps}
+                  {epochInfo && (
+                    <span className="text-gray-400">
+                      {' · '}Epoch {epochInfo.completed}
+                      {epochInfo.total !== null && ` of ~${epochInfo.total}`}
+                    </span>
+                  )}
                 </span>
               </div>
               <div className="w-full bg-gray-800 rounded-full h-2">
@@ -131,6 +138,20 @@ export default function JobOverview({ job }: JobOverviewProps) {
                 <p className="text-sm font-medium text-gray-200">{job.name}</p>
               </div>
             </div>
+
+            {epochInfo && (
+              <div className="flex items-center space-x-4">
+                <Repeat className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
+                <div>
+                  <p className="text-xs text-gray-400">Epochs</p>
+                  <p className="text-sm font-medium text-gray-200">
+                    {epochInfo.completed}
+                    {epochInfo.total !== null && ` of ~${epochInfo.total}`}
+                    {epochInfo.stepsPerEpoch !== null && ` · ${epochInfo.stepsPerEpoch} steps each`}
+                  </p>
+                </div>
+              </div>
+            )}
 
             <div className="flex items-center space-x-4">
               <Cpu className="w-5 h-5 text-purple-600 dark:text-purple-400" />

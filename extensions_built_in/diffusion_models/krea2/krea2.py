@@ -450,9 +450,13 @@ class Krea2Model(BaseModel):
     def _merge_lora_file(self, path, strength, applied):
         """Load one LoRA/diff file and add its weighted delta to transformer params.
 
-        Appends a (param_name, delta_fp32, strength) tuple to `applied` for each
-        tensor as soon as it is merged, so the caller can reverse a partial merge
-        if an exception is raised partway through.
+        Appends a (param_name, delta_fp32, strength, restore_dtype) tuple to
+        `applied` for each tensor as soon as it is merged, so the caller can
+        reverse a partial merge if an exception is raised partway through.
+        `restore_dtype` is the dtype the param had before a quantized-tensor
+        dequantize (or None if it was never quantized) — _unmerge_lora casts
+        back to it as a defensive floor, so a dtype slip here can't survive
+        into the next training step even if this method is wrong about it.
         """
         param_dict = dict(self.model.named_parameters())
 
@@ -475,9 +479,13 @@ class Krea2Model(BaseModel):
                     self.print_and_status_update(f"  skip diff key (no param): {dk}")
                     continue
                 param = param_dict[param_name]
+                restore_dtype = None
+                if hasattr(param.data, 'dequantize'):
+                    restore_dtype = param.data.dtype
+                    param.data = param.data.dequantize().to(restore_dtype)
                 delta = sd[dk].to(param.device, dtype=torch.float32)
                 param.data.add_(delta.to(param.dtype) * strength)
-                applied.append((param_name, delta, strength))
+                applied.append((param_name, delta, strength, restore_dtype))
             return
 
         # --- lora_A/lora_B (or lora_down/lora_up) format ---
@@ -511,16 +519,27 @@ class Krea2Model(BaseModel):
                 continue
 
             param = param_dict[param_name]
+            restore_dtype = None
+            if hasattr(param.data, 'dequantize'):
+                restore_dtype = param.data.dtype
+                param.data = param.data.dequantize().to(restore_dtype)
             param.data.add_(delta.to(param.device, dtype=param.dtype) * strength)
-            applied.append((param_name, delta, strength))
+            applied.append((param_name, delta, strength, restore_dtype))
 
     def _unmerge_lora(self, applied):
-        """Reverse all deltas from _merge_lora_file."""
+        """Reverse all deltas from _merge_lora_file.
+
+        Casts each param back to its pre-merge dtype as a defensive floor
+        (see _merge_lora_file docstring) — cheap no-op when the dtype was
+        never touched, a safety net when it was.
+        """
         param_dict = dict(self.model.named_parameters())
-        for param_name, delta, strength in applied:
+        for param_name, delta, strength, restore_dtype in applied:
             if param_name in param_dict:
                 param = param_dict[param_name]
                 param.data.sub_(delta.to(param.device, dtype=param.dtype) * strength)
+                if restore_dtype is not None and param.data.dtype != restore_dtype:
+                    param.data = param.data.to(restore_dtype)
 
     def _prepare_sampling_lora(self, pipeline):
         sc = getattr(self, 'sample_config', None)

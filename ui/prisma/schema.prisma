@@ -35,6 +35,15 @@ model Job {
   return_to_queue Boolean  @default(false) // same as stop, but will be set to 'queued' when stopped
   step            Int      @default(0)
   total_steps     Int?
+  // Completed passes over the dataset, mirrored from the trainer's authoritative
+  // `epoch_num` (the same value written into checkpoint metadata as
+  // training_info.epoch). Written alongside `step` in the same UPDATE so the two
+  // can never disagree by a step.
+  epoch           Int      @default(0)
+  // Optimizer steps in one pass over the dataset (batches / gradient_accumulation).
+  // Written once when the train loop starts. 0 means "unknown" — older jobs, or a
+  // job that has not begun training yet — and the UI hides epoch info in that case.
+  steps_per_epoch Float    @default(0)
   info            String   @default("")
   speed_string    String   @default("")
   queue_position  Int      @default(0)
@@ -50,6 +59,11 @@ model Job {
   // save is still pending, so the checkpoint always lands first.
   stop_after_save Boolean  @default(false)
   alerts          String   @default("[]") // JSON array of alert objects {timestamp, step, type, message, data}
+  // Freeform per-job notes, each anchored to a training step. JSON array of
+  // {id, ts, step, text}. Authoritative here; mirrored into the top-level
+  // `notes` key of job_config on every config write so it survives clone /
+  // export / import. Never read by the Python trainer.
+  notes           String   @default("[]")
   dataset_stats   String   @default("{}") // JSON object {total_images, buckets: {WxH: count}}
   sample_now      Boolean  @default(false) // if true, the job will be sampled on the next step (lightweight, no save/config reload)
 

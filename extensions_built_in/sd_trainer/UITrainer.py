@@ -326,10 +326,81 @@ class UITrainer(SDTrainer):
 
         await self._execute_db_operation(_do_update)
 
+    async def _update_step_and_epoch(self):
+        if not self.accelerator.is_main_process:
+            return
+
+        def _do_update():
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor.execute(
+                        "UPDATE Job SET step = ?, epoch = ? WHERE id = ?",
+                        (int(self.step_num), int(self.epoch_num), self.job_id)
+                    )
+                finally:
+                    cursor.execute("COMMIT")
+
+        await self._execute_db_operation(_do_update)
+
     def update_step(self):
-        """Non-blocking update of the step count."""
+        """Non-blocking update of the step count (and the epoch it belongs to).
+
+        Both columns go out in a single UPDATE so the UI can never read a step
+        from one moment paired with an epoch from another.
+        """
         if self.accelerator.is_main_process:
-            self._run_async_operation(self._update_key("step", self.step_num))
+            self._note_epoch_progress()
+            self._run_async_operation(self._update_step_and_epoch())
+
+    def _persist_steps_per_epoch(self):
+        """Mark epoch tracking as live for this session but not yet measured.
+
+        -1 is a sentinel meaning "this job reports epochs, length still unknown";
+        0 means "no epoch info at all" (a job that has not run since the epoch
+        columns were added). The UI distinguishes the two so it can show the epoch
+        number immediately and add the projected total once one is measured."""
+        try:
+            self.update_db_key("steps_per_epoch", -1.0)
+        except Exception as e:
+            print(f"[AITK] Warning: could not flag epoch tracking: {e}")
+
+    # --- epoch length measurement -------------------------------------------
+    # len(dataloader) is NOT the number of iterations the train loop pulls in a
+    # pass (bucketed datasets batch inside the dataset, reg datasets alternate,
+    # and the dataset can change size between sessions), so epoch length is
+    # measured from observed rollovers instead: the gap between two consecutive
+    # increments of epoch_num is exactly one epoch, by definition.
+    _prev_rollover_step = None
+    _last_epoch_seen = None
+
+    def _note_epoch_progress(self):
+        """Called once per step. Writes steps_per_epoch after a full epoch is observed."""
+        try:
+            ep = int(self.epoch_num)
+            st = int(self.step_num)
+            if self._last_epoch_seen is None:
+                self._last_epoch_seen = ep
+                return
+            if ep == self._last_epoch_seen:
+                return
+            self._last_epoch_seen = ep
+            if self._prev_rollover_step is None:
+                # We joined this epoch partway through (fresh start or resume), so
+                # its span is a lower bound, not a measurement. Anchor and measure
+                # from the next rollover onward.
+                self._prev_rollover_step = st
+                return
+            span = st - self._prev_rollover_step
+            self._prev_rollover_step = st
+            if span > 0:
+                # Most recent epoch only, not an average: the dataset can grow
+                # mid-run (datasets get added between sessions) and the latest
+                # span is the one that projects the remaining steps correctly.
+                self.update_db_key("steps_per_epoch", float(span))
+        except Exception as e:
+            print(f"[AITK] Warning: could not measure epoch length: {e}")
 
     def update_db_key(self, key, value):
         """Non-blocking update a key in the database."""
@@ -473,6 +544,7 @@ class UITrainer(SDTrainer):
         self.update_step()
         self.update_status("running", "Training")
         self.timer.add_after_print_hook(self.handle_timing_print_hook)
+        self._persist_steps_per_epoch()
 
     def status_update_hook_func(self, string):
         self.update_status("running", string)
