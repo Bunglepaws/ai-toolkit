@@ -3,6 +3,7 @@ import Link from 'next/link';
 import { GroupedSelectOption, SelectOption, JobConfig, ConfigDoc } from '@/types';
 import { defaultSliderConfig } from './jobConfig';
 import { defaultAudioSampleConfig, defaultSampleConfig, defaultIdeogramSamplesConfig } from '@/helpers/defaultSamples';
+import { FrameGrid } from '@/helpers/videoFrames';
 
 type Control = 'depth' | 'line' | 'pose' | 'inpaint';
 
@@ -73,6 +74,11 @@ export interface ModelArch {
   group: ModelGroup;
   controls?: Control[];
   isVideoModel?: boolean;
+  // Valid sample frame counts are `multiple * n + offset`. Defaults to { 1, 1 }
+  // (WAN's fps * seconds + 1) when a video arch does not specify one.
+  frameGrid?: FrameGrid;
+  // fps values we have actually tested; anything else warns in the UI.
+  supportedFps?: number[];
   hasMultiLinePrompts?: boolean;
   defaults?: { [key: string]: any };
   disableSections?: DisableableSections[];
@@ -222,6 +228,8 @@ export const modelArchs: ModelArch[] = [
     label: 'Wan 2.1 (1.3B)',
     group: 'video',
     isVideoModel: true,
+    frameGrid: { multiple: 1, offset: 1 },
+    supportedFps: [16, 24],
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['Wan-AI/Wan2.1-T2V-1.3B-Diffusers', defaultNameOrPath],
@@ -241,6 +249,8 @@ export const modelArchs: ModelArch[] = [
     label: 'Wan 2.1 I2V (14B-480P)',
     group: 'video',
     isVideoModel: true,
+    frameGrid: { multiple: 1, offset: 1 },
+    supportedFps: [16, 24],
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['Wan-AI/Wan2.1-I2V-14B-480P-Diffusers', defaultNameOrPath],
@@ -261,6 +271,8 @@ export const modelArchs: ModelArch[] = [
     label: 'Wan 2.1 I2V (14B-720P)',
     group: 'video',
     isVideoModel: true,
+    frameGrid: { multiple: 1, offset: 1 },
+    supportedFps: [16, 24],
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['Wan-AI/Wan2.1-I2V-14B-720P-Diffusers', defaultNameOrPath],
@@ -281,6 +293,8 @@ export const modelArchs: ModelArch[] = [
     label: 'Wan 2.1 (14B)',
     group: 'video',
     isVideoModel: true,
+    frameGrid: { multiple: 1, offset: 1 },
+    supportedFps: [16, 24],
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['Wan-AI/Wan2.1-T2V-14B-Diffusers', defaultNameOrPath],
@@ -300,6 +314,8 @@ export const modelArchs: ModelArch[] = [
     label: 'Wan 2.2 (14B)',
     group: 'video',
     isVideoModel: true,
+    frameGrid: { multiple: 1, offset: 1 },
+    supportedFps: [16, 24],
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['ai-toolkit/Wan2.2-T2V-A14B-Diffusers-bf16', defaultNameOrPath],
@@ -332,6 +348,8 @@ export const modelArchs: ModelArch[] = [
     label: 'Wan 2.2 I2V (14B)',
     group: 'video',
     isVideoModel: true,
+    frameGrid: { multiple: 1, offset: 1 },
+    supportedFps: [16, 24],
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['ai-toolkit/Wan2.2-I2V-A14B-Diffusers-bf16', defaultNameOrPath],
@@ -371,6 +389,8 @@ export const modelArchs: ModelArch[] = [
     label: 'Wan 2.2 TI2V (5B)',
     group: 'video',
     isVideoModel: true,
+    frameGrid: { multiple: 1, offset: 1 },
+    supportedFps: [16, 24],
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['Wan-AI/Wan2.2-TI2V-5B-Diffusers', defaultNameOrPath],
@@ -733,6 +753,8 @@ export const modelArchs: ModelArch[] = [
     label: 'MiniMax-H3',
     group: 'video',
     isVideoModel: true,
+    frameGrid: { multiple: 17, offset: 5 },
+    supportedFps: [24],
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['Comfy-Org/MiniMax-H3', defaultNameOrPath],
@@ -885,6 +907,8 @@ export const modelArchs: ModelArch[] = [
     label: 'MiniMax-H3 Ref2V',
     group: 'video',
     isVideoModel: true,
+    frameGrid: { multiple: 17, offset: 5 },
+    supportedFps: [24],
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['Comfy-Org/MiniMax-H3', defaultNameOrPath],
@@ -1021,6 +1045,8 @@ export const modelArchs: ModelArch[] = [
     label: 'LTX-2',
     group: 'video',
     isVideoModel: true,
+    frameGrid: { multiple: 8, offset: 1 },
+    supportedFps: [24, 25, 50],
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['Lightricks/LTX-2', defaultNameOrPath],
@@ -1048,6 +1074,8 @@ export const modelArchs: ModelArch[] = [
     label: 'LTX-2.3',
     group: 'video',
     isVideoModel: true,
+    frameGrid: { multiple: 8, offset: 1 },
+    supportedFps: [24, 25, 50],
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['Lightricks/LTX-2.3/ltx-2.3-22b-dev.safetensors', defaultNameOrPath],
@@ -1077,6 +1105,8 @@ export const modelArchs: ModelArch[] = [
     gateUrl: 'https://huggingface.co/Lightricks/LTX-2.5',
     group: 'video',
     isVideoModel: true,
+    frameGrid: { multiple: 8, offset: 1 },
+    supportedFps: [24, 25, 50],
     defaults: {
       // default updates when [selected, unselected] in the UI
       // comfy-style split files resolve from/download to the models folder;

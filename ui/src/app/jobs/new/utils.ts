@@ -1,6 +1,7 @@
 import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
 import { modelArchs, ModelArch } from './options';
 import { objectCopy } from '@/utils/basic';
+import { frameCountToDuration } from '@/helpers/videoFrames';
 
 const expandDatasetDefaults = (
   defaults: { [key: string]: any },
@@ -146,5 +147,16 @@ export const handleModelArchChange = (
 
   for (const key in newDefaults) {
     setJobConfig(newDefaults[key][0], key);
+  }
+
+  // sample.duration is derived from num_frames/fps, so it has to follow the new
+  // arch's defaults rather than carrying the previous model's length over.
+  if (newArch?.group === 'video') {
+    const numFrames =
+      newDefaults['config.process[0].sample.num_frames']?.[0] ?? jobConfig.config.process[0].sample.num_frames;
+    const fps = newDefaults['config.process[0].sample.fps']?.[0] ?? jobConfig.config.process[0].sample.fps;
+    setJobConfig(frameCountToDuration(numFrames, fps), 'config.process[0].sample.duration');
+  } else {
+    setJobConfig(undefined, 'config.process[0].sample.duration');
   }
 };

@@ -263,6 +263,10 @@ export interface SampleConfig {
   sample_steps: number;
   num_frames: number;
   fps: number;
+  // Sample length in seconds. UI-facing source of truth for video samples;
+  // num_frames is derived from it (snapped to the model's frame grid) and
+  // remains what the trainer reads. Absent on jobs created before this existed.
+  duration?: number;
   // LoRA applied only during sampling (not training). WAN 2.2 uses path + path_2 for two-stage LightX2V.
   sample_lora_path?: string | null;
   sample_lora_path_2?: string | null;

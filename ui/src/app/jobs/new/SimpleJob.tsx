@@ -35,6 +35,13 @@ import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
 import { isMac } from '@/helpers/basic';
+import {
+  defaultFrameGrid,
+  durationToFrameCount,
+  frameCountToDuration,
+  formatDuration,
+  isUntestedFps,
+} from '@/helpers/videoFrames';
 import useSettings from '@/hooks/useSettings';
 
 const MRU_LORA_KEY = 'aitk_mru_lora_paths';
@@ -186,6 +193,79 @@ export default function SimpleJob({
   }, [modelArch, jobType]);
 
   const isVideoModel = !!(modelArch?.group === 'video');
+
+  // Video samples are configured in seconds; the frame count is derived from
+  // duration x fps and snapped onto the architecture's frame grid (WAN n+1,
+  // LTX 8n+1, H3 17n+5). num_frames stays in the config as the value the
+  // trainer reads. Jobs saved before `duration` existed back-fill from it.
+  const frameGrid = modelArch?.frameGrid ?? defaultFrameGrid;
+  const sampleFps = jobConfig.config.process[0].sample.fps;
+  const sampleDuration = useMemo(() => {
+    const stored = jobConfig.config.process[0].sample.duration;
+    if (stored !== undefined && stored !== null) return stored;
+    return frameCountToDuration(jobConfig.config.process[0].sample.num_frames, sampleFps);
+  }, [
+    jobConfig.config.process[0].sample.duration,
+    jobConfig.config.process[0].sample.num_frames,
+    sampleFps,
+  ]);
+  const sampleFrameCount = useMemo(
+    () => durationToFrameCount(sampleDuration, sampleFps, frameGrid),
+    [sampleDuration, sampleFps, frameGrid],
+  );
+  const fpsUntested = isUntestedFps(sampleFps, modelArch?.supportedFps);
+
+  const setSampleDuration = useCallback(
+    (duration: number | null, fps: number = sampleFps) => {
+      const seconds = duration ?? 0;
+      setJobConfig(seconds, 'config.process[0].sample.duration');
+      setJobConfig(durationToFrameCount(seconds, fps, frameGrid), 'config.process[0].sample.num_frames');
+    },
+    [setJobConfig, sampleFps, frameGrid],
+  );
+  // Clone Voice card. Clip count mirrors the backend: ceil(seconds / 5.167), the longest
+  // legal H3 slot -- shown live so the seconds field is not abstract.
+  // MERGE with defaults, don't only fall back when absent. Toggling the enable checkbox
+  // writes a nested path, so a config that never had a voice_clone block ends up with a
+  // PARTIAL one -- and a missing `dialogue` array throws on .join(), which the page's
+  // ErrorBoundary surfaces as the misleading "Advanced job detected".
+  const vc: VoiceCloneConfig = {
+    ...defaultVoiceCloneConfig,
+    ...(jobConfig.config.process[0].voice_clone ?? {}),
+  };
+  const vcDialogue = Array.isArray(vc.dialogue) ? vc.dialogue : [];
+  const voiceClipCount = Math.max(1, Math.ceil((vc.target_seconds || 0) / 5.167));
+  const voiceDialogueRef = useRef<HTMLTextAreaElement>(null);
+  // A voice dataset holds audio-only items: their video side is a zeros placeholder pinned to
+  // voice_placeholder_size, never bucketed and never trained on. So resolution, frame count,
+  // crop/flip and control pickers are all inert for it -- hide them rather than leave settings
+  // that look live and do nothing.
+  const isVoiceDataset = (d: { folder_path?: string }) =>
+    !!vc.enabled && !!vc.target_dataset && d.folder_path === vc.target_dataset;
+
+  // Picking a target folder also wires it in as a dataset. Generating clips into a folder
+  // no dataset entry references is a silent no-op -- the run trains as if the voice were
+  // never made -- and this card is the only place with the context to prevent it.
+  // Add/ensure only: never removes a dataset, since the user may have put images there.
+  const setVoiceTargetDataset = (folderPath: string) => {
+    setJobConfig(folderPath, 'config.process[0].voice_clone.target_dataset');
+    if (!folderPath) return;
+    const datasets = objectCopy(jobConfig.config.process[0].datasets) as any[];
+    const idx = datasets.findIndex(d => d.folder_path === folderPath);
+    if (idx === -1) {
+      const newDataset = objectCopy(defaultDatasetConfig) as any;
+      newDataset.folder_path = folderPath;
+      newDataset.controls = modelArch?.controls ?? [];
+      // voice items are audio-only; both are required or the dataset refuses to load
+      newDataset.do_audio = true;
+      newDataset.cache_latents_to_disk = true;
+      datasets.push(newDataset);
+    } else {
+      datasets[idx].do_audio = true;
+      datasets[idx].cache_latents_to_disk = true;
+    }
+    setJobConfig(datasets, 'config.process[0].datasets');
+  };
   const isAudioModel = !!(modelArch?.group === 'audio');
 
   const taggedSampleArr: Record<string, any>[] | null = useMemo(() => {
@@ -1832,24 +1912,45 @@ export default function SimpleJob({
                   />
                   {isVideoModel && (
                     <div>
-                      <NumberInput
-                        label="Num Frames"
-                        value={jobConfig.config.process[0].sample.num_frames}
-                        onChange={value => setJobConfig(value, 'config.process[0].sample.num_frames')}
-                        placeholder="eg. 0"
-                        className="pt-2"
-                        min={0}
-                        required
-                      />
+                      <div className="pt-2 flex items-end gap-3">
+                        <NumberInput
+                          label="Duration (seconds)"
+                          value={sampleDuration}
+                          onChange={value => setSampleDuration(value)}
+                          placeholder="eg. 3"
+                          className="flex-1"
+                          min={0}
+                          required
+                        />
+                        <div className="text-xs text-gray-400 pb-2 whitespace-nowrap">
+                          {sampleFrameCount} frames
+                          {Math.abs(frameCountToDuration(sampleFrameCount, sampleFps) - sampleDuration) > 0.005 && (
+                            <span className="text-gray-500">
+                              {' '}
+                              · {formatDuration(frameCountToDuration(sampleFrameCount, sampleFps))}s
+                            </span>
+                          )}
+                        </div>
+                      </div>
                       <NumberInput
                         label="FPS"
-                        value={jobConfig.config.process[0].sample.fps}
-                        onChange={value => setJobConfig(value, 'config.process[0].sample.fps')}
-                        placeholder="eg. 0"
+                        value={sampleFps}
+                        onChange={value => {
+                          setJobConfig(value, 'config.process[0].sample.fps');
+                          // keep the derived frame count in step with the new fps
+                          setSampleDuration(sampleDuration, value ?? 0);
+                        }}
+                        placeholder="eg. 24"
                         className="pt-2"
                         min={0}
                         required
                       />
+                      {fpsUntested && (
+                        <div className="pt-1 text-xs text-yellow-500">
+                          Untested framerate for this model
+                          {modelArch?.supportedFps ? ` (tested: ${modelArch.supportedFps.join(', ')} fps)` : ''}.
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
