@@ -406,6 +406,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.is_caching_clip_vision_to_disk = dataset_config.cache_clip_vision_to_disk
         self.is_generating_controls = len(dataset_config.controls) > 0
         self.epoch_num = 0
+        self.current_step = 0   # set by trigger_dataloader_setup_epoch
+        self.is_retired = False  # past dataset_config.stop_after_step
 
         self.sd = sd
 
@@ -429,10 +431,18 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             if self.is_audio_model:
                 # only look for audio files
                 extensions = audio_extensions
-            elif self.is_video:
-                # look for videos and images. Video models can train on both;
-                # images are bucketed separately as single-frame items
-                extensions = video_extensions + image_extensions
+            else:
+                if self.is_video:
+                    # look for videos and images. Video models can train on both;
+                    # images are bucketed separately as single-frame items
+                    extensions = video_extensions + image_extensions
+                # Joint video+audio models additionally train standalone audio files as
+                # voice items. NOT nested under is_video: a voice-only dataset legitimately
+                # has num_frames=1 (each item takes its frame count from its own duration),
+                # so gating on the dataset being "video" would make its clips invisible.
+                # do_audio still gates it, so no existing dataset picks up loose .wav files.
+                if getattr(self.sd, 'supports_audio_only_items', False) and dataset_config.do_audio:
+                    extensions = extensions + audio_extensions
             # prune hidden dirs (.thumbs, .tmp) so their contents never train
             file_list = []
             for root, dirs, files in os.walk(self.dataset_path):
@@ -548,6 +558,15 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     latent_space_version=latent_space_version,
                     temporal_compression=temporal_compression,
                     sample_rate=self.sd.sample_rate if self.is_audio_model and self.sd is not None else 48000,
+                    # non-None only for models that train standalone audio as voice
+                    # items; also what FileItemDTO uses to detect one.
+                    audio_grid=(
+                        self.sd.get_audio_grid()
+                        if self.sd is not None
+                        and getattr(self.sd, 'supports_audio_only_items', False)
+                        and dataset_config.do_audio
+                        else None
+                    ),
                 )
                 self.file_list.append(file_item)
             except Exception as e:
@@ -558,6 +577,19 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     print_acc(f"Error processing image: {file}")
                 print_acc(e)
                 bad_count += 1
+
+        # Voice items have no pixels: their video side is a zeros latent the model builds
+        # directly, so there is nothing for the non-cached path (which VAE-encodes
+        # batch.tensor every step) to work from. Fail here with something actionable
+        # rather than at the first batch with an AttributeError on a None tensor.
+        num_voice = len([x for x in self.file_list if getattr(x, 'is_audio_only', False)])
+        if num_voice > 0 and not self.is_caching_latents:
+            raise ValueError(
+                f"{self.dataset_path}: found {num_voice} audio-only (voice) item(s), which "
+                f"require latent caching. Set cache_latents_to_disk: true on this dataset."
+            )
+        if num_voice > 0:
+            print_acc(f"  -  Found {num_voice} voice items (audio-only, video loss zeroed)")
 
         # save the size database
         with open(dataset_size_file, 'w') as f:
@@ -643,6 +675,21 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 _ep_phase("setup_controls")
         self.epoch_num += 1
 
+        # Per-dataset retirement. setup_buckets() early-returns after the first epoch, so
+        # the batch list is otherwise fixed for the run -- rebuild it here on the tick the
+        # dataset crosses its cutoff. The check is at the loader WRAP, so retirement lands
+        # at the next wrap after the step, not exactly on it; the log reports the real step
+        # rather than echoing the configured one.
+        stop_at = self.dataset_config.stop_after_step
+        if stop_at is not None and not getattr(self, 'is_retired', False):
+            if self.current_step >= int(stop_at):
+                self.is_retired = True
+                self.build_batch_indices()
+                print_acc(
+                    f" - Retiring dataset {self.dataset_path} at step {self.current_step} "
+                    f"(stop_after_step={stop_at}); its items will no longer be sampled."
+                )
+
     def __getstate__(self):
         # on Windows/macOS dataloader workers are spawned, which pickles the dataset.
         # sd (the model) is not picklable (weakrefs, cuda tensors) and is only needed
@@ -722,11 +769,16 @@ def validate_control_paths(dataset_configs: list):
         if dataset_path is None or not os.path.isdir(dataset_path):
             continue
 
-        img_files = [
-            f for root, _, files in os.walk(dataset_path)
-            for f in files
-            if f.lower().endswith(tuple(image_extensions)) and not f.startswith('.')
-        ]
+        # prune hidden dirs (.thumbs, .tmp) exactly like the real dataset scan
+        # does -- otherwise UI thumbnails (<original name>.jpg) get validated as
+        # if they were training images and never match a control file
+        img_files = []
+        for root, dirs, files in os.walk(dataset_path):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            img_files.extend(
+                f for f in files
+                if f.lower().endswith(tuple(image_extensions)) and not f.startswith('.')
+            )
 
         for img_file in img_files:
             stem = os.path.splitext(img_file)[0]
@@ -870,21 +922,28 @@ def get_dataloader_from_datasets(
     return data_loader
 
 
-def trigger_dataloader_setup_epoch(dataloader: DataLoader):
+def trigger_dataloader_setup_epoch(dataloader: DataLoader, current_step: int = 0):
     # hacky but needed because of different types of datasets and dataloaders
     dataloader.len = None
+
+    def _mark(ds):
+        # datasets need the step to evaluate stop_after_step; they have no other way to
+        # know where training is
+        ds.current_step = current_step
+        return ds
+
     if isinstance(dataloader.dataset, list):
         for dataset in dataloader.dataset:
             if hasattr(dataset, 'datasets'):
                 for sub_dataset in dataset.datasets:
                     if hasattr(sub_dataset, 'setup_epoch'):
-                        sub_dataset.setup_epoch()
+                        _mark(sub_dataset).setup_epoch()
                         sub_dataset.len = None
             elif hasattr(dataset, 'setup_epoch'):
-                dataset.setup_epoch()
+                _mark(dataset).setup_epoch()
                 dataset.len = None
     elif hasattr(dataloader.dataset, 'setup_epoch'):
-        dataloader.dataset.setup_epoch()
+        _mark(dataloader.dataset).setup_epoch()
         dataloader.dataset.len = None
     elif hasattr(dataloader.dataset, 'datasets'):
         dataloader.dataset.len = None

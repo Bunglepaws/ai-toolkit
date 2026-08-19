@@ -917,6 +917,38 @@ class ModelConfig:
         
 
 
+class VoiceCloneConfig:
+    """Generate voice training clips with a TTS model, before training starts.
+
+    Runs from hook_before_model_load, so a bad path fails in seconds rather than after
+    the diffusion model quantizes, and the TTS is released before it loads.
+    Idempotent: see toolkit/voice_clone/manifest.py.
+    """
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        # 'clone' from a reference recording, or 'design' from attributes. Design mode
+        # generates one seed utterance and then clones from it -- see ensure_voice_clips.
+        self.mode: str = kwargs.get('mode', 'clone')
+        self.reference_path: str = kwargs.get('reference_path', '')  # audio or video
+        self.reference_text: str = kwargs.get('reference_text', '')  # optional; auto-transcribed
+        self.instruct: str = kwargs.get('instruct', '')  # design mode
+        self.voice_seed_path: str = kwargs.get('voice_seed_path', '')  # accepted design seed
+        self.target_dataset: str = kwargs.get('target_dataset', '')
+        # Total GENERATED audio. The reference clip is TTS conditioning only and is never
+        # trained on, so it does not count toward this.
+        self.target_seconds: float = kwargs.get('target_seconds', 60.0)
+        self.duration_mix: str = kwargs.get('duration_mix', 'long')  # long | even | short
+        self.voice_description: str = kwargs.get('voice_description', 'a man speaking calmly, low pitch')
+        self.trigger_word: str = kwargs.get('trigger_word', '')
+        self.dialogue: list = kwargs.get('dialogue', []) or []  # overrides the default bank
+        self.backend: str = kwargs.get('backend', 'omnivoice')
+        self.seed: int = kwargs.get('seed', 42)
+        # A nonce, not a boolean: a checkbox would re-run on every resume. The UI stamps a
+        # timestamp; the manifest records the one it consumed.
+        self.regenerate_token: str = kwargs.get('regenerate_token', '')
+
+
 class EMAConfig:
     def __init__(self, **kwargs):
         self.use_ema: bool = kwargs.get('use_ema', False)
@@ -1184,6 +1216,17 @@ class DatasetConfig:
         self.do_audio: bool = kwargs.get('do_audio', False) # load audio from video files for models that support it
         self.audio_preserve_pitch: bool = kwargs.get('audio_preserve_pitch', False) # preserve pitch when stretching audio to fit num_frames
         self.audio_normalize: bool = kwargs.get('audio_normalize', False) # normalize audio volume levels when loading
+        # pixel canvas for the zeros video placeholder of an audio-only (voice) item.
+        # The pixels are never trained on (video loss is zeroed), so the smallest legal
+        # canvas keeps the packed sequence tiny: at 32 a 124-frame voice item is 37 video
+        # rows instead of ~21k at training resolution. Raise it if voice quality suffers
+        # -- a 1x1 spatial rotary grid is out of distribution for the checkpoint.
+        self.voice_placeholder_size: int = kwargs.get('voice_placeholder_size', 32)
+        # Retire this dataset after N training steps: its items stop being sampled while
+        # the rest keeps training. Voice converges long before a character's visuals, so
+        # sharing one run overtrains the voice while the images catch up. Steps, not
+        # epochs -- ai-toolkit is step-based. None = never retire.
+        self.stop_after_step: Union[int, None] = kwargs.get('stop_after_step', None)
 
 
 def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:

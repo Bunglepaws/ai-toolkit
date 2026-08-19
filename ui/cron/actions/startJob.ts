@@ -3,7 +3,7 @@ import { Job } from '@prisma/client';
 import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
-import { TOOLKIT_ROOT, getTrainingFolder, getHFToken, getGemmaApiKey, getGemmaApiModelIdSource, getQuantizationCacheDir, getModelsPath, getEnableHotModelReload, getSamplePreviewEnabled } from '../paths';
+import { TOOLKIT_ROOT, getTrainingFolder, getHFToken, getGemmaApiKey, getGemmaApiModelIdSource, getQuantizationCacheDir, getModelsPath, getEnableHotModelReload, getSamplePreviewEnabled, getOmniVoiceModelPath } from '../paths';
 import { resolveDetachedPythonPath } from '../pythonPath';
 const isWindows = process.platform === 'win32';
 
@@ -359,6 +359,15 @@ const launchJob = async (job: Job, sampleOnly: boolean = false) => {
       const modelsPath = await getModelsPath();
       if (modelsPath && modelsPath.trim() !== '') {
         additionalEnv.MODELS_PATH = modelsPath;
+      }
+    }
+
+    // OMNIVOICE_MODEL_PATH - TTS weights for the voice-clone pre-step. Same precedence
+    // rule as MODELS_PATH: an env var already set wins over the stored setting.
+    if (!process.env.OMNIVOICE_MODEL_PATH || process.env.OMNIVOICE_MODEL_PATH.trim() === '') {
+      const omniVoicePath = await getOmniVoiceModelPath();
+      if (omniVoicePath && omniVoicePath.trim() !== '') {
+        additionalEnv.OMNIVOICE_MODEL_PATH = omniVoicePath;
       }
     }
 

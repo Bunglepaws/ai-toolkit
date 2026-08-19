@@ -207,6 +207,9 @@ class BucketsMixin:
 
     def build_batch_indices(self: 'AiToolkitDataset'):
         self.batch_indices = []
+        if getattr(self, 'is_retired', False):
+            # dataset past its stop_after_step: sample nothing from it
+            return
         for key, bucket in self.buckets.items():
             for start_idx in range(0, len(bucket.file_list_idx), self.batch_size):
                 end_idx = min(start_idx + self.batch_size, len(bucket.file_list_idx))
@@ -246,6 +249,25 @@ class BucketsMixin:
                 bucket_key = f"{file_item.width}ms"
                 if bucket_key not in self.buckets:
                     self.buckets[bucket_key] = Bucket(file_item.width, 1)
+                self.buckets[bucket_key].file_list_idx.append(idx)
+                continue
+            if getattr(file_item, 'is_audio_only', False):
+                # A voice item's "image" is a zeros latent placeholder that is never
+                # trained on, so it must NOT go through bucket sizing -- that would
+                # scale it up to the dataset resolution and pay for ~21k video rows of
+                # nothing. Pin it to voice_placeholder_size and bucket by frame count,
+                # which keeps voice items out of image/video batches automatically
+                # (different canvas) and apart from each other by duration (different
+                # frame count, since audio row count is derived from it).
+                file_item.scale_to_width = file_item.width
+                file_item.scale_to_height = file_item.height
+                file_item.crop_x = 0
+                file_item.crop_y = 0
+                file_item.crop_width = file_item.width
+                file_item.crop_height = file_item.height
+                bucket_key = f'voice_{file_item.width}x{file_item.height}x{file_item.num_frames}f'
+                if bucket_key not in self.buckets:
+                    self.buckets[bucket_key] = Bucket(file_item.width, file_item.height)
                 self.buckets[bucket_key].file_list_idx.append(idx)
                 continue
             width = int(file_item.width * file_item.dataset_config.scale)
@@ -506,7 +528,50 @@ class AudioProcessingDTOMixin:
         except Exception as e:
             # if issue with libtorchcodec "Could not load libtorchcodec"
             raise Exception(f"** WARNING ** - Error Processing audio for {self.path}. Error: {e}")
-        
+
+    def load_and_process_voice_item(self: 'FileItemDTO'):
+        """A standalone audio file training as a voice item on a joint video+audio model.
+
+        Unlike load_and_process_audio (whole-model-is-audio, where the waveform IS the
+        tensor), here the audio is the training signal and the video side is a zeros
+        placeholder supplied later by the model. So this sets audio_data and leaves
+        self.tensor as None -- the latent cache path never calls encode_images for
+        these items.
+
+        num_frames was already snapped to the grid at FileItemDTO init, so the bucket
+        key matches what trains. All this does is decode and fit the waveform to the
+        hop-exact sample count for that frame count.
+        """
+        from toolkit.audio.grid import fit_waveform_to_grid
+
+        self.audio_data = None
+        self.audio_tensor = None
+        self.tensor = None
+        try:
+            import torchaudio
+
+            grid = self.audio_grid
+            waveform, sample_rate = torchaudio.load(self.path)  # [channels, samples]
+            waveform = waveform_to_stereo(waveform)
+            if sample_rate != grid.sample_rate:
+                waveform = torchaudio.functional.resample(
+                    waveform, sample_rate, grid.sample_rate
+                )
+            if self.dataset_config.audio_normalize:
+                peak = waveform.abs().max()
+                if peak > 0:
+                    # -0.01 dBFS, matching the video-audio path
+                    waveform = waveform * (0.99885 / peak)
+            # hop-exact: the VAE emits ceil(samples/hop) latents but the model wants
+            # round(frames/fps*rate). Fitting to duration instead would land one latent
+            # off at some frame counts.
+            waveform = fit_waveform_to_grid(waveform, self.num_frames, grid)
+            self.audio_tensor = waveform
+            self.audio_data = {"waveform": waveform, "sample_rate": int(grid.sample_rate)}
+        except Exception as e:
+            raise Exception(f"** WARNING ** - Error Processing voice item {self.path}. Error: {e}")
+
+
 
 class ImageProcessingDTOMixin:
     def get_auto_frame_count(self: 'FileItemDTO', total_frames: int, video_fps: float) -> int:
@@ -915,6 +980,9 @@ class ImageProcessingDTOMixin:
                 return
         if self.is_audio_model:
             self.load_and_process_audio()
+            return
+        if getattr(self, 'is_audio_only', False):
+            self.load_and_process_voice_item()
             return
         if self.is_video:
             self.load_and_process_video(transform, only_load_latents)
@@ -2011,6 +2079,13 @@ class LatentCachingFileItemDTOMixin:
                 item["audio_normalize"] = True
             if self.dataset_config.audio_preserve_pitch:
                 item["audio_preserve_pitch"] = True
+        if getattr(self, 'is_audio_only', False):
+            # a voice item's cache holds a zeros placeholder sized by these, so both
+            # must invalidate it
+            item["audio_only"] = True
+            item["voice_placeholder_size"] = self.dataset_config.voice_placeholder_size
+            if self.dataset_config.audio_normalize:
+                item["audio_normalize"] = True
         if self.is_audio_model:
             item["is_audio_model"] = True
             item["sample_rate"] = self.sample_rate
@@ -2243,6 +2318,9 @@ class LatentCachingMixin:
             first_frame_condition = None
             audio_latent = None
             frames = None
+            # voice items never build a pixel batch (the video VAE is bypassed), but the
+            # cleanup below dels this unconditionally
+            imgs = None
             # add batch dimension
             cache_uint8 = getattr(self.sd, 'cache_latents_as_uint8', False)
             if self.dataset_config.cache_tensors_to_disk:
@@ -2263,8 +2341,23 @@ class LatentCachingMixin:
                         file_item._cached_waveform_int16 = waveform_int16
                         file_item._cached_waveform_sample_rate = sample_rate
             try:
-                imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
-                latent = self.sd.encode_images(imgs).squeeze(0)
+                if getattr(file_item, 'is_audio_only', False):
+                    # Voice item: the video VAE is never touched. The placeholder is
+                    # zeros -- the dataset mean in normalized latent space -- and only
+                    # exists to size the packed sequence and give the audio rows
+                    # something to attend across.
+                    latent = self.sd.make_audio_only_placeholder_latent(
+                        file_item.num_frames, file_item.height, file_item.width
+                    )
+                    if latent is None:
+                        raise ValueError(
+                            f"{self.sd.arch} declares supports_audio_only_items but "
+                            f"make_audio_only_placeholder_latent returned None"
+                        )
+                    latent = latent.to(device, dtype=dtype)
+                else:
+                    imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
+                    latent = self.sd.encode_images(imgs).squeeze(0)
                 if to_disk:
                     if cache_uint8:
                         state_dict['latent'] = _latent_to_uint8(latent).cpu()
@@ -2312,7 +2405,10 @@ class LatentCachingMixin:
                 if to_disk:
                     state_dict['audio_latent'] = audio_latent.clone().detach().cpu()
 
-            if is_video:
+            # voice items are not is_video, but their frame count is what sizes the
+            # audio block -- it has to survive a cache round trip or the reload would
+            # fall back to the dataset default and mismatch the audio rows
+            if is_video or getattr(file_item, 'is_audio_only', False):
                 state_dict['num_frames'] = torch.tensor(file_item.num_frames, dtype=torch.int32)
 
             # save_latent

@@ -100,6 +100,15 @@ export const getSamplePreviewEnabled = async () => {
   return row?.value ? row.value === 'true' : true;
 };
 
+export const getOmniVoiceModelPath = async () => {
+  // TTS weights for voice-clip generation. Machine-level infrastructure, so it lives in
+  // Settings rather than per job. Empty means the feature errors with a clear message
+  // rather than silently starting a multi-GB HuggingFace download.
+  const key = 'OMNIVOICE_MODEL_PATH';
+  const row = await prisma.settings.findFirst({ where: { key: key } });
+  return row?.value && row.value !== '' ? row.value : '';
+};
+
 export const getModelsPath = async () => {
   const key = 'MODELS_PATH';
   let row = await prisma.settings.findFirst({

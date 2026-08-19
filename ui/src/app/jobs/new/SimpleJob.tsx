@@ -11,8 +11,8 @@ import {
   isOstrisBackedQtype,
   parseQtypeAra,
 } from './options';
-import { defaultCompileOptions, defaultDatasetConfig } from './jobConfig';
-import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
+import { defaultCompileOptions, defaultDatasetConfig, defaultVoiceCloneConfig } from './jobConfig';
+import { GroupedSelectOption, JobConfig, SelectOption, VoiceCloneConfig } from '@/types';
 import { objectCopy, tagsToObj, objToTags } from '@/utils/basic';
 import {
   TextInput,
@@ -156,6 +156,18 @@ type Props = {
 
 const isDev = process.env.NODE_ENV === 'development';
 
+// The complete OmniVoice non-verbal vocabulary. Anything outside this renders as literal
+// spoken words, so the dialogue box offers them rather than leaving them to be typed.
+const NON_VERBAL_TAGS = [
+  { tag: '[laughter]', hint: 'laughing' },
+  { tag: '[sigh]', hint: 'sighing' },
+  { tag: '[confirmation-en]', hint: 'mm-hmm / audible yes' },
+  { tag: '[question-en]', hint: 'questioning hum' },
+  { tag: '[surprise-oh]', hint: "surprised 'oh'" },
+  { tag: '[surprise-ah]', hint: "surprised 'ah'" },
+  { tag: '[dissatisfaction-hnn]', hint: "disgruntled 'hnn'" },
+];
+
 export default function SimpleJob({
   jobConfig,
   setJobConfig,
@@ -236,6 +248,7 @@ export default function SimpleJob({
   const vcDialogue = Array.isArray(vc.dialogue) ? vc.dialogue : [];
   const voiceClipCount = Math.max(1, Math.ceil((vc.target_seconds || 0) / 5.167));
   const voiceDialogueRef = useRef<HTMLTextAreaElement>(null);
+  const [voiceAdvanced, setVoiceAdvanced] = useState(false);
   // A voice dataset holds audio-only items: their video side is a zeros placeholder pinned to
   // voice_placeholder_size, never bucketed and never trained on. So resolution, frame count,
   // crop/flip and control pickers are all inert for it -- hide them rather than leave settings
@@ -976,7 +989,7 @@ export default function SimpleJob({
                   onChange={value => setJobConfig(value, 'config.process[0].save.save_with_step_num')}
               />
             </FormGroup>
-          </Card>claude
+          </Card>
         </div>
         <div className={sampleOnly ? 'hidden' : ''}>
           <Card title="Training">
@@ -1530,6 +1543,208 @@ export default function SimpleJob({
           </Card>
         </div>
         <div className={sampleOnly ? 'hidden' : ''}>
+          {modelArch?.additionalSections?.includes('voice_clone') && (
+            <Card title="Clone Voice">
+              <>
+                <Checkbox
+                  label="Generate voice clips before training"
+                  checked={vc.enabled}
+                  onChange={value => {
+                    if (!jobConfig.config.process[0].voice_clone) {
+                      setJobConfig(
+                        { ...defaultVoiceCloneConfig, enabled: value },
+                        'config.process[0].voice_clone',
+                      );
+                    } else {
+                      setJobConfig(value, 'config.process[0].voice_clone.enabled');
+                    }
+                  }}
+                  docKey="voice_clone.enabled"
+                />
+                {vc.enabled && (
+                  <div className="mt-4 space-y-4">
+                    {/* One input on the face: the recording to clone. Everything else has a
+                        working default and lives under Advanced. */}
+                    {vc.mode === 'clone' ? (
+                      <TextInput
+                        label="Reference recording"
+                        value={vc.reference_path}
+                        onChange={value => setJobConfig(value, 'config.process[0].voice_clone.reference_path')}
+                        placeholder="absolute path to a 3-25s audio or video file"
+                        docKey="voice_clone.reference_path"
+                      />
+                    ) : (
+                      <TextInput
+                        label="Voice description"
+                        value={vc.instruct}
+                        onChange={value => setJobConfig(value, 'config.process[0].voice_clone.instruct')}
+                        placeholder="male, young adult, low pitch, british accent"
+                        docKey="voice_clone.instruct"
+                      />
+                    )}
+                    <p className="-mt-2 text-xs text-gray-400">
+                      {voiceClipCount} clips will be generated into{' '}
+                      {vc.target_dataset ? vc.target_dataset.split(/[\\/]/).pop() : <em>a dataset (set one under Advanced)</em>}
+                      , captioned with the job&apos;s trigger word.
+                    </p>
+
+                    <button
+                      type="button"
+                      onClick={() => setVoiceAdvanced(v => !v)}
+                      className="text-xs text-gray-400 hover:text-gray-200 underline"
+                    >
+                      {voiceAdvanced ? 'Hide advanced' : 'Advanced'}
+                    </button>
+
+                    {voiceAdvanced && (
+                    <>
+                    <SelectInput
+                      label="Source"
+                      value={vc.mode}
+                      onChange={value => setJobConfig(value, 'config.process[0].voice_clone.mode')}
+                      options={[
+                        { value: 'clone', label: 'Clone a reference recording' },
+                        { value: 'design', label: 'Design a voice from a description' },
+                      ]}
+                      docKey="voice_clone.mode"
+                    />
+                    {vc.mode === 'clone' && (
+                      <TextInput
+                        label="Reference transcript (optional)"
+                        value={vc.reference_text}
+                        onChange={value => setJobConfig(value, 'config.process[0].voice_clone.reference_text')}
+                        placeholder="leave blank to auto-transcribe with Whisper"
+                      />
+                    )}
+
+                    <SelectInput
+                      label="Write clips into"
+                      value={vc.target_dataset}
+                      onChange={value => setVoiceTargetDataset(value as string)}
+                      options={[{ value: '', label: 'Please select...' }, ...datasetOptions]}
+                      docKey="voice_clone.target_dataset"
+                    />
+                    {vc.target_dataset && (
+                      <p className="-mt-2 text-xs text-gray-400">
+                        Added to Datasets below with Do Audio and Cache Latents to Disk enabled.
+                      </p>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <NumberInput
+                        label={`Voice length (seconds) - ${voiceClipCount} clips`}
+                        value={vc.target_seconds}
+                        onChange={value => setJobConfig(value, 'config.process[0].voice_clone.target_seconds')}
+                        placeholder="60"
+                        docKey="voice_clone.target_seconds"
+                        min={5}
+                      />
+                      <NumberInput
+                        label="Seed"
+                        value={vc.seed}
+                        onChange={value => setJobConfig(value, 'config.process[0].voice_clone.seed')}
+                        placeholder="42"
+                        min={0}
+                      />
+                    </div>
+
+                    <TextInput
+                      label="Caption the voice"
+                      value={vc.voice_description}
+                      onChange={value => setJobConfig(value, 'config.process[0].voice_clone.voice_description')}
+                      placeholder="a man speaking calmly, low pitch"
+                      docKey="voice_clone.voice_description"
+                    />
+                    <TextInput
+                      label="Trigger word"
+                      value={vc.trigger_word}
+                      onChange={value => setJobConfig(value, 'config.process[0].voice_clone.trigger_word')}
+                      placeholder="[trigger] to match your image captions"
+                    />
+
+                    <div>
+                      <div className="flex flex-wrap gap-1 mb-2">
+                        {NON_VERBAL_TAGS.map(t => (
+                          <button
+                            key={t.tag}
+                            type="button"
+                            title={t.hint}
+                            onClick={() => {
+                              // Insert at the caret rather than appending a new line -- the
+                              // dialogue box is one string under the hood (joined by \n), so
+                              // splice the tag into that string at the textarea's own
+                              // selectionStart/End, then split back into the array.
+                              const el = voiceDialogueRef.current;
+                              const full = vcDialogue.join('\n');
+                              const start = el?.selectionStart ?? full.length;
+                              const end = el?.selectionEnd ?? full.length;
+                              const insert = `${t.tag} `;
+                              const nextFull = full.slice(0, start) + insert + full.slice(end);
+                              setJobConfig(
+                                nextFull.split('\n').filter((l: string) => l.trim() !== ''),
+                                'config.process[0].voice_clone.dialogue',
+                              );
+                              const caret = start + insert.length;
+                              requestAnimationFrame(() => {
+                                el?.focus();
+                                el?.setSelectionRange(caret, caret);
+                              });
+                            }}
+                            className="px-2 py-0.5 text-xs rounded bg-gray-700 hover:bg-gray-600 text-gray-200"
+                          >
+                            {t.tag}
+                          </button>
+                        ))}
+                      </div>
+                      <TextAreaInput
+                        ref={voiceDialogueRef}
+                        label="Dialogue (one line per clip, ~13-16 words each)"
+                        value={vcDialogue.join('\n')}
+                        onChange={value =>
+                          setJobConfig(
+                            value.split('\n').filter((l: string) => l.trim() !== ''),
+                            'config.process[0].voice_clone.dialogue',
+                          )
+                        }
+                        placeholder="Leave blank to use the built-in 12-line bank."
+                        docKey="voice_clone.dialogue"
+                        rows={6}
+                      />
+                    </div>
+
+                    </>
+                    )}
+
+                    <div className="rounded bg-gray-800/60 border border-gray-700 p-3">
+                      <p className="text-xs text-gray-300">
+                        Clips are generated <b>when this job starts</b>, as its first step - before the
+                        model loads, so it takes the queue&apos;s GPU slot and cannot collide with another
+                        training run. Nothing happens at the moment you press anything here.
+                      </p>
+                      <div className="flex items-center gap-3 mt-3">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setJobConfig(String(Date.now()), 'config.process[0].voice_clone.regenerate_token')
+                          }
+                          className="px-3 py-1.5 text-sm rounded bg-orange-800 hover:bg-orange-700 text-white"
+                        >
+                          Rebuild clips on next run
+                        </button>
+                        <span className="text-xs text-gray-400">
+                          {vc.regenerate_token
+                            ? 'Queued: existing clips will be deleted and rebuilt the next time this job runs.'
+                            : 'Not needed for a first run - clips are created automatically if the folder has none. Use this only to force a rebuild after changing a setting.'}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </>
+            </Card>
+          )}
+        </div>
+        <div className={sampleOnly ? 'hidden' : ''}>
           <Card title="Datasets">
             <>
               {jobConfig.config.process[0].datasets.map((dataset, i) => (
@@ -1563,6 +1778,13 @@ export default function SimpleJob({
                     </button>
                   </div>
                   <h2 className="text-lg font-bold mb-4">Dataset {i + 1}</h2>
+                  {isVoiceDataset(dataset) && (
+                    <p className="-mt-3 mb-4 text-xs text-gray-400">
+                      Voice dataset. Its clips train the audio stream only &mdash; the video side is a
+                      zeros placeholder with its loss zeroed &mdash; so resolution, frame count, cropping
+                      and control settings do not apply and are hidden.
+                    </p>
+                  )}
                   <div className={datasetStyleClass}>
                     <div>
                       <SelectInput
@@ -1571,7 +1793,7 @@ export default function SimpleJob({
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].folder_path`)}
                         options={[{ value: defaultDatasetConfig.folder_path, label: 'Please select...' }, ...datasetOptions]}
                       />
-                      {modelArch?.additionalSections?.includes('datasets.control_path') && (
+                      {modelArch?.additionalSections?.includes('datasets.control_path') && !isVoiceDataset(dataset) && (
                         <SelectInput
                           label="Control Dataset"
                           docKey="datasets.control_path"
@@ -1583,7 +1805,7 @@ export default function SimpleJob({
                           options={[{ value: '', label: 'None' }, ...datasetOptions]}
                         />
                       )}
-                      {modelArch?.additionalSections?.includes('datasets.multi_control_paths') && (
+                      {modelArch?.additionalSections?.includes('datasets.multi_control_paths') && !isVoiceDataset(dataset) && (
                         <>
                           <SelectInput
                             label="Control Dataset 1"
@@ -1684,7 +1906,7 @@ export default function SimpleJob({
                         ]}
                       />
 
-                      {modelArch?.additionalSections?.includes('datasets.num_frames') && !dataset.auto_frame_count && (
+                      {modelArch?.additionalSections?.includes('datasets.num_frames') && !dataset.auto_frame_count && !isVoiceDataset(dataset) && (
                         <NumberInput
                           label="Num Frames"
                           className="pt-2"
@@ -1711,7 +1933,7 @@ export default function SimpleJob({
                           checked={dataset.is_reg || false}
                           onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].is_reg`)}
                         />
-                        {modelArch?.additionalSections?.includes('datasets.auto_frame_count') && (
+                        {modelArch?.additionalSections?.includes('datasets.auto_frame_count') && !isVoiceDataset(dataset) && (
                           <Checkbox
                             label="Auto Frame Count"
                             checked={dataset.auto_frame_count || false}
@@ -1719,7 +1941,7 @@ export default function SimpleJob({
                             docKey="datasets.auto_frame_count"
                           />
                         )}
-                        {modelArch?.additionalSections?.includes('datasets.do_i2v') && (
+                        {modelArch?.additionalSections?.includes('datasets.do_i2v') && !isVoiceDataset(dataset) && (
                           <Checkbox
                             label="Do I2V"
                             checked={dataset.do_i2v || false}
@@ -1755,7 +1977,7 @@ export default function SimpleJob({
                             docKey="datasets.audio_normalize"
                           />
                         )}
-                        {modelArch?.additionalSections?.includes('datasets.audio_preserve_pitch') && (
+                        {modelArch?.additionalSections?.includes('datasets.audio_preserve_pitch') && !isVoiceDataset(dataset) && (
                           <Checkbox
                             label="Audio Preserve Pitch"
                             checked={dataset.audio_preserve_pitch || false}
@@ -1770,7 +1992,7 @@ export default function SimpleJob({
                           />
                         )}
                       </FormGroup>
-                      {!isAudioModel && (
+                      {!isAudioModel && !isVoiceDataset(dataset) && (
                         <FormGroup label="Flipping" docKey={'datasets.flip'} className="mt-2">
                           <Checkbox
                             label={
@@ -1793,7 +2015,7 @@ export default function SimpleJob({
                         </FormGroup>
                       )}
                     </div>
-                    {!isAudioModel && (
+                    {!isAudioModel && !isVoiceDataset(dataset) && (
                       <div>
                         <FormGroup label="Resolutions" className="pt-2">
                           <div className="grid grid-cols-2 gap-2">

@@ -63,7 +63,7 @@ from tqdm import tqdm
 
 from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, NetworkConfig, TrainConfig, ModelConfig, \
     GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
-    DecoratorConfig
+    DecoratorConfig, VoiceCloneConfig
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model
@@ -111,6 +111,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.network_config = None
         self.train_config = TrainConfig(**self.get_conf('train', {}))
+        # optional TTS-generated voice clips; see hook_before_model_load
+        self.voice_clone_config = VoiceCloneConfig(**self.get_conf('voice_clone', {}))
         model_config = self.get_conf('model', {})
         self.modules_being_trained: List[torch.nn.Module] = []
 
@@ -843,8 +845,35 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
     # Called before the model is loaded
     def hook_before_model_load(self):
-        # override in subclass
-        pass
+        self.generate_voice_clips_if_needed()
+
+    def generate_voice_clips_if_needed(self):
+        """Generate TTS voice clips into a dataset folder, before anything else loads.
+
+        Deliberately the FIRST thing in run(): a bad reference path or a missing package
+        fails in seconds rather than after the diffusion model quantizes, the TTS model is
+        released before that model touches the GPU (no VRAM overlap), and the clips land
+        on disk before the dataloader scans the folder, so they are picked up as ordinary
+        voice items with no special-casing.
+
+        A no-op on every run after the first -- see toolkit/voice_clone/manifest.py.
+        """
+        cfg = getattr(self, 'voice_clone_config', None)
+        if cfg is None or not cfg.enabled:
+            return
+        from toolkit.util.get_model import get_model_class
+        from toolkit.voice_clone import ensure_voice_clips
+
+        # The grid comes from the model class, not an instance -- nothing is loaded yet,
+        # and get_audio_grid only reads packing constants.
+        ModelClass = get_model_class(self.model_config)
+        grid = ModelClass.get_audio_grid()
+        if grid is None:
+            raise ValueError(
+                f"voice_clone is enabled but {self.model_config.arch} does not support "
+                f"audio-only training items."
+            )
+        ensure_voice_clips(cfg, grid, print_fn=print_acc)
 
     def hook_after_model_load(self):
         # override in subclass
@@ -2958,7 +2987,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 if self.progress_bar is not None:
                                     self.progress_bar.pause()
                                 dataloader_iterator_reg = iter(dataloader_reg)
-                                trigger_dataloader_setup_epoch(dataloader_reg)
+                                trigger_dataloader_setup_epoch(dataloader_reg, self.step_num)
 
                             with self.timer('get_batch:reg'):
                                 batch = next(dataloader_iterator_reg)
@@ -2975,7 +3004,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 if self.progress_bar is not None:
                                     self.progress_bar.pause()
                                 dataloader_iterator = iter(dataloader)
-                                trigger_dataloader_setup_epoch(dataloader)
+                                trigger_dataloader_setup_epoch(dataloader, self.step_num)
                                 self.epoch_num += 1
                                 if self.train_config.gradient_accumulation_steps == -1:
                                     # if we are accumulating for an entire epoch, trigger a step

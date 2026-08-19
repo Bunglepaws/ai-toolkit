@@ -36,6 +36,12 @@ export const handleModelArchChange = (
   // update the defaults when a model is selected
   const newArch = modelArchs.find(model => model.name === newArchName);
 
+  // voice_clone only exists on archs that declare it. Left behind on a switch it leaks a
+  // stale block into saved configs, so disable it rather than carrying it silently.
+  if (!newArch?.additionalSections?.includes('voice_clone')) {
+    setJobConfig(false, 'config.process[0].voice_clone.enabled');
+  }
+
   // update vram setting
   if (!newArch?.additionalSections?.includes('model.low_vram')) {
     setJobConfig(false, 'config.process[0].model.low_vram');

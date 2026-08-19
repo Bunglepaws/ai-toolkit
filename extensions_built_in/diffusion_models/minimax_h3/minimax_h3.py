@@ -114,6 +114,41 @@ COMFY_FILES = {
 # tokenizer/processor/text-encoder config come from the original repo (tiny files)
 ORIGINAL_REPO = "MiniMaxAI/MiniMax-H3"
 
+# Ceiling on a still reference image handed to Qwen3-VL. Vision tokens scale with
+# pixel count and attention scales with the SQUARE of the token count, so an
+# uncapped reference is an OOM waiting to happen: a 3840x2880 sample reference
+# asked for a single 27.98 GiB SDPA allocation on a 32 GiB card, while a
+# 1440x1440 one on the same card was fine.
+#
+# Dataset control images never reach this — the bucketer has already sized them
+# — so in practice this only bites sample references, which are read off disk at
+# whatever resolution they were uploaded at.
+#
+# 2.4 MP is deliberately above 1920x1080 (2.07 MP) so ordinary HD references pass
+# through untouched and this stays a safety valve rather than a silent change to
+# anyone's conditioning.
+MAX_REF_IMAGE_PIXELS = 2_400_000
+
+
+def _cap_reference_image(img: "Image.Image") -> "Image.Image":
+    """Downscale a reference image that would blow up the text encoder.
+
+    Aspect ratio is preserved and images already under the cap are returned
+    untouched — this never upscales.
+    """
+    w, h = img.size
+    total = w * h
+    if total <= MAX_REF_IMAGE_PIXELS:
+        return img
+    scale = (MAX_REF_IMAGE_PIXELS / total) ** 0.5
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    print(
+        f" - reference image {w}x{h} exceeds {MAX_REF_IMAGE_PIXELS/1e6:.1f}MP cap; "
+        f"downscaling to {new_w}x{new_h} for the text encoder"
+    )
+    return img.resize((new_w, new_h), Image.BICUBIC)
+
 
 def new_save_image_function(
     self: GenerateImageConfig, image, count=0, max_count=0, **kwargs
@@ -180,6 +215,10 @@ class MinimaxH3Model(BaseModel):
         self.is_flow_matching = True
         self.is_transformer = True
         self.target_lora_modules = ["MiniMaxH3Transformer"]
+        # standalone .wav/.mp3 items train the audio stream against a zeros video
+        # placeholder. Audio rows run through the same blocks as video, so the LoRA
+        # trains on them; only the video loss is zeroed.
+        self.supports_audio_only_items = True
         self.supports_model_paths = True
         # keyframes ride into the Qwen3-VL conditioning as vision blocks, so
         # sampling (and control_path datasets) pass control images to
@@ -209,6 +248,32 @@ class MinimaxH3Model(BaseModel):
     @staticmethod
     def get_train_scheduler():
         return CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
+
+    @classmethod
+    def get_audio_grid(cls):
+        # 17n+5 for n>=1: 22, 39, 56, 73, 90, 107, 124 frames. The 5-frame slot is
+        # excluded -- 0.208 s of voice is not worth a training item.
+        from toolkit.audio.grid import AudioGrid
+        counts = tuple(
+            packing.FRAMES_PER_CHUNK * n + packing.LATENTS_PER_CHUNK
+            for n in range(1, 8)
+        )
+        return AudioGrid(
+            frame_counts=counts,
+            fps=packing.FPS,
+            sample_rate=packing.AUDIO_SAMPLE_RATE,
+            latents_per_second=packing.AUDIO_LATENTS_PER_SECOND,
+        )
+
+    def make_audio_only_placeholder_latent(self, num_frames: int, height: int, width: int):
+        # (24, t_lat, h/16, w/16) of zeros. Never touches the video VAE.
+        return torch.zeros(
+            24,
+            packing.video_latent_num_frames(num_frames),
+            max(1, height // 16),
+            max(1, width // 16),
+            dtype=torch.float32,
+        )
 
     def get_bucket_divisibility(self):
         # 16x VAE spatial compression * 2x2 transformer patch
@@ -1183,6 +1248,10 @@ class MinimaxH3Model(BaseModel):
                     )
                 else:
                     pil_images.append(img)
+            pil_images = [
+                _cap_reference_image(im) if isinstance(im, Image.Image) else im
+                for im in pil_images
+            ]
             if len(pil_images) == 1:
                 keyframes_per_prompt = [pil_images] * len(prompt)
             elif len(pil_images) == len(prompt):

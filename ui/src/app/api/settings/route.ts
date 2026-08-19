@@ -77,6 +77,7 @@ export async function POST(request: Request) {
       HF_TOKEN, GEMMA_API_KEY, GEMMA_API_MODEL_ID_SOURCE, TRAINING_FOLDER, DATASETS_FOLDER, QUANTIZATION_CACHE_DIR, MODELS_PATH,
       CHECK_CONFIG_API_BASE_URL, CHECK_CONFIG_API_KEY, CHECK_CONFIG_MODEL,
       CHECK_CONFIG_ENABLE_WEB_SEARCH, ENABLE_HOT_MODEL_RELOAD, AITK_SAMPLE_PREVIEW,
+      OMNIVOICE_MODEL_PATH,
     } = body;
 
     const upsert = (key: string, value: string) =>
@@ -97,6 +98,7 @@ export async function POST(request: Request) {
       upsert('CHECK_CONFIG_ENABLE_WEB_SEARCH', CHECK_CONFIG_ENABLE_WEB_SEARCH ?? 'false'),
       upsert('ENABLE_HOT_MODEL_RELOAD', ENABLE_HOT_MODEL_RELOAD ?? 'true'),
       upsert('AITK_SAMPLE_PREVIEW', AITK_SAMPLE_PREVIEW ?? 'true'),
+      upsert('OMNIVOICE_MODEL_PATH', OMNIVOICE_MODEL_PATH ?? ''),
     ]);
 
     flushCache();

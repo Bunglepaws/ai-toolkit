@@ -33,6 +33,7 @@ printed_messages = []
 # keep in sync with video_extensions in toolkit/data_loader.py (importing it
 # here would be circular)
 video_extensions = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
+audio_extensions = ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a']
 
 
 def print_once(msg):
@@ -65,6 +66,17 @@ class FileItemDTO(
         self.is_video = dataset_is_video and os.path.splitext(self.path)[1].lower() in video_extensions
         self.is_audio_model = kwargs.get("is_audio_model", False)
         self.sample_rate = kwargs.get("sample_rate", 48000)
+        # audio-only "voice" item: a standalone audio file in a video dataset, for a
+        # model that trains audio jointly. Its audio is the training signal; the video
+        # side is a zeros placeholder whose loss is zeroed (see audio_grid below and
+        # load_and_process_voice_item). Distinct from is_audio_model, where the whole
+        # model is audio and there is no video side at all.
+        self.audio_grid = kwargs.get("audio_grid", None)
+        self.is_audio_only = (
+            not self.is_audio_model
+            and self.audio_grid is not None
+            and os.path.splitext(self.path)[1].lower() in audio_extensions
+        )
         self.num_frames = self.dataset_config.num_frames if self.is_video else 1
         self.temporal_compression = kwargs.get("temporal_compression", 8)
         # module-level function (picklable) for models whose valid frame
@@ -117,6 +129,33 @@ class FileItemDTO(
                     s = c.streams.audio[0]
                     w = int(float(s.duration * s.time_base) * 1_000)
             h = 1
+        elif self.is_audio_only:
+            # duration decides the frame count, and the frame count decides everything
+            # else. Read it here (not at load time) so the bucket key carries the count
+            # this item will actually train at.
+            with av.open(self.path) as c:
+                if c.duration is not None:
+                    duration_s = float(c.duration) / 1_000_000.0
+                else:
+                    s = c.streams.audio[0]
+                    duration_s = float(s.duration * s.time_base)
+            frames = self.audio_grid.snap_down(duration_s)
+            if frames is None:
+                raise Exception(
+                    f"{os.path.basename(self.path)}: {duration_s:.3f} s of audio is "
+                    f"shorter than the smallest voice slot "
+                    f"({self.audio_grid.seconds_for_frames(self.audio_grid.frame_counts[0]):.3f} s). "
+                    f"Valid lengths are {self.audio_grid.durations_text()}."
+                )
+            if abs(duration_s - self.audio_grid.seconds_for_frames(frames)) > 0.025:
+                print_once(
+                    f"Voice items: snapping audio down to the frame grid, e.g. "
+                    f"{os.path.basename(self.path)} {duration_s:.3f}s -> "
+                    f"{self.audio_grid.seconds_for_frames(frames):.3f}s ({frames} frames)"
+                )
+            self.num_frames = frames
+            # the placeholder canvas -- these pixels are never trained on
+            w = h = max(1, int(self.dataset_config.voice_placeholder_size))
         elif self.is_video:
             # video entries also carry (total_frames, fps); older 3-item entries
             # get re-read and upgraded here
@@ -185,6 +224,13 @@ class FileItemDTO(
         self.flip_y: bool = kwargs.get("flip_x", False)
         self.augments: List[str] = self.dataset_config.augments
         self.loss_multiplier: float = self.dataset_config.loss_multiplier
+        if self.is_audio_only:
+            # A voice item's video "content" is a zeros placeholder, so its video loss
+            # must not train. This per-item multiplier is applied to the reduced video
+            # loss in SDTrainer BEFORE the audio term is added, so the audio loss --
+            # the whole point of the item -- is untouched. Verified against 5D H3
+            # batches; see scratchpad/a4_spike.py in the plan notes.
+            self.loss_multiplier = 0.0
 
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
@@ -281,10 +327,15 @@ class DataLoaderBatchDTO:
                 or self.file_items[0].dataset_config.cache_tensors_to_disk
             ):
                 # only return a tensor if latents are not cached, or if we are explicitly
-                # loading the raw image alongside the cached latents
-                self.tensor: torch.Tensor = torch.cat(
-                    [x.tensor.unsqueeze(0) for x in self.file_items]
-                )
+                # loading the raw image alongside the cached latents.
+                # Voice items have no pixels at all -- their video side is a zeros latent
+                # placeholder built by the model, never encoded from an image -- so they
+                # contribute no tensor. Bucketing keeps them in their own batches, so this
+                # is all-or-nothing rather than a partial mix.
+                if not any(getattr(x, 'is_audio_only', False) for x in self.file_items):
+                    self.tensor: torch.Tensor = torch.cat(
+                        [x.tensor.unsqueeze(0) for x in self.file_items]
+                    )
             # if we have encoded latents, we concatenate them
             self.latents: Union[torch.Tensor, None] = None
             if is_latents_cached:

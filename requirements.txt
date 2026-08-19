@@ -1,2 +1,6 @@
 -r requirements_base.txt
 scipy==1.12.0
+
+# voice-clip generation for joint video+audio models (toolkit/voice_clone)
+omnivoice
+soundfile

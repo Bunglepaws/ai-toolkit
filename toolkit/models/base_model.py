@@ -199,6 +199,11 @@ class BaseModel:
         self.use_raw_control_images = False
         # defines if the model supports model paths. Only some will
         self.supports_model_paths = False
+        # standalone audio files (.wav/.mp3/...) in a video dataset become
+        # audio-only "voice" items: real audio latents against a zeros video
+        # placeholder, with the video loss zeroed. See get_audio_grid and
+        # make_audio_only_placeholder_latent below.
+        self.supports_audio_only_items = False
         
         # use new lokr format (default false for old models for backwards compatibility)
         self.use_old_lokr_format = True
@@ -674,6 +679,19 @@ class BaseModel:
                         conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
                         unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
                     else:
+                        # Live encoding needs a real text encoder. If it was already
+                        # unloaded there is nothing to fall back to, so say why instead
+                        # of letting the model's encoder trip over the stub with a
+                        # bare "'FakeTextEncoder' object has no attribute 'model'".
+                        from toolkit.unloader import FakeTextEncoder
+                        _te = getattr(self, 'text_encoder', None)
+                        _te_list = _te if isinstance(_te, list) else [_te]
+                        if any(isinstance(t, FakeTextEncoder) for t in _te_list):
+                            raise RuntimeError(
+                                f"Cannot encode sample prompt {i}: the text encoder has been "
+                                "unloaded (cache_text_embeddings) and this prompt has no cached "
+                                "embeds. Restart the job to re-cache the sample prompts."
+                            )
                         ctrl_img = None
                         has_control_images = False
                         if gen_config.ctrl_img is not None or gen_config.ctrl_img_1 is not None or gen_config.ctrl_img_2 is not None or gen_config.ctrl_img_3 is not None:
@@ -1787,6 +1805,24 @@ class BaseModel:
         # can be overridden in child classes to condition latents before noise prediction
         return latents
     
+    @classmethod
+    def get_audio_grid(cls):
+        # override in models with supports_audio_only_items. Returns a
+        # toolkit.audio.grid.AudioGrid describing the legal durations a standalone
+        # audio file may train at, built from the model's own packing constants so
+        # they stay the single source of truth.
+        return None
+
+    def make_audio_only_placeholder_latent(self, num_frames: int, height: int, width: int):
+        # override in models with supports_audio_only_items. Returns the video latent a
+        # voice item trains against -- zeros, which is the dataset mean in normalized
+        # latent space. It is never a stand-in for missing footage: its only jobs are to
+        # size the packed sequence (the latent frame count drives the audio row count)
+        # and to give the audio rows something to attend across. The video loss for
+        # these items is zeroed via the per-item loss_multiplier.
+        # height/width are in PIXELS; the model converts to its own latent geometry.
+        return None
+
     def get_transformer_block_names(self) -> Optional[List[str]]:
         # override in child classes to get transformer block names for lora targeting
         return None

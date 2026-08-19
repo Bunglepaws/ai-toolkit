@@ -136,6 +136,8 @@ export interface DatasetConfig {
   control_path_2?: string | null;
   control_path_3?: string | null;
   auto_frame_count?: boolean;
+  voice_placeholder_size?: number;
+  stop_after_step?: number | null;
 }
 
 export interface EMAConfig {
@@ -289,6 +291,25 @@ export interface SliderConfig {
   anchor_class?: string | null;
 }
 
+export interface VoiceCloneConfig {
+  enabled: boolean;
+  mode: 'clone' | 'design';
+  reference_path: string;
+  reference_text: string;
+  instruct: string;
+  voice_seed_path: string;
+  target_dataset: string;
+  target_seconds: number;
+  duration_mix: 'long' | 'even' | 'short';
+  voice_description: string;
+  trigger_word: string;
+  dialogue: string[];
+  backend: string;
+  seed: number;
+  // nonce, not a boolean -- a checkbox would re-run on every resume
+  regenerate_token: string;
+}
+
 export interface ProcessConfig {
   type: string;
   sqlite_db_path?: string;
@@ -304,6 +325,7 @@ export interface ProcessConfig {
   logging: LoggingConfig;
   model: ModelConfig;
   sample: SampleConfig;
+  voice_clone?: VoiceCloneConfig;
 }
 
 export interface ConfigObject {

@@ -46,7 +46,8 @@ type AdditionalSections =
   | 'model.te_name_or_path'
   | 'model.unconditional_lora_path'
   | 'model.model_kwargs.kv_cache'
-  | 'ideogram_4_prompt';
+  | 'ideogram_4_prompt'
+  | 'voice_clone';
 
 type ModelGroup = 'image' | 'instruction' | 'video' | 'experimental' | 'audio';
 
@@ -807,6 +808,7 @@ export const modelArchs: ModelArch[] = [
       'datasets.auto_frame_count',
       'model.assistant_lora_path',
       'sample.minimax_h3_turbo_lora',
+      'voice_clone',
     ],
     customModelSelectOptions: [
       {

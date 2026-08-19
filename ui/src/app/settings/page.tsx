@@ -232,6 +232,26 @@ export default function Settings() {
                 </div>
 
                 <div>
+                  <label htmlFor="OMNIVOICE_MODEL_PATH" className="block text-sm font-medium mb-2">
+                    OmniVoice Model Path
+                    <div className="text-gray-500 text-sm ml-1">
+                      TTS weights used by Clone Voice to generate voice training clips. Must be an absolute path to a
+                      local OmniVoice checkpoint folder. If blank, Clone Voice will refuse to run rather than
+                      downloading several gigabytes on its own.
+                    </div>
+                  </label>
+                  <input
+                    type="text"
+                    id="OMNIVOICE_MODEL_PATH"
+                    name="OMNIVOICE_MODEL_PATH"
+                    value={settings.OMNIVOICE_MODEL_PATH}
+                    onChange={handleChange}
+                    className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
+                    placeholder="e.g. M:\models\omnivoice\OmniVoice-bf16"
+                  />
+                </div>
+
+                <div>
                   <label className="flex items-start gap-3 cursor-pointer">
                     <input
                       type="checkbox"

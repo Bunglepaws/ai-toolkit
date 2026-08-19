@@ -3,6 +3,89 @@ import { ConfigDoc } from '@/types';
 import { IoFlaskSharp } from 'react-icons/io5';
 
 const docs: { [key: string]: ConfigDoc } = {
+  'voice_clone.enabled': {
+    title: 'Clone Voice',
+    description: (
+      <>
+        Generates voice training clips with a TTS model before training starts, so the LoRA learns a voice as well as a
+        look. It runs once: the clips are written into a dataset folder and reused on every resume. Needs the OmniVoice
+        model path set in Settings, and the target dataset must have <b>Do Audio</b> and <b>Cache Latents to Disk</b>
+        enabled.
+      </>
+    ),
+  },
+  'voice_clone.mode': {
+    title: 'Source',
+    description: (
+      <>
+        <b>Clone</b> copies a real speaker from a 3-25 second recording. <b>Design</b> invents a voice from a
+        description: it generates one seed clip first and clones the rest from it, because two calls with the same
+        description are not guaranteed to give the same voice - without that step a dataset can end up being several
+        different speakers averaged together.
+      </>
+    ),
+  },
+  'voice_clone.reference_path': {
+    title: 'Reference recording',
+    description: (
+      <>
+        Audio or video, 3-25 seconds. It only conditions the TTS - it is never trained on, and does not count toward the
+        voice length.
+      </>
+    ),
+  },
+  'voice_clone.instruct': {
+    title: 'Voice description',
+    description: (
+      <>
+        Comma separated attributes, one per category: gender (male, female), age (child, teenager, young adult,
+        middle-aged, elderly), pitch (very low to very high), style (whisper), and an accent such as american or
+        british. Omit anything you do not care about.
+      </>
+    ),
+  },
+  'voice_clone.target_dataset': {
+    title: 'Write clips into',
+    description: (
+      <>
+        A dataset folder for the generated clips. Keeping them separate from your images lets the voice be retired
+        independently once it converges. Selecting it here <b>adds it to Datasets below automatically</b>, with Do Audio
+        and Cache Latents to Disk enabled - generating clips into a folder no dataset references would otherwise train
+        nothing, silently.
+      </>
+    ),
+  },
+  'voice_clone.target_seconds': {
+    title: 'Voice length',
+    description: (
+      <>
+        Total generated audio, cut into 5.167 second clips (the longest length H3 accepts), so 60 seconds gives 12
+        clips. Around 45-50 seconds has been enough in practice and two minutes is a comfortable ceiling. Generation is
+        fast, so raising this costs training steps rather than wall time.
+      </>
+    ),
+  },
+  'voice_clone.voice_description': {
+    title: 'Caption the voice',
+    description: (
+      <>
+        Describes the voice, not a picture - &quot;a man speaking calmly, low pitch&quot;. It leads every generated
+        caption, followed by the words actually spoken.
+      </>
+    ),
+  },
+  'voice_clone.dialogue': {
+    title: 'Dialogue',
+    description: (
+      <>
+        One utterance per line, roughly 13-16 words each so it fills a 5 second clip without sounding rushed or slowed.
+        Lines are used in order and cycled if there are fewer than the clip count. The bracket tags are the only
+        non-verbal sounds the model knows - anything else is spoken aloud as a literal word. Tags are stripped from the
+        caption and replaced with plain language.
+      </>
+    ),
+  },
+
   'config.name': {
     title: 'Training Name',
     description: (
