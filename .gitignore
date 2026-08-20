@@ -191,6 +191,13 @@ cython_debug/
 aitk_db.db
 aitk_db.db-wal
 aitk_db.db-shm
+# dated safety snapshots taken before schema changes, plus their -wal/-shm siblings.
+# The aitk_db*.db pattern above does not catch these: they end in the timestamp, not .db
+aitk_db.db.bak-*
+# stray root-level node_modules (ui/ has its own rule); nothing should install here
+/node_modules/
+# JetBrains config for the WSL-side project
+.ideaWSL/
 /notes.md
 /data
 .claude
