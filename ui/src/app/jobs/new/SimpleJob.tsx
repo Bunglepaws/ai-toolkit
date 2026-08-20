@@ -249,6 +249,32 @@ export default function SimpleJob({
   const voiceClipCount = Math.max(1, Math.ceil((vc.target_seconds || 0) / 5.167));
   const voiceDialogueRef = useRef<HTMLTextAreaElement>(null);
   const [voiceAdvanced, setVoiceAdvanced] = useState(false);
+  // What is actually in the target folder. Generation happens inside the training job, so
+  // nothing here observes it -- without this the card cannot tell "never generated" from
+  // "already generated and current", which is what made the rebuild button look inert.
+  const [voiceManifest, setVoiceManifest] = useState<{
+    exists: boolean;
+    count: number;
+    missing?: number;
+  } | null>(null);
+  useEffect(() => {
+    if (!vc.enabled || !vc.target_dataset) {
+      setVoiceManifest(null);
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/datasets/voice-manifest?path=${encodeURIComponent(vc.target_dataset)}`)
+      .then(r => r.json())
+      .then(d => {
+        if (!cancelled) setVoiceManifest(d);
+      })
+      .catch(() => {
+        if (!cancelled) setVoiceManifest(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [vc.enabled, vc.target_dataset]);
   // A voice dataset holds audio-only items: their video side is a zeros placeholder pinned to
   // voice_placeholder_size, never bucketed and never trained on. So resolution, frame count,
   // crop/flip and control pickers are all inert for it -- hide them rather than leave settings
@@ -1656,10 +1682,14 @@ export default function SimpleJob({
                       docKey="voice_clone.voice_description"
                     />
                     <TextInput
-                      label="Trigger word"
+                      label="Trigger word (optional)"
                       value={vc.trigger_word}
                       onChange={value => setJobConfig(value, 'config.process[0].voice_clone.trigger_word')}
-                      placeholder="[trigger] to match your image captions"
+                      placeholder={
+                        jobConfig.config.process[0].trigger_word
+                          ? `inherits "${jobConfig.config.process[0].trigger_word}" from the job`
+                          : 'leave blank to use the job trigger word'
+                      }
                     />
 
                     <div>
@@ -1734,7 +1764,11 @@ export default function SimpleJob({
                         <span className="text-xs text-gray-400">
                           {vc.regenerate_token
                             ? 'Queued: existing clips will be deleted and rebuilt the next time this job runs.'
-                            : 'Not needed for a first run - clips are created automatically if the folder has none. Use this only to force a rebuild after changing a setting.'}
+                            : voiceManifest?.exists
+                              ? `${voiceManifest.count} clip${voiceManifest.count === 1 ? '' : 's'} already generated${
+                                  voiceManifest.missing ? ` (${voiceManifest.missing} missing from disk)` : ''
+                                } - press this only to force a rebuild.`
+                              : 'No clips yet - they are created automatically the first time this job runs. This button is only for forcing a rebuild.'}
                         </span>
                       </div>
                     </div>

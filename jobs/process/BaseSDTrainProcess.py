@@ -136,6 +136,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.data_loader: Union[DataLoader, None] = None
         self.data_loader_reg: Union[DataLoader, None] = None
         self.trigger_word = self.get_conf('trigger_word', None)
+        # Voice captions lead with the trigger, same as image captions. Inherit the job's
+        # rather than asking for it twice -- mirrors the per-dataset inheritance below.
+        if not self.voice_clone_config.trigger_word and self.trigger_word is not None:
+            self.voice_clone_config.trigger_word = self.trigger_word
 
         self.guidance_config: Union[GuidanceConfig, None] = None
         guidance_config_raw = self.get_conf('guidance', None)
