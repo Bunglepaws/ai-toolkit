@@ -3,8 +3,19 @@
 Lines are written to take roughly 5 seconds to speak, matching the 5.167 s grid slot so
 the TTS `duration` conditioning barely has to stretch or compress the delivery. Clips are
 taken IN ORDER, as many as the length setting needs -- 60 s takes all 12, 30 s takes the
-first 6 -- so the first six are ordered to stand alone, with the non-verbal tags spread
-across them rather than clustered at the end.
+first 6 -- so the first six are ordered to stand alone.
+
+**No line here opens with a non-verbal tag, deliberately.** A tag at the START of a clip
+puts a laugh/grunt/sigh at the start of nearly every training item, and the LoRA learns
+that as part of the voice -- every generation then wants to open with the same noise.
+Observed in practice and it is very audible.
+
+Tags are also kept SPARSE: two out of twelve lines, mid-sentence or trailing. The long
+breathy tags are the dangerous ones -- a `[sigh]` or `[surprise-oh]` renders as ~1.9 s of
+broadband noise, which in a ~5 s slot is nearly 40% of the clip, and that much non-speech
+in a training item bleeds into the cloned voice itself. Short tags (`[laughter]`,
+`[confirmation-en]`, `[question-en]`) measured ~0.3-0.4 s and are harmless. `split_tags`
+finds tags anywhere in the line, so mid-sentence and end-of-line placement both work.
 
 Keep edited lines in the 13-16 word range. Much shorter and `duration` stretches them into
 absurdly slow speech; much longer and they compress into a rush. This is a quality
@@ -85,16 +96,16 @@ def split_tags(line: str) -> Tuple[List[str], str]:
 # ---------------------------------------------------------------------------
 DEFAULT_DIALOGUE: List[str] = [
     "Alright boys, hit the showers. You've earned every bit of that one out there today.",
-    "[laughter] Nice work, big guy. I honestly didn't think you had that last set in you.",
+    "Nice work, big guy. [laughter] I honestly didn't think you had that last set in you.",
     "Come here a second, let me get a look at that shoulder before you take off.",
-    "[confirmation-en] Yeah, that's it. Slow, controlled, all the way down. Just like that.",
+    "Yeah, that's it. Slow, controlled, all the way down. Just like that, perfect.",
     "You've been holding out on me. Where's all of this been hiding lately, huh?",
-    "[sigh] You're going to be the death of me one day, you know that, right?",
+    "You're going to be the death of me one day, you know that, right? [sigh]",
     "Towel off and come meet me in my office, we've got some things to talk about.",
-    "[surprise-oh] Well now, somebody's been putting in the extra work over the summer.",
+    "Well now, somebody's been putting in the extra work over the summer, haven't they?",
     "Chin up, chest out, own the room. That's how a champion walks in here.",
     "Lock the door behind you, I don't want anybody walking in on this tonight.",
-    "[question-en] You sure you can handle another round, or do you need a minute first?",
+    "You sure you can handle another round, or do you need a minute first?",
     "Good boy. That's exactly what I've been wanting to see out of you.",
 ]
 

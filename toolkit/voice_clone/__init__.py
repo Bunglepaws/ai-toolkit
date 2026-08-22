@@ -85,7 +85,11 @@ def _caption(line: str, voice_description: str, trigger_word: str) -> str:
     phrases, spoken = split_tags(line)
     bits = []
     if trigger_word:
-        bits.append(trigger_word.strip())
+        # Write the ``[trigger]`` PLACEHOLDER, not the resolved word. That is the
+        # convention the image datasets already use, and the dataset's own
+        # trigger_word substitutes it at caption-load time -- so changing the job's
+        # trigger does not leave a stale name baked into every voice caption on disk.
+        bits.append("[trigger]")
     if voice_description:
         bits.append(voice_description.strip())
     bits.extend(phrases)
