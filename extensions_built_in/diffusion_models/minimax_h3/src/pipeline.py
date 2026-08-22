@@ -126,8 +126,15 @@ class MiniMaxH3Pipeline:
             if isinstance(r, dict):
                 lat = r["latent"]
                 a = r.get("audio_rows")
-                a_lat = int(a.shape[0]) // 2 if a is not None else 0
-                ref_blocks.append((lat.shape[1], lat.shape[2], lat.shape[3], a_lat))
+                # ref_a_lat, NOT a_lat: this is the soundtrack length of THIS reference
+                # (0 for a still image, which has none). Naming it a_lat shadowed the
+                # clip's own audio-latent count computed above -- Python for-loops do not
+                # scope -- so a single image reference silently reset it to 0 and the
+                # audio decode below then unpacked an empty tensor:
+                #   "Calculated padded input size per channel: (0)" from conv1d.
+                # Hit ref2va + image references + any video-length sample.
+                ref_a_lat = int(a.shape[0]) // 2 if a is not None else 0
+                ref_blocks.append((lat.shape[1], lat.shape[2], lat.shape[3], ref_a_lat))
             elif isinstance(r, torch.Tensor):
                 ref_blocks.append((r.shape[1], r.shape[2], r.shape[3]))
             else:
