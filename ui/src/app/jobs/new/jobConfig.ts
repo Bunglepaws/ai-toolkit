@@ -44,16 +44,16 @@ export const defaultCompileOptions = {
 // ~13-16 words each, which fills a 5.167s clip without sounding rushed or slowed.
 export const defaultVoiceDialogue: string[] = [
   'Alright boys, hit the showers. You\'ve earned every bit of that one out there today.',
-  '[laughter] Nice work, big guy. I honestly didn\'t think you had that last set in you.',
+  'Nice work, big guy. I honestly didn\'t think you had that last set in you.',
   'Come here a second, let me get a look at that shoulder before you take off.',
-  '[confirmation-en] Yeah, that\'s it. Slow, controlled, all the way down. Just like that.',
+  'Yeah, that\'s it. Slow, controlled, all the way down. Just like that, perfect.',
   'You\'ve been holding out on me. Where\'s all of this been hiding lately, huh?',
-  '[sigh] You\'re going to be the death of me one day, you know that, right?',
+  'You\'re going to be the death of me one day, you know that, right?',
   'Towel off and come meet me in my office, we\'ve got some things to talk about.',
-  '[surprise-oh] Well now, somebody\'s been putting in the extra work over the summer.',
+  'Well now, somebody\'s been putting in the extra work over the summer, haven\'t they?',
   'Chin up, chest out, own the room. That\'s how a champion walks in here.',
   'Lock the door behind you, I don\'t want anybody walking in on this tonight.',
-  '[question-en] You sure you can handle another round, or do you need a minute first?',
+  'You sure you can handle another round, or do you need a minute first?',
   'Good boy. That\'s exactly what I\'ve been wanting to see out of you.',
 ];
 
