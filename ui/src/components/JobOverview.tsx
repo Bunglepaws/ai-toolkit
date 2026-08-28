@@ -130,21 +130,27 @@ export default function JobOverview({ job }: JobOverviewProps) {
           )}
 
           {/* Job Info Grid */}
-          <div className="grid gap-4 grid-cols-1 md:grid-cols-3">
-            <div className="flex items-center space-x-4">
-              <HardDrive className="w-5 h-5 text-blue-600 dark:text-blue-400" />
-              <div>
+          {/* Column count follows the item count: the Epochs cell only renders for jobs
+              that report epochs, and a fixed 4-up would leave a hole without it. Icons
+              are shrink-0 and the text columns min-w-0 so a long job name truncates
+              inside its own cell instead of pushing a neighbour onto a second row. */}
+          <div className={`grid gap-4 grid-cols-1 md:grid-cols-2 ${epochInfo ? 'lg:grid-cols-4' : 'lg:grid-cols-3'}`}>
+            <div className="flex items-center space-x-4 min-w-0">
+              <HardDrive className="w-5 h-5 shrink-0 text-blue-600 dark:text-blue-400" />
+              <div className="min-w-0">
                 <p className="text-xs text-gray-400">Job Name</p>
-                <p className="text-sm font-medium text-gray-200">{job.name}</p>
+                <p className="text-sm font-medium text-gray-200 truncate" title={job.name}>
+                  {job.name}
+                </p>
               </div>
             </div>
 
             {epochInfo && (
-              <div className="flex items-center space-x-4">
-                <Repeat className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
-                <div>
+              <div className="flex items-center space-x-4 min-w-0">
+                <Repeat className="w-5 h-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                <div className="min-w-0">
                   <p className="text-xs text-gray-400">Epochs</p>
-                  <p className="text-sm font-medium text-gray-200">
+                  <p className="text-sm font-medium text-gray-200 truncate">
                     {epochInfo.completed}
                     {epochInfo.total !== null && ` of ~${epochInfo.total}`}
                     {epochInfo.stepsPerEpoch !== null && ` · ${epochInfo.stepsPerEpoch} steps each`}
@@ -153,19 +159,21 @@ export default function JobOverview({ job }: JobOverviewProps) {
               </div>
             )}
 
-            <div className="flex items-center space-x-4">
-              <Cpu className="w-5 h-5 text-purple-600 dark:text-purple-400" />
-              <div>
+            <div className="flex items-center space-x-4 min-w-0">
+              <Cpu className="w-5 h-5 shrink-0 text-purple-600 dark:text-purple-400" />
+              <div className="min-w-0">
                 <p className="text-xs text-gray-400">Assigned GPUs</p>
-                <p className="text-sm font-medium text-gray-200">GPUs: {job.gpu_ids}</p>
+                <p className="text-sm font-medium text-gray-200 truncate">GPUs: {job.gpu_ids}</p>
               </div>
             </div>
 
-            <div className="flex items-center space-x-4">
-              <Gauge className="w-5 h-5 text-green-600 dark:text-green-400" />
-              <div>
+            <div className="flex items-center space-x-4 min-w-0">
+              <Gauge className="w-5 h-5 shrink-0 text-green-600 dark:text-green-400" />
+              <div className="min-w-0">
                 <p className="text-xs text-gray-400">Speed</p>
-                <p className="text-sm font-medium text-gray-200">{job.speed_string == '' ? '?' : job.speed_string}</p>
+                <p className="text-sm font-medium text-gray-200 truncate">
+                  {job.speed_string == '' ? '?' : job.speed_string}
+                </p>
               </div>
             </div>
           </div>

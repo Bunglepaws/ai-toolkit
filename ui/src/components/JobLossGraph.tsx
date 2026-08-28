@@ -137,7 +137,8 @@ const PALETTE = [
 ];
 
 // Persisted, per-URL graph settings. Sliders + display toggles + which loss
-// series are visible. Zoom / highlighted window is intentionally NOT persisted.
+// series are visible, plus the x-axis zoom window so returning to a job's chart
+// restores the range you were looking at instead of refitting to all data.
 interface PersistedSettings {
   useLogScale: boolean;
   showTrend: boolean;
@@ -145,6 +146,9 @@ interface PersistedSettings {
   plotStride: number;
   clipOutliers: boolean;
   enabled: Record<string, boolean>;
+  // null = not zoomed (full range). Stale windows that no longer overlap the
+  // data (e.g. after a range delete) are discarded on restore.
+  zoom: { min: number; max: number } | null;
 }
 
 // Key by the exact URL so each job remembers its own settings independently.
@@ -186,6 +190,11 @@ export default function JobLossGraph({ job }: Props) {
 
   const [isZoomed, setIsZoomed] = useState(false);
 
+  // Persisted x-zoom window. The ref mirrors it so the chart-create effect can
+  // re-apply it without re-running on every zoom change.
+  const [zoom, setZoom] = useState<{ min: number; max: number } | null>(null);
+  const zoomRef = useRef<{ min: number; max: number } | null>(null);
+
   // Gate persistence writes until we've loaded any stored settings, so the
   // initial defaults don't clobber what was saved before the load effect runs.
   const [hydrated, setHydrated] = useState(false);
@@ -199,6 +208,9 @@ export default function JobLossGraph({ job }: Props) {
   useEffect(() => {
     setHydrated(false);
     persistedEnabledRef.current = null;
+    zoomRef.current = null;
+    setZoom(null);
+    setIsZoomed(false);
     const key = settingsStorageKey();
     if (!key) {
       setHydrated(true);
@@ -217,6 +229,16 @@ export default function JobLossGraph({ job }: Props) {
           persistedEnabledRef.current = s.enabled;
           setEnabled(s.enabled);
         }
+        if (
+          s.zoom &&
+          typeof s.zoom === 'object' &&
+          Number.isFinite(s.zoom.min) &&
+          Number.isFinite(s.zoom.max) &&
+          s.zoom.min < s.zoom.max
+        ) {
+          zoomRef.current = { min: s.zoom.min, max: s.zoom.max };
+          setZoom(zoomRef.current);
+        }
       }
     } catch {
       // ignore malformed / unavailable storage
@@ -230,12 +252,12 @@ export default function JobLossGraph({ job }: Props) {
     const key = settingsStorageKey();
     if (!key) return;
     try {
-      const payload: PersistedSettings = { useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled };
+      const payload: PersistedSettings = { useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled, zoom };
       localStorage.setItem(key, JSON.stringify(payload));
     } catch {
       // ignore unavailable storage
     }
-  }, [hydrated, useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled]);
+  }, [hydrated, useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled, zoom]);
 
   // keep enabled map in sync with discovered keys. "loss/loss" and "val/loss"
   // are on by default; every other metric starts deactivated (user can toggle
@@ -494,6 +516,11 @@ export default function JobLossGraph({ job }: Props) {
             const sx = u.scales.x;
             const zoomed = sx.min !== xs[0] || sx.max !== xs[xs.length - 1];
             setIsZoomed(zoomed);
+            // Record the window so it survives navigating away and back.
+            const nextZoom =
+              zoomed && sx.min != null && sx.max != null ? { min: sx.min, max: sx.max } : null;
+            zoomRef.current = nextZoom;
+            setZoom(nextZoom);
           },
         ],
       },
@@ -510,6 +537,23 @@ export default function JobLossGraph({ job }: Props) {
       if (uplotRef.current !== uplotInstance) return;
       const fitted = computeCanvasSize(host);
       if (fitted) uplotInstance.setSize(fitted);
+
+      // Re-apply the saved zoom window. Done here rather than in the options so
+      // it also survives a structural recreate (toggling a series), and after
+      // setSize so the scale applies against the final canvas width.
+      const saved = zoomRef.current;
+      if (!saved) return;
+      const xs = uplotInstance.data[0] as number[];
+      if (!xs || xs.length < 2) return;
+      // Drop a window that no longer overlaps the data at all — e.g. the range
+      // was deleted, or this is a fresh run that hasn't reached those steps.
+      if (saved.max <= xs[0] || saved.min >= xs[xs.length - 1]) {
+        zoomRef.current = null;
+        setZoom(null);
+        return;
+      }
+      // setScale fires the setScale hook above, which sets isZoomed for us.
+      uplotInstance.setScale('x', { min: saved.min, max: saved.max });
     });
 
     return () => {

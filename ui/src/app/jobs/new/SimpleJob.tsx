@@ -1740,6 +1740,11 @@ export default function SimpleJob({
                         docKey="voice_clone.dialogue"
                         rows={6}
                       />
+                      <p className="mt-1 text-xs text-gray-400">
+                        Avoid starting a line with a tag &mdash; a laugh or sigh at the front of most
+                        clips gets learned as part of the voice, and every generation then opens with
+                        it. Mid-line is fine.
+                      </p>
                     </div>
 
                     </>
