@@ -60,22 +60,38 @@ say which class the running jobs actually use.
 
 ## Running the stack
 
-Everything runs inside **WSL Ubuntu-22.04**. The Python venv is at `venv/` inside the repo.
+Everything runs on **native Windows** (migrated off WSL 2026-08-09). The Python venv is
+`.venv/` in the repo, managed by `uv`.
 
-```bash
-# Start the full stack (UI + optional git pull + pip/npm sync)
-bash run_ai_toolkit.sh          # from WSL; opens browser at http://localhost:8675
+> **Never launch anything through WSL.** The Ubuntu-22.04 distro and its venv are gone. Any
+> `wsl -d Ubuntu-22.04 ...` command in old notes, scripts, or settings is dead — it will fail or,
+> worse, run a half-present stack. `run_ai_toolkit.sh` is legacy and should not be used.
 
-# Run a training job directly
-wsl -d Ubuntu-22.04 -- /home/marcbate/venvs/ai-toolkit/bin/python3 run.py config/my_config.yaml
+```powershell
+# Start the full stack (deps sync + UI). Opens http://localhost:8675
+run_windows.bat
 ```
 
-Always use `wsl -d Ubuntu-22.04` explicitly — the default WSL distro is not the right one.
+`run_windows.bat` is a thin bootstrap: it ensures `uv` + a Python exist, reports whether
+origin/main has commits to merge (it never merges — bring that to a Claude Code session), then
+runs `python -m manager sync` and `python -m manager launch`. `manager launch` runs
+`npm run db_build_start` in `ui/` and serves on port 8675. If the UI is already up it refuses to
+rebuild over the live stack and offers open/restart/leave.
 
-**UI commands** (run from `ui/` in WSL):
+```bash
+# Run a training job directly
+.venv/Scripts/python.exe run.py config/my_config.yaml
+```
+
+Use `.venv/Scripts/python.exe` explicitly for every Python invocation (py_compile, pyflakes,
+one-off scripts). The repo-root `venv/` is a **stale symlink** to the deleted WSL venv — do not
+use it, and do not trust `source venv/bin/activate`.
+
+**UI commands** (run from `ui/`):
 ```bash
 npm run dev            # dev mode with hot reload (Next.js + cron worker)
-npm run build_and_start  # production build + start (what run_ai_toolkit.sh uses)
+npm run build_and_start  # production build + start
+npm run db_build_start   # what `manager launch` actually runs
 npm run update_db      # regenerate Prisma client + push schema to SQLite
 npm run lint           # ESLint
 npx tsc --noEmit       # TypeScript type-check without emitting
@@ -192,7 +208,7 @@ text encoder before the first step.
 Sample outputs embed A1111-format metadata for CivitAI compatibility:
 - **PNG:** `parameters` tEXt chunk via `PIL.PngImagePlugin.PngInfo`
 - **MP4:** ffmpeg FFMETADATA1 re-mux with `-movflags use_metadata_tags` writing `parameters=` and `comment=` keys. Falls back to mutagen `©cmt` if ffmpeg fails.
-- **WSL/NTFS caveat:** `os.replace()` fails on `/mnt/c/` paths; the code catches `OSError` and copies bytes in-place instead.
+- **Legacy WSL/NTFS fallback:** `os.replace()` used to fail on `/mnt/c/` paths under WSL, so the code catches `OSError` and copies bytes in-place instead (`toolkit/config_modules.py:1489`). Harmless on native Windows — kept as a fallback, no longer a live concern.
 
 ---
 
@@ -211,52 +227,37 @@ See `README.md` "Fork additions" section for the full list. Key areas:
 
 ## Key paths
 
+Runtime paths come from the UI **Settings** table in `aitk_db.db`, not from this file — check
+there if something looks wrong. Current values:
+
 | Purpose | Path |
 |---------|------|
-| Training output | `C:\Data\AIToolkit-StagingArea\output\` |
-| HuggingFace cache | `/mnt/wsl/hfcache/huggingface` (ext4 VHD, see below) |
+| Training output | `C:\Data\AIToolkit-StagingArea\output\aitoolkit` (`TRAINING_FOLDER`) |
+| Datasets | `C:\Data\AIToolkit-StagingArea\datasets` (`DATASETS_FOLDER`) |
+| Models folder | `M:\models` (`MODELS_PATH`) |
+| Quantization cache | `C:\Data\AIToolkit-StagingArea\quant` (`QUANTIZATION_CACHE_DIR`) |
+| HuggingFace cache | `C:\Users\marc.bate\.cache\huggingface` (~213 GB) |
 | UI runs on | `http://localhost:8675` |
-| WSL distro | `Ubuntu-22.04` |
-| Python venv | `/home/marcbate/venvs/ai-toolkit/bin/python3` (see below — **not** in the repo) |
+| Python venv | `.venv\Scripts\python.exe` (Python 3.12, uv-managed) |
 
-### The venv is NOT in the repo
+The Settings table also holds live secrets (HF token, Gemma API key, Check-Config API key).
+Never copy those into this file, a config, or a commit.
 
-`<repo>/venv` is a **symlink** to `/home/marcbate/venvs/ai-toolkit`, which lives on
-the distro's ext4. The venv is ~56,000 small files and that is drvfs's worst case:
-importing torch + transformers + diffusers costs **~67s** under `/mnt/c` versus
-**~2s** native.
+### The `venv/` symlink is dead
 
-**Always invoke the real path.** Going through the symlink does not help — Python
-keeps the invocation path as `sys.prefix`, so every site-packages read is still
-translated across the bridge (measured 30s vs 2s). `run_ai_toolkit.sh` sets
-`VENV_DIR` to the real path and exports `AITK_PYTHON`, which `resolvePythonPath()`
-in `ui/cron/pythonPath.ts` prefers over the in-repo candidates.
+`<repo>/venv` is still a symlink to `/home/marcbate/venvs/ai-toolkit` — a WSL path that no longer
+exists. It is leftover clutter. Always use `.venv\Scripts\python.exe`; `source venv/bin/activate`
+will not work.
 
-The symlink exists only so `source venv/bin/activate` still works by habit.
+`resolvePythonPath()` in `ui/cron/pythonPath.ts` is what the worker uses to find the interpreter
+when spawning trainers.
 
-### HuggingFace cache lives on a dedicated ext4 VHD
+### HuggingFace cache
 
-The cache is **not** under `/mnt/c` anymore. The WSL drvfs bridge caps at ~225 MB/s
-regardless of how fast the underlying Windows drive is (measured: 223 MB/s on `/mnt/c`,
-228 MB/s on a second NVMe, **13.3 GB/s** on native ext4). Loading a 25GB transformer
-took ~112s across the bridge.
+Lives at `C:\Users\marc.bate\.cache\huggingface` on native NTFS. The old 400GB ext4 VHD
+(`C:\Data\WSL\hf-cache.vhdx`, mounted at `/mnt/wsl/hfcache`) existed only to dodge the WSL drvfs
+bandwidth cap (~225 MB/s across the bridge vs 13.3 GB/s on native ext4). That whole problem
+disappeared with the move off WSL, and the VHD has been deleted — ignore any note about mounting
+it or a logon scheduled task that attaches it.
 
-It now lives on `C:\Data\WSL\hf-cache.vhdx`, a 400GB ext4 disk mounted at
-`/mnt/wsl/hfcache`. `run_ai_toolkit.sh` exports `HF_HOME` there and refuses to start
-if the mount is missing — otherwise HF would silently re-download everything.
-
-**WSL does not re-attach the disk after a reboot.** A logon scheduled task runs:
-
-```
-wsl.exe --mount --vhd "C:\Data\WSL\hf-cache.vhdx" --name hfcache
-```
-
-To attach it manually (elevated prompt required):
-
-```
-wsl --mount --vhd "C:\Data\WSL\hf-cache.vhdx" --name hfcache
-```
-
-The captioner project keeps its own copy of the Gliese caption model in the old
-Windows cache (`C:\Users\marc.bate\.cache\huggingface`), along with the HF auth
-token — that path is still live and should not be deleted.
+The captioner project shares this same cache, along with the HF auth token.
