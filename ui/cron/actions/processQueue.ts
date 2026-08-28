@@ -105,8 +105,12 @@ function isLaunching(job: Job): boolean {
 
 /** Returns a job whose trainer process is still alive on these GPUs, if any. */
 async function findLiveTrainerOnGpu(gpuIds: string): Promise<Job | null> {
+  // Only consider jobs in active states. Stopped/completed jobs retain their
+  // last pid in the DB but that process is long gone; checking them causes false
+  // positives when an unrelated system process recycles the old pid — the UNKNOWN
+  // command-line case returns true conservatively and deadlocks the queue forever.
   const candidates: Job[] = await prisma.job.findMany({
-    where: { gpu_ids: gpuIds, pid: { not: null } },
+    where: { gpu_ids: gpuIds, pid: { not: null }, status: { in: ['running', 'stopping'] } },
   });
   return candidates.find(job => isTrainerAlive(job.pid)) ?? null;
 }
