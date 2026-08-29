@@ -1,10 +1,10 @@
+import os
+import time
 from fnmatch import fnmatch
 from typing import List, Optional, Union, TYPE_CHECKING, Tuple
 import hashlib
 import json
-import os
 import re
-import time
 import torch
 
 from optimum.quanto.quantize import _quantize_submodule, quantization_map
@@ -180,6 +180,22 @@ def requantize_module_weight(module, fp_weight, orig_dtype, config) -> None:
         torchao_quantize_(module, config)
 
 
+def _wrap_qlinear_ndim(qlinear: torch.nn.Module) -> None:
+    """quanto QLinear forward that tolerates >3D activations by flattening
+    the leading dims for the mm and restoring them after (no-op otherwise)."""
+    orig_forward = qlinear.forward
+
+    def forward(x):
+        if x.ndim > 3:
+            lead = x.shape[:-1]
+            out = orig_forward(x.reshape(-1, x.shape[-1]))
+            return out.reshape(*lead, out.shape[-1])
+        return orig_forward(x)
+
+    qlinear.forward = forward
+    qlinear._aitk_ndim_wrapped = True
+
+
 def quantize(
     model: torch.nn.Module,
     weights: Optional[Union[str, qtype, aotype]] = None,
@@ -188,6 +204,7 @@ def quantize(
     include: Optional[Union[str, List[str]]] = None,
     exclude: Optional[Union[str, List[str]]] = None,
     quantize_device: Optional[torch.device] = None,
+    keep_on_quantize_device: bool = False,
 ):
     """Quantize the specified model submodules
 
@@ -218,6 +235,11 @@ def quantize(
             If provided, each module is moved to this device to quantize, then moved
             back to the device its weights were on initially. Lets a CPU-resident
             model (low vram) quantize layer-by-layer on the GPU.
+        keep_on_quantize_device (`bool`):
+            With quantize_device set: leave each layer on the quantize device after
+            quantizing instead of moving it back. The gpu transient is then one
+            bf16 layer at a time — never the whole unquantized remainder at once —
+            for models whose final home is that device.
     """
     if include is not None:
         include = [include] if isinstance(include, str) else include
@@ -242,6 +264,16 @@ def quantize(
                     isinstance(weights, ostristype)
                     and m.__class__.__name__ == "OstrisLinear"
                 ):
+                    continue
+                if getattr(m.ostris_quantizer, "qtype", None) == weights.quantizer.qtype:
+                    # guaranteed per-layer no-op: skip before any
+                    # quantize_device round-trip
+                    continue
+            if isinstance(weights, ostristype) and not isinstance(m, torch.nn.Linear):
+                # ostris backends only quantize nn.Linear; don't ferry norms/
+                # embeddings across the bus for nothing when quantize_device
+                # is set (containers fall through so children are visited)
+                if quantize_device is not None and next(m.children(), None) is None:
                     continue
             if (
                 isinstance(weights, aotype)
@@ -281,8 +313,16 @@ def quantize(
                         activations=activations,
                         optimizer=optimizer,
                     )
+                    # quanto's qbytes_mm only takes 2D/3D activations; video
+                    # patch embeds feed their linears >3D tensors (convrot/
+                    # torchao reshape internally). Flatten around the QLinear.
+                    replaced = model.get_submodule(name)
+                    if replaced.__class__.__name__ == "QLinear" and not getattr(
+                        replaced, "_aitk_ndim_wrapped", False
+                    ):
+                        _wrap_qlinear_ndim(replaced)
             finally:
-                if orig_device is not None:
+                if orig_device is not None and not keep_on_quantize_device:
                     # quanto replaces the module in its parent, so re-fetch by name
                     model.get_submodule(name).to(orig_device)
         except Exception as e:
@@ -537,6 +577,155 @@ def _has_quantizable_linear(module: torch.nn.Module, weights, exclude=None) -> b
     return False
 
 
+@torch.no_grad()
+def dequantize_ostris_to_linear(module: torch.nn.Module) -> int:
+    """Replace every OstrisLinear with a plain nn.Linear holding the full-
+    precision weight (activation-side transforms folded), in place, layer by
+    layer — the full-precision transient never exceeds one layer. Used when a
+    pre-quantized checkpoint is loaded but a DIFFERENT quantization (or none,
+    e.g. full finetuning) was requested. Returns the number of layers
+    restored."""
+    replaced = 0
+    for parent in module.modules():
+        for child_name, child in list(parent.named_children()):
+            if not isinstance(child, OstrisLinear):
+                continue
+            weight = child.ostris_quantizer.dequantize_folded(child).to(
+                child.ostris_orig_dtype
+            )
+            new = torch.nn.Linear(
+                child.in_features,
+                child.out_features,
+                bias=child.bias is not None,
+                device="meta",
+                dtype=weight.dtype,
+            )
+            new.weight = torch.nn.Parameter(weight)
+            if child.bias is not None:
+                new.bias = torch.nn.Parameter(
+                    child.bias.data.to(weight.device, weight.dtype)
+                )
+            setattr(parent, child_name, new)
+            replaced += 1
+    return replaced
+
+
+@torch.no_grad()
+def quantize_module(
+    module: torch.nn.Module,
+    qtype: str,
+    device=None,
+    dtype: torch.dtype = torch.bfloat16,
+    block_names: Optional[List[str]] = None,
+    exclude: Optional[List[str]] = None,
+    quantize_kwargs: Optional[dict] = None,
+    status_fn=print_acc,
+    keep_on_device: bool = False,
+):
+    """Module-centric quantization: block-streamed (each repeated block moves
+    to ``device`` for the math) with a whole-module pass for the extras. This
+    is the core the per-model loaders call; holders' quantize_model wraps it
+    with model_config plumbing.
+
+    ``keep_on_device``: when the model's final home IS ``device`` (no layer
+    offloading / low_vram), quantized blocks stay there instead of round-
+    tripping back to cpu — the weights then cross the bus exactly once
+    (mmap/page-cache -> gpu) instead of three times (up, back into a fresh
+    host copy, up again at final placement), and the model-sized host RAM
+    spike of that intermediate copy never happens. The extras pass runs on
+    the gpu too. With it off (offload paths), blocks return to cpu as before
+    and the extras quantize layer-by-layer on ``device`` via quantize_device
+    rather than burning every cpu core."""
+    from toolkit.dequantize import patch_dequantization_on_save
+
+    patch_dequantization_on_save(module)
+    quantization_type = get_qtype(qtype)
+    exclude = list(exclude or [])
+    quantize_kwargs = quantize_kwargs or {}
+    keep_on_device = keep_on_device and device is not None
+
+    all_blocks: List[torch.nn.Module] = []
+    for name in block_names or []:
+        # name may be a dotted path for models that nest their blocks
+        block_list = module
+        for part in name.split("."):
+            block_list = getattr(block_list, part, None)
+            if block_list is None:
+                break
+        if block_list is not None:
+            all_blocks += list(block_list)
+    if all_blocks:
+        status_fn(f" - quantizing {len(all_blocks)} blocks")
+    already_quantized = 0
+    debug_phases = os.environ.get("AITK_QUANT_DEBUG") == "1"
+    t_check = t_h2d = t_quant = t_d2h = 0.0
+    for block in tqdm(all_blocks):
+        t = time.perf_counter()
+        skip = not _has_quantizable_linear(block, quantization_type, exclude)
+        t_check += time.perf_counter() - t
+        if skip:
+            # pre-quantized checkpoint with a matching qtype: nothing in this
+            # block would change — skip the dtype cast entirely so the load
+            # stays byte-identical (placement still honors keep_on_device)
+            already_quantized += 1
+            if keep_on_device:
+                block.to(device)
+            continue
+        t = time.perf_counter()
+        if device is not None:
+            block.to(device, dtype=dtype, non_blocking=True)
+        t_h2d += time.perf_counter() - t
+        t = time.perf_counter()
+        quantize(block, weights=quantization_type, exclude=exclude, **quantize_kwargs)
+        freeze(block)
+        t_quant += time.perf_counter() - t
+        # NOT non_blocking: an async D2H allocates the cpu destination in pinned
+        # memory, which the caching host allocator keeps forever — that silently
+        # retained a model-sized chunk of host ram
+        t = time.perf_counter()
+        if device is not None and not keep_on_device:
+            block.to("cpu")
+        t_d2h += time.perf_counter() - t
+    if debug_phases and all_blocks:
+        status_fn(
+            f" - [debug] check {t_check:.1f}s h2d {t_h2d:.1f}s "
+            f"quant {t_quant:.1f}s d2h {t_d2h:.1f}s"
+        )
+    if already_quantized:
+        status_fn(
+            f" - {already_quantized} blocks already quantized with a matching qtype; left untouched"
+        )
+
+    status_fn(" - quantizing extras")
+    if keep_on_device:
+        # blocks already live on the gpu; quantize each remaining layer there
+        # one at a time and leave it — the transient is one bf16 layer, never
+        # the whole unquantized remainder at once (that transient bump could
+        # exceed the model's final footprint by GBs on big-extras models)
+        quantize(
+            module,
+            weights=quantization_type,
+            exclude=exclude,
+            quantize_device=device,
+            keep_on_quantize_device=True,
+            **quantize_kwargs,
+        )
+        # non-quantized leftovers (norms, embeddings, buffers) follow — final
+        # residency, not a transient
+        module.to(device)
+    else:
+        # cpu-resident model: quantize each extra layer with a gpu round-trip
+        quantize(
+            module,
+            weights=quantization_type,
+            exclude=exclude,
+            quantize_device=device,
+            **quantize_kwargs,
+        )
+    freeze(module)
+    return module
+
+
 def quantize_model(
     base_model: "BaseModel",
     model_to_quantize: torch.nn.Module,
@@ -555,329 +744,213 @@ def quantize_model(
     # sensitive modules to keep in full precision (fnmatch patterns)
     exclude_modules = base_model.get_quantization_exclude_modules() or []
 
-    if base_model.model_config.accuracy_recovery_adapter is not None:
-        from toolkit.config_modules import NetworkConfig
-        from toolkit.lora_special import LoRASpecialNetwork
+    mc = base_model.model_config
+    device = base_model.device_torch
+    keep_on_device = (
+        not mc.low_vram
+        and not (mc.layer_offloading and mc.layer_offloading_transformer_percent > 0)
+        and torch.device(device).type != "cpu"
+    )
 
-        # we need to load and quantize with an accuracy recovery adapter
-        # todo handle hf repos
-        load_lora_path = base_model.model_config.accuracy_recovery_adapter
+    if mc.accuracy_recovery_adapter is not None:
+        attach_ara_and_quantize(
+            base_model,
+            model_to_quantize,
+            ara_path=mc.accuracy_recovery_adapter,
+            exclude=exclude_modules,
+            device=device,
+            keep_on_device=keep_on_device,
+        )
 
-        if not os.path.exists(load_lora_path):
-            # not local file, grab from the hub
+    else:
+        quantize_module(
+            model_to_quantize,
+            mc.qtype,
+            device=device,
+            dtype=base_model.torch_dtype,
+            block_names=base_model.get_transformer_block_names(),
+            exclude=exclude_modules,
+            quantize_kwargs=mc.quantize_kwargs,
+            status_fn=base_model.print_and_status_update,
+            keep_on_device=keep_on_device,
+        )
 
-            path_split = load_lora_path.split("/")
-            if len(path_split) > 3:
-                raise ValueError(
-                    "The accuracy recovery adapter path must be a local path or for a hf repo, 'username/repo_name/filename.safetensors'."
-                )
-            repo_id = f"{path_split[0]}/{path_split[1]}"
-            print_acc(f"Grabbing lora from the hub: {load_lora_path}")
-            new_lora_path = hf_hub_download(
-                repo_id,
-                filename=path_split[-1],
+
+@torch.no_grad()
+def attach_ara_and_quantize(
+    base_model: "BaseModel",
+    model_to_quantize: torch.nn.Module,
+    ara_path: str,
+    exclude: Optional[List[str]] = None,
+    device=None,
+    keep_on_device: bool = False,
+):
+    """Load an accuracy recovery adapter as a live network on the module and
+    quantize around it (adapter-hijacked linears at the configured qtype,
+    everything else uint8). The network lands on
+    base_model.accuracy_recovery_adapter.
+
+    ``device``: quantize each hijacked linear there (gpu kernels) instead of
+    wherever it happens to live (historically the cpu — slow). With
+    ``keep_on_device`` the quantized linears stay there (final home is that
+    gpu); otherwise each returns to the device it came from."""
+    from toolkit.config_modules import NetworkConfig
+    from toolkit.lora_special import LoRASpecialNetwork
+
+    exclude_modules = list(exclude or [])
+    load_lora_path = ara_path
+
+    if not os.path.exists(load_lora_path):
+        # not local file, grab from the hub
+
+        path_split = load_lora_path.split("/")
+        if len(path_split) > 3:
+            raise ValueError(
+                "The accuracy recovery adapter path must be a local path or for a hf repo, 'username/repo_name/filename.safetensors'."
             )
-            # replace the path
-            load_lora_path = new_lora_path
+        repo_id = f"{path_split[0]}/{path_split[1]}"
+        print_acc(f"Grabbing lora from the hub: {load_lora_path}")
+        new_lora_path = hf_hub_download(
+            repo_id,
+            filename=path_split[-1],
+        )
+        # replace the path
+        load_lora_path = new_lora_path
 
-        # build the lora config based on the lora weights
-        lora_state_dict = load_file(load_lora_path)
+    # build the lora config based on the lora weights
+    lora_state_dict = load_file(load_lora_path)
         
-        if hasattr(base_model, "convert_lora_weights_before_load"):
-            lora_state_dict = base_model.convert_lora_weights_before_load(lora_state_dict)
+    if hasattr(base_model, "convert_lora_weights_before_load"):
+        lora_state_dict = base_model.convert_lora_weights_before_load(lora_state_dict)
         
-        network_config = {
-            "type": "lora",
-            "network_kwargs": {"only_if_contains": []},
-            "transformer_only": False,
-        }
-        first_key = list(lora_state_dict.keys())[0]
-        first_weight = lora_state_dict[first_key]
-        # if it starts with lycoris and includes lokr
-        if first_key.startswith("lycoris") and any(
-            "lokr" in key for key in lora_state_dict.keys()
-        ):
-            network_config["type"] = "lokr"
+    network_config = {
+        "type": "lora",
+        "network_kwargs": {"only_if_contains": []},
+        "transformer_only": False,
+    }
+    first_key = list(lora_state_dict.keys())[0]
+    first_weight = lora_state_dict[first_key]
+    # if it starts with lycoris and includes lokr
+    if first_key.startswith("lycoris") and any(
+        "lokr" in key for key in lora_state_dict.keys()
+    ):
+        network_config["type"] = "lokr"
         
-        network_kwargs = {}
+    network_kwargs = {}
 
-        # find firse loraA weight
-        if network_config["type"] == "lora":
-            linear_dim = None
-            for key, value in lora_state_dict.items():
-                if "lora_A" in key:
-                    linear_dim = int(value.shape[0])
-                    break
-            linear_alpha = linear_dim
-            network_config["linear"] = linear_dim
-            network_config["linear_alpha"] = linear_alpha
+    # find firse loraA weight
+    if network_config["type"] == "lora":
+        linear_dim = None
+        for key, value in lora_state_dict.items():
+            if "lora_A" in key:
+                linear_dim = int(value.shape[0])
+                break
+        linear_alpha = linear_dim
+        network_config["linear"] = linear_dim
+        network_config["linear_alpha"] = linear_alpha
 
-            # we build the keys to match every key
-            only_if_contains = []
-            for key in lora_state_dict.keys():
-                contains_key = key.split(".lora_")[0]
+        # we build the keys to match every key
+        only_if_contains = []
+        for key in lora_state_dict.keys():
+            contains_key = key.split(".lora_")[0]
+            if contains_key not in only_if_contains:
+                only_if_contains.append(contains_key)
+
+        network_kwargs["only_if_contains"] = only_if_contains
+    elif network_config["type"] == "lokr":
+        # find the factor
+        largest_factor = 0
+        for key, value in lora_state_dict.items():
+            if "lokr_w1" in key:
+                factor = int(value.shape[0])
+                if factor > largest_factor:
+                    largest_factor = factor
+        network_config["lokr_full_rank"] = True
+        network_config["lokr_factor"] = largest_factor
+
+        only_if_contains = []
+        for key in lora_state_dict.keys():
+            if "lokr_w1" in key:
+                contains_key = key.split(".lokr_w1")[0]
+                contains_key = contains_key.replace("lycoris_", "")
                 if contains_key not in only_if_contains:
                     only_if_contains.append(contains_key)
-
-            network_kwargs["only_if_contains"] = only_if_contains
-        elif network_config["type"] == "lokr":
-            # find the factor
-            largest_factor = 0
-            for key, value in lora_state_dict.items():
-                if "lokr_w1" in key:
-                    factor = int(value.shape[0])
-                    if factor > largest_factor:
-                        largest_factor = factor
-            network_config["lokr_full_rank"] = True
-            network_config["lokr_factor"] = largest_factor
-
-            only_if_contains = []
-            for key in lora_state_dict.keys():
-                if "lokr_w1" in key:
-                    contains_key = key.split(".lokr_w1")[0]
-                    contains_key = contains_key.replace("lycoris_", "")
-                    if contains_key not in only_if_contains:
-                        only_if_contains.append(contains_key)
-            network_kwargs["only_if_contains"] = only_if_contains
+        network_kwargs["only_if_contains"] = only_if_contains
         
-        if hasattr(base_model, 'target_lora_modules'):
-            network_kwargs['target_lin_modules'] = base_model.target_lora_modules
+    if hasattr(base_model, 'target_lora_modules'):
+        network_kwargs['target_lin_modules'] = base_model.target_lora_modules
 
-        # todo auto grab these
-        # get dim and scale
-        network_config = NetworkConfig(**network_config)
+    # todo auto grab these
+    # get dim and scale
+    network_config = NetworkConfig(**network_config)
 
-        network = LoRASpecialNetwork(
-            text_encoder=None,
-            unet=model_to_quantize,
-            lora_dim=network_config.linear,
-            multiplier=1.0,
-            alpha=network_config.linear_alpha,
-            # conv_lora_dim=self.network_config.conv,
-            # conv_alpha=self.network_config.conv_alpha,
-            train_unet=True,
-            train_text_encoder=False,
-            network_config=network_config,
-            network_type=network_config.type,
-            transformer_only=network_config.transformer_only,
-            is_transformer=base_model.is_transformer,
-            base_model=base_model,
-            is_ara=True,
-            **network_kwargs
-        )
-        network.apply_to(
-            None, model_to_quantize, apply_text_encoder=False, apply_unet=True
-        )
-        network.force_to(base_model.device_torch, dtype=base_model.torch_dtype)
-        network._update_torch_multiplier()
-        network.load_weights(lora_state_dict)
-        network.eval()
-        network.is_active = True
-        network.can_merge_in = False
-        base_model.accuracy_recovery_adapter = network
+    network = LoRASpecialNetwork(
+        text_encoder=None,
+        unet=model_to_quantize,
+        lora_dim=network_config.linear,
+        multiplier=1.0,
+        alpha=network_config.linear_alpha,
+        # conv_lora_dim=self.network_config.conv,
+        # conv_alpha=self.network_config.conv_alpha,
+        train_unet=True,
+        train_text_encoder=False,
+        network_config=network_config,
+        network_type=network_config.type,
+        transformer_only=network_config.transformer_only,
+        is_transformer=base_model.is_transformer,
+        base_model=base_model,
+        is_ara=True,
+        **network_kwargs
+    )
+    network.apply_to(
+        None, model_to_quantize, apply_text_encoder=False, apply_unet=True
+    )
+    network.force_to(base_model.device_torch, dtype=base_model.torch_dtype)
+    network._update_torch_multiplier()
+    network.load_weights(lora_state_dict)
+    network.eval()
+    network.is_active = True
+    network.can_merge_in = False
+    base_model.accuracy_recovery_adapter = network
 
-        # Cache check. The ARA network above must be rebuilt either way (it owns the
-        # module hijacking), but the per-module quantization below is the slow part
-        # and is fully determined by the weights + qtype + adapter, so it can be
-        # restored from disk. load_quantized_layers converts plain Linears in place
-        # without redoing the quantization math.
-        ara_cache_dir = os.environ.get("AITK_QUANTIZATION_CACHE_DIR", None)
-        ara_wants_cache = getattr(
-            base_model.model_config, "cache_quantized_model", False)
-        ara_use_cache = bool(ara_cache_dir and ara_wants_cache)
-        ara_cache_path = None
-        if ara_wants_cache and not ara_cache_dir:
-            base_model.print_and_status_update(
-                " - Note: cache_quantized_model is enabled but "
-                "AITK_QUANTIZATION_CACHE_DIR is not set. Configure a cache "
-                "directory in Settings."
-            )
-        if ara_use_cache:
-            # the adapter is part of the cached result, so key on it too
-            ara_extra = f"{cache_key_extra}|ara:{os.path.basename(load_lora_path)}"
-            ara_slug, ara_key = _compute_quant_cache_key(base_model, ara_extra)
-            ara_cache_path = os.path.join(
-                ara_cache_dir, f"quant_{ara_slug}_{ara_key}_ara.safetensors")
-            ara_resolved = _resolve_cache_path(
-                base_model, ara_cache_dir, f"{ara_slug}", f"{ara_key}_ara",
-                "safetensors")
-            if ara_resolved is not None:
-                try:
-                    base_model.print_and_status_update(
-                        " - loading cached ARA-quantized model...")
-                    n = load_quantized_layers(model_to_quantize, ara_resolved)
-                    base_model.print_and_status_update(
-                        f" - cached ARA-quantized model loaded ({n} layers)")
-                    return
-                except Exception as e:
-                    base_model.print_and_status_update(
-                        f" - ARA cache load failed ({e}), re-quantizing from scratch"
-                    )
-
-        # quantize it
-        lora_exclude_modules = []
-        quantization_type = get_qtype(base_model.model_config.qtype)
-        for lora_module in tqdm(network.unet_loras, desc="Attaching quantization"):
-            # the lora has already hijacked the original module
-            orig_module = lora_module.org_module[0]
+    # quantize it
+    keep_on_device = keep_on_device and device is not None
+    lora_exclude_modules = []
+    quantization_type = get_qtype(base_model.model_config.qtype)
+    for lora_module in tqdm(network.unet_loras, desc="Attaching quantization"):
+        # the lora has already hijacked the original module
+        orig_module = lora_module.org_module[0]
+        orig_device = None
+        if device is not None:
+            param = next(orig_module.parameters(), None)
+            orig_device = param.device if param is not None else None
+            orig_module.to(device, dtype=base_model.torch_dtype)
+        else:
             orig_module.to(base_model.torch_dtype)
-            # make the params not require gradients
-            for param in orig_module.parameters():
-                param.requires_grad = False
-            quantize(orig_module, weights=quantization_type)
-            freeze(orig_module)
-            module_name = lora_module.lora_name.replace('$$', '.').replace('transformer.', '')
-            lora_exclude_modules.append(module_name)
-            if base_model.model_config.low_vram:
-                # move it back to cpu
-                orig_module.to("cpu")
-        pass
-        # quantize additional layers
-        print_acc(" - quantizing additional layers")
-        quantization_type = get_qtype('uint8')
-        quantize(
-            model_to_quantize,
-            weights=quantization_type,
-            exclude=lora_exclude_modules + exclude_modules
-        )
+        # make the params not require gradients
+        for param in orig_module.parameters():
+            param.requires_grad = False
+        quantize(orig_module, weights=quantization_type)
+        freeze(orig_module)
+        module_name = lora_module.lora_name.replace('$$', '.').replace('transformer.', '')
+        lora_exclude_modules.append(module_name)
+        if not keep_on_device and orig_device is not None:
+            orig_module.to(orig_device)
+        elif base_model.model_config.low_vram and device is None:
+            # legacy behavior when no quantize device was given
+            orig_module.to("cpu")
+    # quantize additional layers
+    print_acc(" - quantizing additional layers")
+    quantization_type = get_qtype('uint8')
+    quantize(
+        model_to_quantize,
+        weights=quantization_type,
+        exclude=lora_exclude_modules + exclude_modules,
+        quantize_device=device,
+        keep_on_quantize_device=keep_on_device,
+    )
+    if keep_on_device:
+        # non-quantized leftovers follow — final residency, not a transient
+        model_to_quantize.to(device)
 
-        # Save every module the passes above actually converted. Only the ostris
-        # backends produce OstrisLinear, which is what save/load_quantized_layers
-        # round-trips; quanto/torchao qtypes are skipped with a note rather than
-        # silently writing a cache that would restore nothing.
-        if ara_use_cache and ara_cache_path:
-            ostris_modules = {
-                name: mod for name, mod in model_to_quantize.named_modules()
-                if isinstance(mod, OstrisLinear)
-            }
-            if not ostris_modules:
-                base_model.print_and_status_update(
-                    f" - note: qtype '{base_model.model_config.qtype}' with an ARA "
-                    "does not use the ostris backend, so there is nothing to cache"
-                )
-            else:
-                try:
-                    base_model.print_and_status_update(
-                        " - saving ARA quantization cache...")
-                    os.makedirs(os.path.dirname(ara_cache_path), exist_ok=True)
-                    save_quantized_layers(ostris_modules, ara_cache_path)
-                    base_model.print_and_status_update(
-                        f" - ARA quantization cache saved to {ara_cache_path}")
-                except Exception as e:
-                    base_model.print_and_status_update(
-                        f" - warning: failed to save ARA quantization cache: {e}")
-    else:
-        # quantize model the original way without an accuracy recovery adapter
-        # move and quantize only certain pieces at a time.
-        quantization_type = get_qtype(base_model.model_config.qtype)
 
-        # Cache check: skip GPU quantization if a pre-computed cache exists
-        cache_dir = os.environ.get("AITK_QUANTIZATION_CACHE_DIR", None)
-        wants_cache = getattr(base_model.model_config, "cache_quantized_model", False)
-        is_torchao = isinstance(quantization_type, aotype)
-        use_cache = bool(cache_dir and wants_cache)
-        if wants_cache and not cache_dir:
-            base_model.print_and_status_update(
-                f" - Note: cache_quantized_model is enabled but AITK_QUANTIZATION_CACHE_DIR "
-                f"is not set. Configure a cache directory in Settings."
-            )
-        cache_path = cache_qmap_path = None
-        if use_cache:
-            slug, cache_key = _compute_quant_cache_key(base_model, cache_key_extra)
-            ext = "pt" if is_torchao else "safetensors"
-            # Path to save a freshly-quantized model to (exact key). The load side may
-            # resolve to a glob-matched file when the source checkpoint is missing.
-            resolved = _resolve_cache_path(base_model, cache_dir, slug, cache_key, ext)
-            if is_torchao:
-                # torchao: single .pt file (pickle-based; handles tensor subclasses)
-                cache_path = os.path.join(cache_dir, f"quant_{slug}_{cache_key}.pt")
-                cache_qmap_path = None
-                if resolved is not None:
-                    try:
-                        base_model.print_and_status_update(" - loading cached torchao quantized model...")
-                        _load_torchao_cache(model_to_quantize, resolved,
-                                            stop_check=base_model.maybe_stop)
-                        base_model.print_and_status_update(" - cached torchao quantized model loaded")
-                        return
-                    except Exception as e:
-                        base_model.print_and_status_update(
-                            f" - torchao cache load failed ({e}), re-quantizing from scratch"
-                        )
-            else:
-                # quanto: safetensors + qmap JSON
-                cache_path = os.path.join(cache_dir, f"quant_{slug}_{cache_key}.safetensors")
-                cache_qmap_path = os.path.join(cache_dir, f"quant_{slug}_{cache_key}_qmap.json")
-                if resolved is not None:
-                    # qmap sits beside the safetensors with the same key
-                    resolved_qmap = resolved[: -len(".safetensors")] + "_qmap.json"
-                    if os.path.exists(resolved_qmap):
-                        try:
-                            base_model.print_and_status_update(" - loading cached quantized model...")
-                            _load_from_quant_cache(model_to_quantize, resolved, resolved_qmap,
-                                                   stop_check=base_model.maybe_stop)
-                            base_model.print_and_status_update(" - cached quantized model loaded")
-                            return
-                        except Exception as e:
-                            base_model.print_and_status_update(
-                                f" - cache load failed ({e}), re-quantizing from scratch"
-                            )
-
-        # all_blocks = list(model_to_quantize.transformer_blocks)
-        all_blocks: List[torch.nn.Module] = []
-        transformer_block_names = base_model.get_transformer_block_names()
-        for name in transformer_block_names:
-            # name may be a dotted path for models that nest their blocks
-            # (e.g. hidream_o1's "model.language_model.layers").
-            block_list = model_to_quantize
-            for part in name.split('.'):
-                block_list = getattr(block_list, part, None)
-                if block_list is None:
-                    break
-            if block_list is not None:
-                all_blocks += list(block_list)
-        base_model.print_and_status_update(
-            f" - quantizing {len(all_blocks)} transformer blocks"
-        )
-        already_quantized = 0
-        for block in tqdm(all_blocks):
-            base_model.maybe_stop()
-            if not _has_quantizable_linear(block, quantization_type, exclude_modules):
-                # pre-quantized checkpoint with a matching qtype: nothing in
-                # this block would change — skip the device round-trip and the
-                # dtype cast entirely so the load stays byte-identical
-                already_quantized += 1
-                continue
-            block.to(base_model.device_torch, dtype=base_model.torch_dtype, non_blocking=True)
-            # exclude patterns with a leading wildcard (e.g. "*adaln_proj*")
-            # also apply inside blocks, where names are block-relative
-            quantize(block, weights=quantization_type, exclude=exclude_modules)
-            freeze(block)
-            # NOT non_blocking: an async D2H allocates the cpu destination in pinned
-            # memory, which the caching host allocator keeps forever (with power-of-2
-            # bucket rounding on top) — that silently retained a model-sized chunk of
-            # host ram after the weights moved back to the gpu for training
-            block.to("cpu")
-        if already_quantized:
-            base_model.print_and_status_update(
-                f" - {already_quantized} blocks already quantized with a matching qtype; left untouched"
-            )
-
-        # Quantize the extras (non-transformer-block children) that weren't handled block-by-block above.
-        # We skip the already-frozen transformer block lists to avoid rescanning thousands of frozen
-        # sub-modules, which would be extremely slow on large models like LTX2-22B.
-        base_model.print_and_status_update(" - quantizing extras")
-        # model_to_quantize.to(base_model.device_torch, dtype=base_model.torch_dtype)
-        quantize(model_to_quantize, weights=quantization_type, exclude=exclude_modules)
-        freeze(model_to_quantize)
-
-        # Save to cache after successful quantization
-        if use_cache and cache_path:
-            try:
-                base_model.print_and_status_update(" - saving quantization cache...")
-                if is_torchao:
-                    _save_torchao_cache(model_to_quantize, cache_path)
-                else:
-                    _save_to_quant_cache(model_to_quantize, cache_path, cache_qmap_path)
-                base_model.print_and_status_update(f" - quantization cache saved to {cache_path}")
-            except Exception as e:
-                base_model.print_and_status_update(f" - warning: failed to save quantization cache: {e}")

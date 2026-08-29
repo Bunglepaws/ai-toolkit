@@ -10,18 +10,18 @@ from toolkit.models.wan21.wan_utils import add_first_frame_conditioning
 from toolkit.prompt_utils import PromptEmbeds
 from PIL import Image
 from diffusers import UniPCMultistepScheduler
-import torch
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
 )
 from toolkit.util.quantize import quantize_model, has_quant_cache, filter_lora_state_dict_for_quantized_model
 from .wan22_pipeline import Wan22Pipeline
-from diffusers import WanTransformer3DModel
+from toolkit.models.v2.diffusion_models.wan import WanTransformer3DModel
 
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
 from torchvision.transforms import functional as TF
 
+from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.wan21.wan21 import Wan21
 from .wan22_5b_model import (
     scheduler_config,
@@ -94,6 +94,13 @@ class DualWanTransformer3DModel(torch.nn.Module):
     def dtype(self) -> torch.dtype:
         return self.torch_dtype
 
+    def get_offload_ignore_modules(self):
+        # both DiTs' fp32 modulation tables stay resident on the compute device
+        return (
+            self.transformer_1.get_offload_ignore_modules()
+            + self.transformer_2.get_offload_ignore_modules()
+        )
+
     @property
     def config(self):
         return self.transformer_1.config
@@ -109,33 +116,6 @@ class DualWanTransformer3DModel(torch.nn.Module):
         self.transformer_1.enable_gradient_checkpointing()
         self.transformer_2.enable_gradient_checkpointing()
 
-    @torch._dynamo.disable
-    def _prepare_transformer(self, hidden_states: torch.Tensor, timestep: torch.LongTensor) -> None:
-        """Select and device-swap the active transformer.
-
-        Decorated with @torch._dynamo.disable because QBytesTensor.detach() (called
-        internally by .to()) raises under TorchDynamo tracing when the model is
-        quantized with optimum-quanto.  The .item() call at the timestep boundary
-        check already causes a graph break; keeping the entire swap logic outside
-        the compiler avoids the subsequent re-trace failure."""
-        with torch.no_grad():
-            t_name = "transformer_1" if timestep.float().mean().item() > self.boundary else "transformer_2"
-
-            if t_name != self._active_transformer_name:
-                if self.low_vram:
-                    getattr(self, self._active_transformer_name).to("cpu")
-                    getattr(self, t_name).to(self.device_torch)
-                    torch.cuda.empty_cache()
-                self._active_transformer_name = t_name
-
-        if self.transformer.device != hidden_states.device:
-            if self.low_vram:
-                other_tname = (
-                    "transformer_1" if self._active_transformer_name == "transformer_2" else "transformer_2"
-                )
-                getattr(self, other_tname).to("cpu")
-            self.transformer.to(hidden_states.device)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -146,7 +126,42 @@ class DualWanTransformer3DModel(torch.nn.Module):
         attention_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
-        self._prepare_transformer(hidden_states, timestep)
+        # determine if doing high noise or low noise by meaning the timestep.
+        # timesteps are in the range of 0 to 1000, so we can use a threshold
+        with torch.no_grad():
+            if timestep.float().mean().item() > self.boundary:
+                t_name = "transformer_1"
+            else:
+                t_name = "transformer_2"
+
+            # memory-managed transformers own their placement (layers bounce
+            # from cpu per forward); whole-model swaps would haul the full
+            # 14B up and defeat the offloading
+            managed = (
+                hasattr(self, "_memory_manager")
+                or hasattr(self.transformer_1, "_memory_manager")
+                or hasattr(self.transformer_2, "_memory_manager")
+            )
+
+            # check if we are changing the active transformer, if so, we need to swap the one in
+            # vram if low_vram is enabled
+            # todo swap the loras as well
+            if t_name != self._active_transformer_name:
+                if self.low_vram and not managed:
+                    getattr(self, self._active_transformer_name).to("cpu")
+                    getattr(self, t_name).to(self.device_torch)
+                    torch.cuda.empty_cache()
+                self._active_transformer_name = t_name
+
+        if not managed and self.transformer.device != hidden_states.device:
+            if self.low_vram:
+                # move other transformer to cpu
+                other_tname = (
+                    "transformer_1" if t_name == "transformer_2" else "transformer_2"
+                )
+                getattr(self, other_tname).to("cpu")
+
+            self.transformer.to(hidden_states.device)
 
         return self.transformer(
             hidden_states=hidden_states,
@@ -371,104 +386,25 @@ class Wan2214bModel(Wan21):
             # we have a hf path, replace it with transformer_2 subfolder
             subfolder_2 = "transformer_2"
 
+        # per-transformer load kwargs; the ARA (if any) applies to the combined
+        # dual model below, offload attaches per transformer after that
+        per_kwargs = self.component_load_kwargs("transformer")
+        per_kwargs["offload"] = 0.0
+        if self.model_config.accuracy_recovery_adapter is not None:
+            per_kwargs["qtype"] = None
+
         self.print_and_status_update("Loading transformer 1")
-        dtype = self.torch_dtype
-        cache_key_extra_1 = f"high-noise|{transformer_path_1}|{subfolder_1}"
-        cache_key_extra_2 = f"low-noise|{transformer_path_2}|{subfolder_2}"
-        if is_single_file:
-            path_1_exists = os.path.exists(transformer_path_1)
-            if not path_1_exists:
-                can_use_cache = (
-                    self.model_config.quantize
-                    and has_quant_cache(self, cache_key_extra_1)
-                )
-                if not can_use_cache:
-                    raise FileNotFoundError(
-                        f"Transformer 1 file not found and no quantization cache available: {transformer_path_1}"
-                    )
-            transformer_1 = self._load_wan_transformer_single_file(
-                transformer_path_1, "transformer", skip_weights=not path_1_exists
-            )
-        else:
-            transformer_1 = WanTransformer3DModel.from_pretrained(
-                transformer_path_1,
-                subfolder=subfolder_1,
-                torch_dtype=dtype,
-            ).to(dtype=dtype)
-
+        transformer_1 = WanTransformer3DModel.load(
+            transformer_path_1, subfolder=subfolder_1, **per_kwargs
+        )
         flush()
-
-        if self.model_config.low_vram:
-            # quantize on the device
-            transformer_1.to('cpu', dtype=dtype)
-            flush()
-        else:
-            transformer_1.to(self.device_torch, dtype=dtype)
-            flush()
-
-        if self.model_config.quantize and self.model_config.accuracy_recovery_adapter is None:
-            # todo handle two ARAs
-            self.print_and_status_update("Quantizing Transformer 1")
-            quantize_model(
-                self, transformer_1,
-                cache_key_extra=cache_key_extra_1,
-            )
-            flush()
-
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving transformer 1 to CPU")
-            transformer_1.to("cpu")
-        else:
-            transformer_1.to(self.device_torch)
 
         self.print_and_status_update("Loading transformer 2")
-        dtype = self.torch_dtype
-        if is_single_file:
-            path_2_exists = os.path.exists(transformer_path_2)
-            if not path_2_exists:
-                can_use_cache = (
-                    self.model_config.quantize
-                    and has_quant_cache(self, cache_key_extra_2)
-                )
-                if not can_use_cache:
-                    raise FileNotFoundError(
-                        f"Transformer 2 file not found and no quantization cache available: {transformer_path_2}"
-                    )
-            transformer_2 = self._load_wan_transformer_single_file(
-                transformer_path_2, "transformer_2", skip_weights=not path_2_exists
-            )
-        else:
-            transformer_2 = WanTransformer3DModel.from_pretrained(
-                transformer_path_2,
-                subfolder=subfolder_2,
-                torch_dtype=dtype,
-            ).to(dtype=dtype)
-
+        transformer_2 = WanTransformer3DModel.load(
+            transformer_path_2, subfolder=subfolder_2, **per_kwargs
+        )
         flush()
 
-        if self.model_config.low_vram:
-            # quantize on the device
-            transformer_2.to('cpu', dtype=dtype)
-            flush()
-        else:
-            transformer_2.to(self.device_torch, dtype=dtype)
-            flush()
-
-        if self.model_config.quantize and self.model_config.accuracy_recovery_adapter is None:
-            # todo handle two ARAs
-            self.print_and_status_update("Quantizing Transformer 2")
-            quantize_model(
-                self, transformer_2,
-                cache_key_extra=cache_key_extra_2,
-            )
-            flush()
-
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving transformer 2 to CPU")
-            transformer_2.to("cpu")
-        else:
-            transformer_2.to(self.device_torch)
-    
         layer_offloading_transformer = self.model_config.layer_offloading and self.model_config.layer_offloading_transformer_percent > 0
         # make the combined model
         self.print_and_status_update("Creating DualWanTransformer3DModel")
@@ -489,18 +425,13 @@ class Wan2214bModel(Wan21):
             
         
         if layer_offloading_transformer:
-            MemoryManager.attach(
-                transformer_1,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_transformer_percent,
-                ignore_modules=[transformer_1.scale_shift_table] + [block.scale_shift_table for block in transformer_1.blocks]
-            )
-            MemoryManager.attach(
-                transformer_2,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_transformer_percent,
-                ignore_modules=[transformer_2.scale_shift_table] + [block.scale_shift_table for block in transformer_2.blocks]
-            )
+            for t in (transformer_1, transformer_2):
+                MemoryManager.attach(
+                    t,
+                    self.device_torch,
+                    offload_percent=self.model_config.layer_offloading_transformer_percent,
+                    ignore_modules=t.get_offload_ignore_modules(),
+                )
 
         return transformer
 
@@ -559,19 +490,19 @@ class Wan2214bModel(Wan21):
         return False
 
     def save_model(self, output_path, meta, save_dtype):
+        # comfy-format single-file saves, one per DiT (comfy convention:
+        # separate high/low noise files)
         transformer_combo: DualWanTransformer3DModel = unwrap_model(self.model)
-        transformer_combo.transformer_1.save_pretrained(
-            save_directory=os.path.join(output_path, "transformer"),
-            safe_serialization=True,
+        base = output_path
+        if base.endswith(".safetensors"):
+            base = base[: -len(".safetensors")]
+        metadata = get_meta_for_safetensors(meta, name=self.arch)
+        transformer_combo.transformer_1.save_model(
+            f"{base}_high_noise.safetensors", dtype=save_dtype, metadata=metadata
         )
-        transformer_combo.transformer_2.save_pretrained(
-            save_directory=os.path.join(output_path, "transformer_2"),
-            safe_serialization=True,
+        transformer_combo.transformer_2.save_model(
+            f"{base}_low_noise.safetensors", dtype=save_dtype, metadata=metadata
         )
-
-        meta_path = os.path.join(output_path, "aitk_meta.yaml")
-        with open(meta_path, "w") as f:
-            yaml.dump(meta, f)
 
     def save_lora(
         self,

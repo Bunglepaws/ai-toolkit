@@ -262,9 +262,17 @@ echo "── Python: LTX-2.3 distilled LoRA ──────────"
 check "distill_lora_path support in ltx2.py" \
   "extensions_built_in/diffusion_models/ltx2/ltx2.py" \
   "distill_lora"
-check "filter_lora_state_dict_for_quantized_model used in ltx2.py (prevents weight corruption on quantized layers)" \
-  "extensions_built_in/diffusion_models/ltx2/ltx2.py" \
-  "filter_lora_state_dict_for_quantized_model"
+# Checks the files that actually CALL it. It was previously asserted against
+# ltx2.py, where the name only ever appeared on an import line and was never
+# called - so the check passed on dead code while the real call sites went
+# unguarded. The 2026-08-29 ostris merge dropped the import from qwen_image.py
+# and that landed as a runtime NameError this check did not catch.
+check "filter_lora_state_dict_for_quantized_model called in qwen_image.py (prevents weight corruption on quantized layers)" \
+  "extensions_built_in/diffusion_models/qwen_image/qwen_image.py" \
+  "lora_state_dict = filter_lora_state_dict_for_quantized_model"
+check "filter_lora_state_dict_for_quantized_model called in wan22_14b_model.py (prevents weight corruption on quantized layers)" \
+  "extensions_built_in/diffusion_models/wan22/wan22_14b_model.py" \
+  "= filter_lora_state_dict_for_quantized_model"
 
 echo
 echo "── Python: MiniMax-H3 turbo LoRA ────────────"
