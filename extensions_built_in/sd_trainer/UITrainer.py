@@ -41,6 +41,9 @@ class UITrainer(SDTrainer):
         self._async_tasks = []
         # Initialize the status
         self._run_async_operation(self._update_status("running", "Starting"))
+        # Clear any `stop_after_save` left over from a previous run before the
+        # first maybe_stop() can act on it. See DiffusionTrainer for the full note.
+        self.update_db_key("stop_after_save", 0)
         self._stop_watcher_started = False
         if os.name == "nt":
             # On Windows the stop route cannot send us SIGINT from outside
@@ -272,6 +275,9 @@ class UITrainer(SDTrainer):
             self.update_db_key("save", False)
             self.update_db_key("save_now", 0)
             self.update_db_key("return_to_queue", False)
+            # The return_to_queue branch raises before the stop_after_save branch
+            # can reset it. See DiffusionTrainer for the full note.
+            self.update_db_key("stop_after_save", 0)
             self.update_db_key("pid", None)
 
     def maybe_stop(self):

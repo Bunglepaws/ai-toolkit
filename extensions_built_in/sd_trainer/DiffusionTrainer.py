@@ -57,6 +57,15 @@ class DiffusionTrainer(SDTrainer):
             self._async_tasks = []
             # Initialize the status
             self._run_async_operation(self._update_status("running", "Starting"))
+            # A job that is only now starting cannot have a checkpoint write
+            # pending, so `stop_after_save` here can only be a leftover from a
+            # previous run -- and a leftover is fatal: hook_before_model_load()
+            # calls maybe_stop() before the model is even loaded, so a stale flag
+            # stops the job dead within milliseconds and it silently drops out of
+            # the queue with no error to show for it. Clear it here rather than
+            # trusting whoever launched us: this is the one point every launch
+            # path (Node's startJob and run_ui.py's hot-model handoff) shares.
+            self.update_db_key("stop_after_save", 0)
             self._stop_watcher_started = False
             if os.name == "nt":
                 # On Windows the stop route cannot send us SIGINT from outside
@@ -325,6 +334,12 @@ class DiffusionTrainer(SDTrainer):
             self.update_db_key("save", False)
             self.update_db_key("save_now", 0)
             self.update_db_key("return_to_queue", False)
+            # Must be cleared here, not only in the should_stop_after_save()
+            # branch below. Save and Stop Queue sets return_to_queue AND
+            # stop_after_save together, and maybe_stop() checks return_to_queue
+            # first -- so that branch raises and the reset in the stop_after_save
+            # branch is never reached, leaving the flag set forever.
+            self.update_db_key("stop_after_save", 0)
             self.update_db_key("pid", None)
 
     def maybe_stop(self):
