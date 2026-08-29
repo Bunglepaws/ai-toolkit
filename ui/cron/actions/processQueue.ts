@@ -105,21 +105,12 @@ function isLaunching(job: Job): boolean {
 
 /** Returns a job whose trainer process is still alive on these GPUs, if any. */
 async function findLiveTrainerOnGpu(gpuIds: string): Promise<Job | null> {
-  // Only consider jobs in active-ish states. Stopped/completed jobs retain their
+  // Only consider jobs in active states. Stopped/completed jobs retain their
   // last pid in the DB but that process is long gone; checking them causes false
   // positives when an unrelated system process recycles the old pid — the UNKNOWN
   // command-line case returns true conservatively and deadlocks the queue forever.
-  //
-  // 'queued' is included on purpose: maybe_stop()'s return_to_queue branch (Save
-  // and Stop Queue) writes status='queued' and only *afterwards* clears pid, while
-  // the trainer still has to unwind and actually exit -- a window of real seconds
-  // on a quantized model. A queued job never has a live pid otherwise (creation
-  // and normal re-queuing both leave pid null), so this can't false-positive the
-  // way a long-idle stopped/completed row's stale pid can. Without it, this tick
-  // sees the GPU as free and can start a second trainer on it before the first
-  // one has actually let go -- see project memory on the double-job-on-one-GPU bug.
   const candidates: Job[] = await prisma.job.findMany({
-    where: { gpu_ids: gpuIds, pid: { not: null }, status: { in: ['running', 'stopping', 'queued'] } },
+    where: { gpu_ids: gpuIds, pid: { not: null }, status: { in: ['running', 'stopping'] } },
   });
   return candidates.find(job => isTrainerAlive(job.pid)) ?? null;
 }
