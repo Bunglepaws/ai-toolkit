@@ -69,6 +69,16 @@ check "Reads prompt from file metadata" \
   "ui/src/components/SampleImageViewer.tsx" \
   "metadataPrompt"
 
+check "Sticky video mute hook wired in"   "ui/src/components/SampleImageViewer.tsx"   "videoMute"
+
+echo
+echo "── UI: DatasetImageViewer ───────────────────"
+check "Sticky video mute hook wired in"   "ui/src/components/DatasetImageViewer.tsx"   "videoMute"
+
+echo
+echo "── UI: useVideoMute ─────────────────────────"
+check "Global mute preference storage key"   "ui/src/hooks/useVideoMute.ts"   "aitk_video_muted"
+
 echo
 echo "── UI: JobActionBar ─────────────────────────"
 check "SaveSnapshotModal import" \

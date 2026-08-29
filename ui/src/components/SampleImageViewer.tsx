@@ -12,6 +12,7 @@ import { isVideo, isAudio, encodeFilePathForUrl } from '@/utils/basic';
 import AudioPlayer from './AudioPlayer';
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
 import BoundingBoxOverlay, { parseBoundingBoxes } from './BoundingBoxOverlay';
+import useVideoMute from '@/hooks/useVideoMute';
 
 interface Props {
   imgPath: string | null; // current image path
@@ -337,6 +338,7 @@ export default function SampleImageViewer({
   }, [isOpen, onCancel, handleArrowUp, handleArrowDown, handleArrowLeft, handleArrowRight, handleDelete]);
 
   // Touch swipe navigation
+  const videoMute = useVideoMute();
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const multiTouchRef = useRef(false);
   const zoomedRef = useRef(false);
@@ -412,6 +414,8 @@ export default function SampleImageViewer({
                   </div>
                 ) : isVideo(displayedImgPath) ? (
                   <video
+                    ref={videoMute.ref}
+                    onVolumeChange={videoMute.onVolumeChange}
                     src={`/api/img/${encodeFilePathForUrl(displayedImgPath)}`}
                     className="w-auto h-auto max-w-full sm:max-w-[95vw] max-h-[82vh] object-contain"
                     preload="none"

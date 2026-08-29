@@ -72,6 +72,7 @@ This is a personal fork of [ostris/ai-toolkit](https://github.com/ostris/ai-tool
 - **Step counter on Samples tab** — "Step X of Y" progress shown left of the Generate Samples Now button, updating live
 - **Sample button blocked during startup** — Generate Samples disabled while loading model, quantizing, encoding dataset, etc.; only active once in the training loop
 - **Toolbar sample button hidden on Samples tab** — avoids duplicate camera buttons when already on the Samples page
+- **Sticky video mute** — muting a video in the fullscreen sample or dataset viewer is remembered globally (`aitk_video_muted` in `localStorage`) and applied to the next video you open, so a late-night mute stays muted. Only the audible players with controls participate; grid thumbnails stay hard-muted. If the browser blocks unmuted autoplay, playback falls back to muted without overwriting the stored preference
 
 ### UI — Datasets / Captions
 

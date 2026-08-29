@@ -22,6 +22,7 @@ these known fork customizations are still present before considering the merge d
 - `ui/src/app/layout.tsx`: `StopJobModal` and `StripAudioModal` alongside any new Ostris modals
 - `ui/src/helpers/defaultSamples.ts`: `guidance_scale: 7` in `defaultIdeogramSamplesConfig`
 - `ui/src/components/SampleImageViewer.tsx`: both our `promptExpanded` state and Ostris's `showBoxes` state
+- `ui/src/components/SampleImageViewer.tsx` and `ui/src/components/DatasetImageViewer.tsx`: `videoMute` wired onto the `<video>` (sticky mute); `ui/src/hooks/useVideoMute.ts` is fork-only and shouldn't be touched by a merge at all
 - `ui/src/components/StopJobModal.tsx`, `SaveSnapshotModal.tsx`, `QueueStatusWidget.tsx`, `JobTrainingSessions.tsx`, and the `/api/jobs/[jobID]/save_and_pause`, `/save_and_requeue`, `/save_now` routes: fork-only, shouldn't be touched by a merge at all — confirm they still exist
 
 A one-line `grep -c` per marker (see chat history for the exact commands) is enough — report which markers you

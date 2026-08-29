@@ -13,6 +13,7 @@ import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
 import { BoundingBoxEditor, parseBoundingBoxes, extractBoxes } from './BoundingBoxOverlay';
 import IdeogramCaptionSidebar, { isIdeogramCaption } from './IdeogramCaptionSidebar';
 import datasetTemplates from '@/helpers/datasetTemplates';
+import useVideoMute from '@/hooks/useVideoMute';
 
 function safeParse(text: string): any {
   try {
@@ -331,6 +332,7 @@ export default function DatasetImageViewer({
   }, [isOpen, onCancel, handlePrev, handleNext, handleDelete, showBoxes, selectedBoxIndex, handleDeleteBox]);
 
   // Touch swipe navigation
+  const videoMute = useVideoMute();
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const multiTouchRef = useRef(false);
   const zoomedRef = useRef(false);
@@ -414,6 +416,8 @@ export default function DatasetImageViewer({
                   </div>
                 ) : isVideo(imgPath) ? (
                   <video
+                    ref={videoMute.ref}
+                    onVolumeChange={videoMute.onVolumeChange}
                     src={`/api/img/${encodeFilePathForUrl(imgPath)}`}
                     className="w-auto h-auto max-w-full max-h-[50vh] sm:max-h-[90vh] object-contain"
                     preload="none"
