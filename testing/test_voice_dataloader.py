@@ -14,7 +14,7 @@ from toolkit.data_loader import AiToolkitDataset
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
 from toolkit.util.get_model import get_model_class
 
-REAL = r'C:\Data\AIToolkit-StagingArea\datasets\brock_voice'
+REAL = r'C:\Data\AIToolkit-StagingArea\datasets\brock_voice_audio'
 GRID = get_model_class(type('A', (), {'arch': 'minimax_h3'})()).get_audio_grid()
 
 
