@@ -12,8 +12,8 @@ everything else is skipped and reported.
 This never creates a training_sessions row - it only fills in
 startup_seconds on existing rows recorded by the app itself.
 
-Usage (from WSL):
-    venv/bin/python3 scripts/backfill_startup_times.py [--dry-run] [--output-dir PATH]
+Usage:
+    .venv/Scripts/python.exe scripts/backfill_startup_times.py [--dry-run] [--output-dir PATH]
 """
 
 import argparse
@@ -22,7 +22,7 @@ import re
 import sqlite3
 import time
 
-DEFAULT_OUTPUT_DIR = "/mnt/c/Data/AIToolkit-StagingArea/output"
+DEFAULT_OUTPUT_DIR = r"C:\Data\AIToolkit-StagingArea\output\aitoolkit"
 LOOKBACK_SECONDS = 30 * 24 * 60 * 60
 TOLERANCE_SECONDS = 15 * 60
 

@@ -32,7 +32,7 @@ from toolkit.print import print_acc
 # written before this were encoded against a solid black control.
 CACHE_FORMAT_VERSION = 3
 
-CACHE_DIRNAME = '.embed_cache'
+CACHE_DIRNAME = '_embed_cache'
 
 
 def cache_disabled() -> bool:
@@ -132,7 +132,8 @@ def save(cache_root: str, key_material: Dict[str, Any], payload: Any) -> None:
     tmp_path = f'{path}.tmp'
     try:
         torch.save({'key_material': key_material, 'payload': payload}, tmp_path)
-        # os.replace fails across /mnt/c on WSL; fall back to a copy in place
+        # os.replace used to fail across /mnt/c under WSL; fall back to a copy in place.
+        # Harmless on native Windows - kept as a fallback, no longer a live concern.
         try:
             os.replace(tmp_path, path)
         except OSError:
