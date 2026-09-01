@@ -240,6 +240,43 @@ batch through Ostris's `DTO` latent.
 
 ---
 
+## Gemma API and LTX-2.5 conditioning
+
+**The 2.3-checkpoint-for-model-id trick does not cost you 2.5 quality.** This looks
+alarming and comes up repeatedly, so the evidence is recorded here.
+
+Every released LTX-2.5 file lacks the `encrypted_wandb_properties` metadata the API
+needs, so `_extract_gemma_model_id` falls back to a local LTX-2.3 checkpoint for the
+id. Lightricks' own reference ComfyUI workflow does the same, and their Gemma API
+node has not been updated for 2.5 at all.
+
+**Verified:** the API returns *post-connector* embeddings at `[batch, seq, 6144]` =
+4096 video + 2048 audio. That is Gemma 4's output shape — `text_embedding_projection`
+aggregates all 49 hidden layers (188160 = 49 x 3840) down to 4096/2048, and the server
+applies those connectors before returning. LTX-2.3 conditioning is `caption_channels:
+3840`, a different shape entirely. So the returned width proves the server used the
+**2.5** path: `model_id` is a lookup/entitlement token, not an encoder selector.
+
+Cheapest check if this is ever in doubt: log the embedding's last dim. **6144 = Gemma 4
+conditioning. 3840 = it fell back to 2.3** and something is wrong.
+
+**Reasoned, NOT measured** — treat as a hypothesis to test, not a finding:
+API quality should be ≈ local bf16 Gemma 4 (identical weights and connectors, just run
+server-side) and ≥ local int8-convrot (quantization can only add error). *Direction* is
+certain by mechanism; *magnitude* of the int8 gap is unmeasured and could be anywhere
+from imperceptible to material. Note this encoder is more quantization-exposed than
+most, since the projection aggregates every hidden layer rather than just the last.
+
+The API is also the clean control when debugging poor prompt adherence: it is
+quantization-free and costs no local VRAM. But rank distilled/few-step checkpoints and
+guidance settings above TE quantization as suspects — both have larger effect sizes.
+
+One asymmetry: the API tokenizes server-side with unknown settings, while the local
+path uses `max_length=1024, truncation=True`. Long prompts are the one place the two
+could legitimately diverge.
+
+---
+
 ## Fork additions summary
 
 See `README.md` "Fork additions" section for the full list. Key areas:
