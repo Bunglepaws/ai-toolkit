@@ -213,6 +213,33 @@ Sample outputs embed A1111-format metadata for CivitAI compatibility:
 
 ---
 
+## Voice datasets (H3 audio training)
+
+**Keep non-word TTS tags out of voice-clip captions unless they are genuinely rare.**
+Sighs, breaths, and similar bracketed noises are learned as part of the character's
+speech pattern, so their frequency in the captions becomes the character's
+behavioural frequency. The original `brock_voice` dataset used them across many
+clips and the trained character sighed before *everything* it said. It was recut as
+`brock_voice_audio` rather than caption-edited, and `brock_voice` no longer exists.
+
+Check tag frequency across captions *before* training, not after — the failure only
+shows up at sample time, and it looks like a model problem rather than a data one.
+
+`testing/test_voice_dataloader.py` runs against `brock_voice_audio` (12 clips on disk
+plus a synthetic `handcut.wav` = the 13 items it asserts). It uses a `StubSD`, so it
+needs no model weights and no GPU — it is the fastest way to confirm the audio-only
+item path still works after a merge:
+
+```bash
+.venv/Scripts/python.exe testing/test_voice_dataloader.py
+```
+
+It covers the fork-only audio-only feature (`is_audio_only`,
+`make_audio_only_placeholder_latent`, VAE bypass) *and* that audio still reaches the
+batch through Ostris's `DTO` latent.
+
+---
+
 ## Fork additions summary
 
 See `README.md` "Fork additions" section for the full list. Key areas:
