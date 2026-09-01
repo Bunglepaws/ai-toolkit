@@ -13,6 +13,7 @@ from transformers import Gemma3Config
 import yaml
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
+from toolkit.dto import DTO
 from toolkit.models.base_model import BaseModel
 from toolkit.basic import flush
 from toolkit.prompt_utils import PromptEmbeds
@@ -59,6 +60,7 @@ try:
         convert_ltx2_audio_vae,
         convert_ltx2_vocoder,
         convert_ltx2_connectors,
+        split_transformer_and_connector_state_dict,
         dequantize_state_dict,
         convert_comfy_gemma3_to_transformers,
         convert_lora_original_to_diffusers,
@@ -385,6 +387,16 @@ class LTX2Model(BaseModel):
                 original_dit_ckpt, version=self.ltx_version
             )
             transformer = transformer.to(dtype)
+            # the transformer holds these tensors (assign=True); drop the dict refs
+            # so each block's bf16 original frees as it quantizes instead of the
+            # whole dit staying in RAM. Connector keys stay — converted later.
+            transformer_sd, _ = split_transformer_and_connector_state_dict(
+                original_dit_ckpt
+            )
+            for key in transformer_sd:
+                combined_state_dict.pop(dit_prefix + key, None)
+            del transformer_sd, original_dit_ckpt
+            flush()
         else:
             if os.path.exists(model_path):
                 # check if the path is a full checkpoint.
@@ -1601,16 +1613,7 @@ class LTX2Model(BaseModel):
         batch: "DataLoaderBatchDTO" = None,
         **kwargs,
     ):
-        # a grad-enabled prediction is the primary (loss carrying) one unless
-        # the trainer declared a secondary slot on the batch (prior /
-        # guidance-unconditional / preservation passes). Trainers that make
-        # several grad predictions per step (e.g. turbo rollouts) get one
-        # primary per prediction, last writer wins.
-        is_primary_pred = (
-            torch.is_grad_enabled()
-            and batch is not None
-            and batch.audio_pred_slot is None
-        )
+        audio_target = None
         with torch.no_grad():
             if self.model.device == torch.device("cpu"):
                 self.model.to(self.device_torch)
@@ -1713,22 +1716,27 @@ class LTX2Model(BaseModel):
                     raw_audio_latents = self.encode_audio(batch.audio_data)
 
                 audio_num_frames = raw_audio_latents.shape[1]
-                # add the audio targets to the batch for loss calculation later
                 # the audio noise is drawn once per step and shared by every
                 # pass (prior, primary, cfg/guidance, preservation) so they all
-                # see the same soundtrack and the stored target keeps matching
+                # see the same soundtrack and every pass's target matches. It
+                # rides on the latents DTO.
+                audio_noise = (
+                    batch.latents.get("audio_noise")
+                    if isinstance(batch.latents, DTO)
+                    else None
+                )
                 if (
-                    batch.audio_noise is not None
-                    and batch.audio_noise.shape == raw_audio_latents.shape
+                    audio_noise is not None
+                    and audio_noise.shape == raw_audio_latents.shape
                 ):
-                    audio_noise = batch.audio_noise.to(
+                    audio_noise = audio_noise.to(
                         raw_audio_latents.device, dtype=raw_audio_latents.dtype
                     )
                 else:
                     audio_noise = torch.randn_like(raw_audio_latents)
-                    batch.audio_noise = audio_noise
-                if batch.audio_target is None:
-                    batch.audio_target = (audio_noise - raw_audio_latents).detach()
+                    if batch.latents is not None:
+                        batch.latents = DTO(batch.latents, audio_noise=audio_noise)
+                audio_target = (audio_noise - raw_audio_latents).detach()
                 audio_latents = self.add_noise(
                     raw_audio_latents,
                     audio_noise,
@@ -1829,13 +1837,6 @@ class LTX2Model(BaseModel):
             return_dict=False,
         )
 
-        # add audio latent to batch if we had audio
-        if batch.audio_target is not None:
-            if is_primary_pred:
-                batch.audio_pred = noise_pred_audio
-            else:
-                batch.set_secondary_audio_pred(noise_pred_audio)
-
         unpacked_output = self.pipeline._unpack_latents(
             latents=noise_pred_video,
             num_frames=latent_num_frames,
@@ -1845,6 +1846,13 @@ class LTX2Model(BaseModel):
             patch_size_t=self.pipeline.transformer_temporal_patch_size,
         )
 
+        if audio_target is not None:
+            # every pass's DTO carries its own audio stream and target
+            return DTO(
+                unpacked_output,
+                audio=noise_pred_audio,
+                audio_target=audio_target,
+            )
         return unpacked_output
 
     # Minimum seconds between consecutive API calls to stay within rate limits
@@ -2188,6 +2196,13 @@ class LTX25Model(LTX2Model):
             transformer, transformer_sd, "transformer"
         )
         del transformer_sd
+        # dit_sd still references every transformer tensor (assign=True sharing);
+        # drop them so each block frees as it quantizes. Connector keys stay for
+        # the convert_ltx2_connectors call below.
+        trans_sd, _ = split_transformer_and_connector_state_dict(dit_sd)
+        for key in trans_sd:
+            dit_sd.pop(key, None)
+        del trans_sd
         if num_quantized_dit == 0:
             transformer = transformer.to(dtype)
         else:
