@@ -703,7 +703,7 @@ export default function SimpleJob({
                 placeholder="Path to .safetensors text encoder (optional — defaults to the arch's own resolution)"
               />
             )}
-            {modelArch?.additionalSections?.includes('model.layer_offloading') && !isMac() && !useGemmaApi && (
+            {modelArch?.additionalSections?.includes('model.layer_offloading') && !isMac() && (
               <>
                 <Checkbox
                   label={
@@ -729,18 +729,20 @@ export default function SimpleJob({
                       max={100}
                       step={1}
                     />
-                    <SliderInput
-                      label="Text Encoder Offload %"
-                      value={Math.round(
-                        (jobConfig.config.process[0].model.layer_offloading_text_encoder_percent ?? 1) * 100,
-                      )}
-                      onChange={value =>
-                        setJobConfig(value * 0.01, 'config.process[0].model.layer_offloading_text_encoder_percent')
-                      }
-                      min={0}
-                      max={100}
-                      step={1}
-                    />
+                    {!useGemmaApi && (
+                      <SliderInput
+                        label="Text Encoder Offload %"
+                        value={Math.round(
+                          (jobConfig.config.process[0].model.layer_offloading_text_encoder_percent ?? 1) * 100,
+                        )}
+                        onChange={value =>
+                          setJobConfig(value * 0.01, 'config.process[0].model.layer_offloading_text_encoder_percent')
+                        }
+                        min={0}
+                        max={100}
+                        step={1}
+                      />
+                    )}
                   </div>
                 )}
               </>
