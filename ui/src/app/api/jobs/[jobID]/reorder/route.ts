@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { PrismaClient } from '@prisma/client';
-
-const prisma = new PrismaClient();
+import prisma from '@/server/prisma';
+import { invalidateCache } from '@/server/apiCache';
 
 export async function POST(request: NextRequest, { params }: { params: { jobID: string } }) {
   const { jobID } = await params;
@@ -70,6 +69,11 @@ export async function POST(request: NextRequest, { params }: { params: { jobID: 
     } else {
       console.log(`Renumbered queue on GPU(s) ${job.gpu_ids} (duplicate positions healed)`);
     }
+    // The active-jobs list is cached for 5s. Without this the client's refresh
+    // right after a reorder is served the pre-move order, the optimistic row
+    // snaps back, and the new order only appears when the entry expires — the
+    // 5-10s "lag" that looks like a slow reorder but is a stale read.
+    invalidateCache('jobs-active');
   }
 
   return NextResponse.json({ success: true });

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
+import { invalidateCache } from '@/server/apiCache';
 import { getTrainingFolder } from '@/server/settings';
 import path from 'path';
 import fs from 'fs';
@@ -24,6 +25,10 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
   await prisma.job.delete({
     where: { id: jobID },
   });
+
+  // Serve the change immediately: the active-jobs list is cached for 5s, so
+  // without this the client's next poll is still shown the pre-change list.
+  invalidateCache('jobs-active');
 
   return NextResponse.json(job);
 }

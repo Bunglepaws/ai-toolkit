@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
 import { isMac } from '@/helpers/basic';
-import { cached } from '@/server/apiCache';
+import { cached, invalidateCache } from '@/server/apiCache';
 import {
   stripMootModelSettings,
   stripMootTrainSettings,
@@ -93,6 +93,9 @@ export async function POST(request: Request) {
           ...extra,
         },
       });
+  // Serve the change immediately: the active-jobs list is cached for 5s, so
+  // without this the client's next poll is still shown the pre-change list.
+      invalidateCache('jobs-active');
       return NextResponse.json(training);
     } else {
       // find the highest queue position and add 1000
@@ -113,6 +116,7 @@ export async function POST(request: Request) {
           ...extra,
         },
       });
+      invalidateCache('jobs-active');
       return NextResponse.json(training);
     }
   } catch (error: any) {
