@@ -115,6 +115,32 @@ async function findLiveTrainerOnGpu(gpuIds: string): Promise<Job | null> {
   return candidates.find(job => isTrainerAlive(job.pid)) ?? null;
 }
 
+/**
+ * Rewrite a GPU's queued jobs to positions 0..n-1, preserving their current
+ * order. Re-queuing below puts a job back with the position it held before it
+ * ran (deliberately — pausing and resuming the queue should resume that job in
+ * its old spot), but that position can collide with whatever a reorder has since
+ * renumbered into the slot. Duplicate positions make the queue unreorderable:
+ * the UI and the reorder API sort the same [queue_position, created_at] pair, so
+ * they agree on the order, but a duplicate still lets a plain up/down swap write
+ * each row its own value back and do nothing. Renumbering keeps relative order
+ * and removes the duplicate.
+ */
+async function renumberQueue(gpuIds: string): Promise<void> {
+  const queued: Job[] = await prisma.job.findMany({
+    where: { status: 'queued', gpu_ids: gpuIds },
+    orderBy: [{ queue_position: 'asc' }, { created_at: 'asc' }],
+  });
+  const writes = queued
+    .map((job, idx) => ({ job, idx }))
+    .filter(({ job, idx }) => job.queue_position !== idx);
+  if (writes.length === 0) return;
+  await prisma.$transaction(
+    writes.map(({ job, idx }) => prisma.job.update({ where: { id: job.id }, data: { queue_position: idx } })),
+  );
+  console.log(`Renumbered ${writes.length} queued job(s) on GPU(s) ${gpuIds}`);
+}
+
 export default async function processQueue() {
   const queues: Queue[] = await prisma.queue.findMany({
     orderBy: {
@@ -163,6 +189,16 @@ export default async function processQueue() {
             info: 'Job queued',
           },
         });
+      }
+
+      // The row is 'queued' but still carries its pre-run position, which may
+      // now duplicate another job's. Heal it in the same tick. Safe here: this
+      // whole block only runs while the queue is stopped, so nothing is being
+      // picked, and the renumber preserves order so the resumed job keeps its
+      // spot. Worst case a UI poll lands between the two writes and shows the
+      // stale position for one second.
+      if (stoppedRequeueJobs.length > 0) {
+        await renumberQueue(queue.gpu_ids);
       }
     }
     if (queue.is_running) {
