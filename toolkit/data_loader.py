@@ -837,43 +837,58 @@ def get_dataloader_from_datasets(
         else:
             raise ValueError(f"invalid dataset type: {config.type}")
 
-    # When combine_datasets is set and we have more than one dataset, merge all file
-    # lists into the first dataset and re-run bucket assignment on the combined pool.
-    # Each FileItemDTO retains its own dataset_config so per-item settings are preserved.
+    # When combine_datasets is set, merge the file lists so several folders train as
+    # though their images sat in one folder: one shared bucket pool, so batches can mix
+    # images across folders instead of each small folder bucketing alone.
+    #
+    # Merging is per compatibility group, not global. setup_buckets() reads resolution,
+    # buckets, square_crop and bucket_tolerance off the *dataset-level* config
+    # (self.dataset_config) rather than off each item, so items pooled into a primary get
+    # bucketed with the primary's values. Datasets disagreeing on those cannot share a
+    # pool without silently re-bucketing someone's images.
+    #
+    # That is not an error case, though: preprocess_dataset_raw_config() splits a single
+    # dataset with resolution [512, 1024] into two configs on the same folder, so
+    # differing resolutions are the normal multi-resolution setup, and rejecting them
+    # broke ordinary jobs. Grouping gives the intended behaviour in both directions: two
+    # folders at 512 merge into one pool, while a folder at [512, 1024] keeps one pool
+    # per resolution. Two folders both at [512, 1024] yield two pools each holding both
+    # folders, which is what physically copying them together would produce.
     if combine_datasets and len(datasets) > 1:
-        base_config = datasets[0].dataset_config
-        for ds in datasets[1:]:
-            dc = ds.dataset_config
-            if dc.resolution != base_config.resolution:
-                raise ValueError(
-                    f"combine_datasets requires all datasets to have the same resolution "
-                    f"({base_config.resolution} vs {dc.resolution} for {dc.folder_path or dc.dataset_path})"
-                )
-            if dc.buckets != base_config.buckets:
-                raise ValueError(
-                    f"combine_datasets requires all datasets to have the same buckets setting"
-                )
-            if dc.square_crop != base_config.square_crop:
-                raise ValueError(
-                    f"combine_datasets requires all datasets to have the same square_crop setting"
-                )
-
-        combined_file_list = []
+        groups = {}
         for ds in datasets:
-            combined_file_list.extend(ds.file_list)
+            dc = ds.dataset_config
+            key = (dc.resolution, dc.buckets, dc.square_crop, dc.bucket_tolerance)
+            groups.setdefault(key, []).append(ds)
 
-        primary = datasets[0]
-        primary.file_list = combined_file_list
-        if has_buckets:
-            # primary.epoch_num was already bumped to 1 by its own setup_epoch()
-            # during construction above, and setup_buckets() no-ops once
-            # epoch_num > 0 (see dataloader_mixins.py) — without resetting it
-            # here, the merged file list from the other dataset(s) would never
-            # actually get assigned to a bucket.
-            primary.epoch_num = 0
-            primary.setup_buckets()
-            primary.epoch_num = 1
-        datasets = [primary]
+        combined_datasets = []
+        for group in groups.values():
+            primary = group[0]
+            if len(group) > 1:
+                combined_file_list = []
+                for ds in group:
+                    combined_file_list.extend(ds.file_list)
+                primary.file_list = combined_file_list
+                if primary.dataset_config.buckets:
+                    # primary.epoch_num was already bumped to 1 by its own setup_epoch()
+                    # during construction above, and setup_buckets() no-ops once
+                    # epoch_num > 0 (see dataloader_mixins.py), so without resetting it
+                    # here the merged file list from the other dataset(s) would never
+                    # actually get assigned to a bucket.
+                    primary.epoch_num = 0
+                    primary.setup_buckets()
+                    primary.epoch_num = 1
+            combined_datasets.append(primary)
+
+        if len(combined_datasets) != len(datasets):
+            summary = ", ".join(
+                f"{len(g)} @ {key[0]}px" for key, g in groups.items()
+            )
+            print_acc(
+                f" - Combining {len(datasets)} datasets into "
+                f"{len(combined_datasets)} shared pool(s): {summary}"
+            )
+        datasets = combined_datasets
 
     concatenated_dataset = ConcatDataset(datasets)
 
