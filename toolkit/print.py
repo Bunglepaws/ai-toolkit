@@ -10,6 +10,23 @@ from toolkit.accelerator import get_accelerator
 _REAL_STDOUT = sys.stdout
 _REAL_STDERR = sys.stderr
 
+# The trainer's stdout is a pipe, so Python picks the Windows locale encoding
+# (cp1252) rather than UTF-8. Any print carrying a non-ASCII character then
+# raises UnicodeEncodeError -- and because prints happen inside end_step_hook,
+# that exception propagates out of the training loop and kills the job. A
+# single U+26A0 in a loss-spike alert did exactly that at step ~1250 of
+# sdxl_speedo_tan_line. Switch the real streams to replacement errors so an
+# unencodable character degrades to '?' instead of ending a run. Done at import
+# time so it also covers output written before setup_log_to_file() wraps them,
+# and direct writes to the real streams by library code.
+for _stream in (_REAL_STDOUT, _REAL_STDERR):
+    try:
+        _stream.reconfigure(errors='replace')
+    except Exception:
+        # Not a TextIOWrapper (already wrapped, or redirected to something
+        # exotic). Logger.write's own fallback still covers it.
+        pass
+
 
 def print_acc(*args, **kwargs):
     if get_accelerator().is_local_main_process:
@@ -67,9 +84,34 @@ class Logger:
         return ''.join(out)
 
     def write(self, message):
-        self.terminal.write(message)
-        self.log.write(self._stamp(message))
-        self.log.flush()  # Make sure it's written immediately
+        """Write to both the console and the log file, never raising.
+
+        A diagnostic must not be able to abort training. The streams can still
+        reject a character (a terminal whose encoding cannot be reconfigured,
+        for instance), so each write falls back to an ASCII-safe form of the
+        message rather than letting the error escape into the training loop.
+        """
+        self._safe_write(self.terminal, message)
+        self._safe_write(self.log, self._stamp(message))
+        try:
+            self.log.flush()  # Make sure it's written immediately
+        except Exception:
+            pass
+
+    @staticmethod
+    def _safe_write(stream, message):
+        try:
+            stream.write(message)
+        except UnicodeEncodeError:
+            encoding = getattr(stream, 'encoding', None) or 'ascii'
+            try:
+                stream.write(
+                    message.encode(encoding, errors='replace').decode(encoding, errors='replace')
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def flush(self):
         self.terminal.flush()
@@ -94,6 +136,10 @@ def setup_log_to_file(filename):
     # Wrap the real streams captured at import time — wrapping the
     # already-replaced sys.stdout would chain through the previous Logger and
     # double-write every message into every prior job's log file.
-    log_file = open(filename, 'a')
+    # Explicit UTF-8: without it the log file inherits the same cp1252 locale
+    # encoding as the console and rejects the exact characters the console
+    # rejects, so hardening only the terminal write would just move the crash
+    # one line down.
+    log_file = open(filename, 'a', encoding='utf-8', errors='replace')
     sys.stdout = Logger(_REAL_STDOUT, log_file)
     sys.stderr = Logger(_REAL_STDERR, log_file)
