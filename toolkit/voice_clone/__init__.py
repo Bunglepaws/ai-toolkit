@@ -75,6 +75,77 @@ def _write_wav(path: str, wav, sample_rate: int) -> None:
     torchaudio.save(path, t, sample_rate)
 
 
+# MEASURED 2026-08-21, not guessed. A long reference makes OmniVoice emit a phantom word
+# before the requested text -- "Focus.", "Lucas.", "Who I was." -- on EVERY clip. It is the
+# model still unwinding the reference before starting the target line, so it is audible and
+# it would train straight into the voice.
+#
+# Reference length vs a fixed line, everything else held constant:
+#     25.3s -> "Focus Who I was Hit the showers ..."   PHANTOM
+#     21.0s -> "Focus. What boys? Hit the showers ..." PHANTOM
+#     20.0s -> "Focus. Who I was. Hit the showers ..." PHANTOM
+#     16.0s -> "The rock was in the showers ..."       PHANTOM
+#     12.0s -> "All right boys, hit the showers ..."   CLEAN
+#
+# The model card advertises 3-25 s; the API docs say "3-10 seconds recommended". The
+# recommendation is the real number -- 25 s is where it stops erroring, not where it stops
+# degrading. Trailing silence alone does NOT fix it; length is the driver.
+REF_MAX_SECONDS = 12.0
+REF_MIN_SECONDS = 3.0
+# The prompt also wants a beat of silence to close on; references cut mid-flow are worse.
+REF_TAIL_SILENCE = 0.5
+
+_VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".wmv", ".flv")
+
+
+def _prepare_reference(path: str, work_dir: str, print_fn=print) -> str:
+    """Return a path to a reference clip inside OmniVoice's window.
+
+    Extracts the soundtrack from a video, trims an over-long recording, and refuses one
+    that is too short to clone from. Returns the original path untouched when it already
+    conforms, so the common case writes nothing.
+    """
+    import torch
+    import torchaudio
+
+    src = path
+    if os.path.splitext(path)[1].lower() in _VIDEO_EXTS:
+        # video reference: pull the soundtrack out first
+        import subprocess
+
+        src = os.path.join(work_dir, ".voice_ref_extracted.wav")
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-i", path, "-vn", "-acodec", "pcm_s16le", src],
+            check=True,
+        )
+        print_fn(f"Voice clone: extracted reference audio from {os.path.basename(path)}")
+
+    wav, sr = torchaudio.load(src)
+    seconds = wav.shape[-1] / sr
+
+    if seconds < REF_MIN_SECONDS:
+        raise ValueError(
+            f"Reference recording is {seconds:.2f}s; OmniVoice needs at least "
+            f"{REF_MIN_SECONDS:.0f}s to clone a voice from."
+        )
+
+    if seconds > REF_MAX_SECONDS:
+        wav = wav[..., : int(REF_MAX_SECONDS * sr)]
+        print_fn(
+            f"Voice clone: reference is {seconds:.2f}s, using the first "
+            f"{REF_MAX_SECONDS:.0f}s -- longer references make the model emit a phantom "
+            f"word before every line"
+        )
+
+    # close the prompt on silence so it is not cut mid-flow
+    wav = torch.cat([wav, torch.zeros(wav.shape[0], int(REF_TAIL_SILENCE * sr))], dim=-1)
+
+    out = os.path.join(work_dir, ".voice_ref_prepared.wav")
+    torchaudio.save(out, wav, sr)
+    return out
+
+
 def _caption(line: str, voice_description: str, trigger_word: str) -> str:
     """Caption the VOICE, not a picture, with the spoken words appended.
 
@@ -179,6 +250,7 @@ def ensure_voice_clips(config, audio_grid: AudioGrid, print_fn=print) -> Optiona
             raise ValueError("clone mode needs a reference_path")
         if not os.path.exists(ref_audio):
             raise ValueError(f"reference audio not found: {ref_audio}")
+        ref_audio = _prepare_reference(ref_audio, target, print_fn=print_fn)
 
         # Ask for the HOP-EXACT duration, not the nominal one: for 124 frames the model
         # wants 207*800 = 165600 samples (5.175s) while 124/24 is 5.1667s. Requesting the
