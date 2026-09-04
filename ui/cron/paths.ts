@@ -82,13 +82,6 @@ export const getQuantizationCacheDir = async () => {
   return path.join(trainingFolder, 'quantized');
 };
 
-export const getEnableHotModelReload = async () => {
-  const key = 'ENABLE_HOT_MODEL_RELOAD';
-  let row = await prisma.settings.findFirst({ where: { key } });
-  // default true — matches prior (always-on) behavior when the setting has never been saved
-  return row?.value ? row.value === 'true' : true;
-};
-
 // See ui/src/server/settings.ts getSamplePreviewEnabled -- same setting, this
 // copy is what startJob.ts reads to inject AITK_SAMPLE_PREVIEW into the
 // trainer's environment (cron runs from compiled dist/cron, separate from the

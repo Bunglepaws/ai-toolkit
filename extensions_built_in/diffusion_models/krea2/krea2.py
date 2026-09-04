@@ -31,7 +31,6 @@ from transformers import (
     AutoTokenizer,
     Qwen2TokenizerFast,
 )
-from optimum.quanto import freeze
 
 from toolkit.config_modules import GenerateImageConfig, ModelConfig, NetworkConfig
 from toolkit.lora_special import LoRASpecialNetwork
@@ -48,10 +47,8 @@ from toolkit.samplers.custom_flowmatch_sampler import (
 )
 from toolkit.accelerator import unwrap_model
 from toolkit.metadata import get_meta_for_safetensors
-from toolkit.memory_management import MemoryManager
 # still used by this fork's own load paths (see note in ltx2.py)
 from toolkit.print import print_timing
-from toolkit.util.quantize import quantize, get_qtype
 
 from .src.mmdit import (
     DoubleSharedModulation,
@@ -554,43 +551,6 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
             except Exception:
                 pass
 
-    def reload_text_encoder(self):
-        """Reload Qwen3-VL text encoder from disk after it was unloaded into a FakeTextEncoder stub.
-
-        Called by the persistent-process model cache (run_ui.py) when the hot model
-        is reused for a new job but the text encoder was already unloaded by the
-        previous job's embedding-caching step. Tokenizer and processors are already
-        on self.tokenizer / self.processor / self.vl_processor (the unloader never
-        touches them), so the reloaded copies are discarded.
-        """
-        # _load_text_encoder returns four values, not three
-        _tokenizer, _processor, _vl_processor, text_encoder = self._load_text_encoder()
-
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing text encoder")
-            text_encoder.to(self.device_torch)
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
-            freeze(text_encoder)
-            flush()
-
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_text_encoder_percent > 0
-        ):
-            MemoryManager.attach(
-                text_encoder,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
-            )
-
-        if self.model_config.low_vram:
-            text_encoder.to("cpu")
-        else:
-            text_encoder.to(self.device_torch)
-        flush()
-
-        self.text_encoder = text_encoder
-        self.pipeline = Krea2Pipeline(self)
 
     def load_model(self):
         dtype = self.torch_dtype

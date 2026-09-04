@@ -119,16 +119,6 @@ export const getCheckConfigEnableWebSearch = async () => {
   return val === 'true';
 };
 
-export const getEnableHotModelReload = async () => {
-  const key = 'ENABLE_HOT_MODEL_RELOAD';
-  let val = myCache.get(key) as string | undefined;
-  if (val !== undefined) return val === 'true';
-  const row = await prisma.settings.findFirst({ where: { key } });
-  val = row?.value || 'true';
-  myCache.set(key, val);
-  return val === 'true';
-};
-
 export const getSamplePreviewEnabled = async () => {
   const key = 'AITK_SAMPLE_PREVIEW';
   let val = myCache.get(key) as string | undefined;

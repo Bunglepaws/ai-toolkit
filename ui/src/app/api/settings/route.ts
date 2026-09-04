@@ -35,7 +35,6 @@ export async function GET() {
     // jobs within one process instead of a fresh load+quantize per job. Defaults to
     // on (matches prior behavior); can be turned off if it's ever suspected of
     // causing trouble.
-    if (!settingsObject.ENABLE_HOT_MODEL_RELOAD) settingsObject.ENABLE_HOT_MODEL_RELOAD = 'true';
 
     // Live sample preview (tiny-VAE decode of the clip forming during a
     // sample). Defaults to on, matching toolkit/sample_preview.py's own
@@ -76,7 +75,7 @@ export async function POST(request: Request) {
     const {
       HF_TOKEN, GEMMA_API_KEY, GEMMA_API_MODEL_ID_SOURCE, TRAINING_FOLDER, DATASETS_FOLDER, QUANTIZATION_CACHE_DIR, MODELS_PATH,
       CHECK_CONFIG_API_BASE_URL, CHECK_CONFIG_API_KEY, CHECK_CONFIG_MODEL,
-      CHECK_CONFIG_ENABLE_WEB_SEARCH, ENABLE_HOT_MODEL_RELOAD, AITK_SAMPLE_PREVIEW,
+      CHECK_CONFIG_ENABLE_WEB_SEARCH, AITK_SAMPLE_PREVIEW,
       OMNIVOICE_MODEL_PATH,
     } = body;
 
@@ -96,7 +95,6 @@ export async function POST(request: Request) {
       upsert('CHECK_CONFIG_API_KEY', CHECK_CONFIG_API_KEY ?? ''),
       upsert('CHECK_CONFIG_MODEL', CHECK_CONFIG_MODEL ?? ''),
       upsert('CHECK_CONFIG_ENABLE_WEB_SEARCH', CHECK_CONFIG_ENABLE_WEB_SEARCH ?? 'false'),
-      upsert('ENABLE_HOT_MODEL_RELOAD', ENABLE_HOT_MODEL_RELOAD ?? 'true'),
       upsert('AITK_SAMPLE_PREVIEW', AITK_SAMPLE_PREVIEW ?? 'true'),
       upsert('OMNIVOICE_MODEL_PATH', OMNIVOICE_MODEL_PATH ?? ''),
     ]);

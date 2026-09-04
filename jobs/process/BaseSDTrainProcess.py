@@ -2029,63 +2029,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 model_config_to_load.refiner_name_or_path = previous_refiner_save
                 self.load_training_state_from_metadata(previous_refiner_save)
 
-        _hot = getattr(BaseSDTrainProcess, '_hot_model', None)
-        BaseSDTrainProcess._hot_model = None
-        _hot_arch = getattr(_hot, 'arch', None) or getattr(type(_hot), 'arch', None)
-        _new_arch = getattr(model_config_to_load, 'arch', None)
-        _used_hot = False
-        _hot_model_enabled = os.environ.get('AITK_ENABLE_HOT_MODEL', '1') == '1'
-        _hot_transformer_intact = getattr(_hot, 'model', None) is not None
-        if not _hot_transformer_intact and _hot is not None:
-            print_acc(" - Model cache: cached model's transformer is missing; falling back to full load+quantize")
-        if _hot is not None and _hot_model_enabled and _hot_transformer_intact and type(_hot) is ModelClass and _hot_arch == _new_arch:
-            try:
-                self.sd = _hot
-                self.sd.model_config = model_config_to_load
-                # Clear hooks registered by the previous job's trainer. They are bound
-                # methods on a trainer object that no longer exists (its thread_pool was
-                # already shut down), so leaving them would crash the next call into
-                # maybe_stop()/status updates with "cannot schedule new futures after shutdown".
-                self.sd._status_update_hooks = []
-                self.sd._maybe_stop_hooks = []
-                self.sd._after_sample_img_hooks = []
-                self.hook_after_sd_init_before_load()
-                validate_control_paths(self.dataset_configs)
-                # If the previous job unloaded the text encoder (stub or empty from API mode)
-                # but the new job needs a local TE, reload it. Transformer stays in RAM.
-                from toolkit.unloader import FakeTextEncoder
-                te = getattr(self.sd, 'text_encoder', None)
-                new_uses_api = getattr(model_config_to_load, 'gemma_api_key', None) is not None
-                te_is_stub = (
-                    isinstance(te, list) and te and any(isinstance(enc, FakeTextEncoder) for enc in te)
-                ) or (te is not None and not isinstance(te, list) and isinstance(te, FakeTextEncoder))
-                te_missing = isinstance(te, list) and len(te) == 0 and not new_uses_api
-                if te_is_stub or te_missing:
-                    print_acc(" - Model cache hit: reusing transformer, reloading text encoder...")
-                    self.sd.reload_text_encoder()
-                else:
-                    print_acc(" - Model cache hit: reusing loaded model (skipping load+quantize)")
-                _used_hot = True
-            except Exception as hot_err:
-                import traceback
-                print_acc(f" - Model cache: hot load failed ({hot_err}); falling back to full load+quantize")
-                print_acc(traceback.format_exc())
-                self.sd = None
-
-        if not _used_hot:
-            self.sd = ModelClass(
-                # todo handle single gpu and multi gpu here
-                # device=self.device,
-                device=self.accelerator.device,
-                model_config=model_config_to_load,
-                dtype=self.train_config.dtype,
-                custom_pipeline=self.custom_pipeline,
-                noise_scheduler=sampler,
-            )
-            self.hook_after_sd_init_before_load()
-            validate_control_paths(self.dataset_configs)
-            # run base sd process run
-            self.sd.load_model()
+        self.sd = ModelClass(
+            # todo handle single gpu and multi gpu here
+            # device=self.device,
+            device=self.accelerator.device,
+            model_config=model_config_to_load,
+            dtype=self.train_config.dtype,
+            custom_pipeline=self.custom_pipeline,
+            noise_scheduler=sampler,
+        )
+        self.hook_after_sd_init_before_load()
+        validate_control_paths(self.dataset_configs)
+        # run base sd process run
+        self.sd.load_model()
 
         # Startup phase timing, opt-in via AITK_PROFILE_STARTUP=1. Model loading
         # turned out to be a small slice of time-to-first-step, so measure the

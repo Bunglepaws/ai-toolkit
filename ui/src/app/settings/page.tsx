@@ -255,26 +255,6 @@ export default function Settings() {
                   <label className="flex items-start gap-3 cursor-pointer">
                     <input
                       type="checkbox"
-                      name="ENABLE_HOT_MODEL_RELOAD"
-                      checked={settings.ENABLE_HOT_MODEL_RELOAD === 'true'}
-                      onChange={handleChange}
-                      className="mt-1 h-4 w-4 rounded border-gray-600 bg-gray-800 text-blue-500 focus:ring-blue-500"
-                    />
-                    <span className="text-sm font-medium">
-                      Enable Hot Model Reload Between Jobs
-                      <div className="text-gray-500 text-sm font-normal mt-1">
-                        When consecutive queued jobs use the same model/quantization, reuse the already-loaded
-                        model instead of a fresh load+quantize, saving startup time. This is a newer, less-tested
-                        code path — turn it off if you suspect it&apos;s causing issues between jobs.
-                      </div>
-                    </span>
-                  </label>
-                </div>
-
-                <div>
-                  <label className="flex items-start gap-3 cursor-pointer">
-                    <input
-                      type="checkbox"
                       name="AITK_SAMPLE_PREVIEW"
                       checked={settings.AITK_SAMPLE_PREVIEW === 'true'}
                       onChange={handleChange}
