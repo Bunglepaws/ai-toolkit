@@ -86,6 +86,82 @@ function isTrainerAlive(pid: number | null): boolean {
 }
 
 /**
+ * How often to sweep for orphaned DataLoader workers. The queue ticks every
+ * second and this shells out to powershell, so it must not run every tick.
+ */
+const ORPHAN_SWEEP_INTERVAL_MS = 60000;
+let lastOrphanSweepAt = 0;
+
+/**
+ * Kill DataLoader workers whose trainer is gone.
+ *
+ * A trainer runs as `pythonw.exe run_ui.py` and its torch DataLoader workers are
+ * `pythonw.exe -c "...spawn_main(parent_pid=N)" --multiprocessing-fork` children
+ * of it. `taskkill /T` on the recorded pid does take the whole tree -- verified
+ * -- but that only ever runs for a *hung* job: the stop route's force-kill
+ * backstop gives up the moment the pid dies, so a job that stops correctly is
+ * cleaned up by Python's own multiprocessing teardown. When that teardown does
+ * not complete, the workers are left with nothing to collect them and sit there
+ * indefinitely holding RAM. Killing only the inner pid without /T reproduces it
+ * exactly.
+ *
+ * Safety: only a worker whose *parent no longer exists* is touched. A live
+ * trainer's workers always have a live parent, so this cannot reach a running
+ * job. A recycled parent PID reads as alive and the worker is skipped, which is
+ * the conservative direction -- it just survives to the next sweep. Scoped to
+ * pythonw.exe because that is what the detached trainer is launched as; other
+ * python multiprocessing apps on this box (ComfyUI, interactive scripts) run
+ * python.exe and are never candidates.
+ */
+function reapOrphanedDataloaderWorkers(): void {
+  if (process.platform !== 'win32') return;
+
+  let listing: string;
+  try {
+    listing = execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | ` +
+          `Where-Object { $_.CommandLine -like '*--multiprocessing-fork*' } | ` +
+          `ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }`,
+      ],
+      { encoding: 'utf8', timeout: 15000, windowsHide: true },
+    );
+  } catch {
+    // Could not enumerate. Nothing is wrong enough to act on blindly.
+    return;
+  }
+
+  for (const line of listing.split(/\r?\n/)) {
+    const [pidText, parentText] = line.trim().split(/\s+/);
+    const pid = Number(pidText);
+    const parentPid = Number(parentText);
+    if (!Number.isInteger(pid) || !Number.isInteger(parentPid) || pid <= 0) continue;
+
+    try {
+      process.kill(parentPid, 0);
+      continue; // parent still there (or a recycled pid) -- leave it alone
+    } catch (e: any) {
+      if (e?.code === 'EPERM') continue; // exists, not ours to signal
+    }
+
+    try {
+      execFileSync('taskkill.exe', ['/PID', String(pid), '/F'], {
+        stdio: 'ignore',
+        timeout: 10000,
+        windowsHide: true,
+      });
+      console.log(`Reaped orphaned dataloader worker ${pid} (parent ${parentPid} is gone)`);
+    } catch {
+      // already exited between listing and kill
+    }
+  }
+}
+
+/**
  * How long a row may sit at 'running' with no pid before we call it dead.
  *
  * A launch is not atomic: startJob flips the row to 'running' first and can only
@@ -142,6 +218,14 @@ async function renumberQueue(gpuIds: string): Promise<void> {
 }
 
 export default async function processQueue() {
+  // Collect any workers left behind by a trainer that is already gone. Cheap to
+  // skip, throttled because the queue ticks every second, and independent of any
+  // queue state -- orphans outlive the job row that produced them.
+  if (Date.now() - lastOrphanSweepAt >= ORPHAN_SWEEP_INTERVAL_MS) {
+    lastOrphanSweepAt = Date.now();
+    reapOrphanedDataloaderWorkers();
+  }
+
   const queues: Queue[] = await prisma.queue.findMany({
     orderBy: {
       id: 'asc',
