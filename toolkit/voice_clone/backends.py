@@ -3,17 +3,21 @@
 One method, so another engine (Qwen Voice, Fish S2, ...) slots in by adding a class and a
 registry entry -- nothing in the generation flow changes.
 
-Three measured facts about OmniVoice shape this (verified 2026-08-18, v0.2.1):
+**Generation is NATURAL LENGTH, not forced.** An earlier version passed `duration=` to
+land each clip on an exact H3 grid slot. Measured 2026-08-21: forcing duration on a line
+whose natural length is shorter makes the model fill the gap by repeating words, stuttering,
+or over-emphasising -- audible defects, not edge cases (3 of 12 clips in one real run).
+Comparing the same three lines with `speed=0.9` instead of a forced duration, all three came
+out clean. So generation now asks for natural delivery and the RESULT is fit to the grid
+afterwards -- the dataset loader already re-derives a clip's frame count from its actual
+on-disk duration (see toolkit/dataloader_mixins.py's voice-item path), so nothing downstream
+needed to change for this.
 
-  * `duration` lands within one TTS token, not exactly. OmniVoice quantizes to its own
-    ~40 ms grid and rounds DOWN -- asking for 5.175 s returned 5.160 s on every clip.
-    That removes the generate-measure-snap-discard SEARCH, but the caller's hop-exact
-    pad is still load-bearing, not a rounding guard.
-  * `postprocess_output=True` is free here. The docs warn it trims trailing silence and
-    shortens output; measured, with `duration` set the model fills the time with speech
-    so there is nothing to trim -- output was identical either way. Leave it and
-    `denoise` on: an artefact in a training corpus repeats across every clip instead of
-    averaging out.
+Other measured facts (verified 2026-08-18/21, v0.2.1):
+
+  * `postprocess_output=True` is free. Docs warn it trims trailing silence and shortens
+    output; measured, output was the same length either way. Leave it and `denoise` on:
+    an artefact in a training corpus repeats across every clip instead of averaging out.
   * Generation is stochastic. Two unseeded runs of the same text differ (max sample
     delta 0.92), so a cycled dialogue line genuinely gets a different take. Seeding via
     `torch.manual_seed` makes that reproducible without making it uniform.
@@ -44,13 +48,16 @@ class TTSBackend(ABC):
     def generate(
         self,
         texts: List[str],
-        durations: List[float],
         ref_audio: Optional[str] = None,
         ref_text: Optional[str] = None,
         instruct: Optional[str] = None,
         seed: int = 42,
     ) -> List[np.ndarray]:
-        """One waveform per text, each `durations[i]` seconds (to within one TTS token).
+        """One waveform per text, at whatever length the voice naturally delivers it.
+
+        No duration is requested -- see the module docstring for why forcing one produces
+        audible repetition/stutter/over-emphasis. The caller fits the result to the H3 grid
+        afterwards; it does not need to know the length in advance.
 
         Exactly one of `ref_audio` (clone) or `instruct` (design) is given.
 
@@ -100,10 +107,14 @@ class OmniVoiceBackend(TTSBackend):
             self.model_path, device_map=self.device, dtype=torch.bfloat16
         )
 
+    # Marc's ComfyUI workflow uses 0.9; adopted as the default here after measuring that
+    # forcing an exact duration (the previous approach) makes the model fill short lines
+    # with repeated words, stutters, or over-emphasis to hit the target length.
+    NATURAL_SPEED = 0.9
+
     def generate(
         self,
         texts: List[str],
-        durations: List[float],
         ref_audio: Optional[str] = None,
         ref_text: Optional[str] = None,
         instruct: Optional[str] = None,
@@ -135,27 +146,22 @@ class OmniVoiceBackend(TTSBackend):
             kwargs["instruct"] = instruct
 
         out = []
-        for i, (text, dur) in enumerate(zip(texts, durations)):
+        for i, text in enumerate(texts):
             # seed+i: reproducible run, but a repeated line still gets its own take
             torch.manual_seed(seed + i)
             audio = self.model.generate(
                 text=text,
-                duration=float(dur),
+                # NATURAL length -- no `duration=`. See NATURAL_SPEED above and the
+                # module docstring for why forcing a target length backfired.
+                speed=self.NATURAL_SPEED,
                 # Cleaner speech. Worth having in training data -- any artefact here is
                 # reproduced identically across every clip rather than averaging out.
                 denoise=True,
-                # Strips dead air. This makes the output shorter than `duration` asks
-                # for, which would be fatal if we needed exact lengths -- but we don't:
-                # OmniVoice quantizes to its own ~40 ms token grid anyway and always
-                # lands short, so the loader's hop-exact pad is load-bearing either way.
-                # Given that, trimming dead air and padding the tail beats training on
-                # the model's own pauses.
+                # Strips dead air.
                 postprocess_output=True,
                 # cleans the REFERENCE: strips its long silences and punctuates the
-                # transcript. Matters for a 20 s recording used as a voice prompt.
+                # transcript.
                 preprocess_prompt=True,
-                # 0.1 s of silence per side is 22% of the shortest slot
-                pad_duration=0.0,
                 # keep a hair of fade so clip edges don't click
                 fade_duration=0.01,
                 **kwargs,

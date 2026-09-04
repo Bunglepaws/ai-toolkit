@@ -116,6 +116,14 @@ def decide(target_dataset: str, fingerprint: Dict, token: str) -> Tuple[str, Opt
         return "regenerate", m
 
     if m.get("fingerprint") == fingerprint:
+        # The manifest is a record, not the truth. If clips it lists are gone -- deleted by
+        # hand because a couple sounded wrong -- regenerate rather than skipping into a run
+        # with a half-empty voice dataset. Deleting the files is the obvious way to ask for a
+        # rebuild, so it should work as well as the button does.
+        gone = [f for f in (m.get("files") or [])
+                if not os.path.exists(os.path.join(target_dataset, f))]
+        if gone:
+            return "regenerate", m
         return "skip", m
 
     changes = describe_changes(m.get("fingerprint", {}), fingerprint)

@@ -75,37 +75,26 @@ def _write_wav(path: str, wav, sample_rate: int) -> None:
     torchaudio.save(path, t, sample_rate)
 
 
-# MEASURED 2026-08-21, not guessed. A long reference makes OmniVoice emit a phantom word
-# before the requested text -- "Focus.", "Lucas.", "Who I was." -- on EVERY clip. It is the
-# model still unwinding the reference before starting the target line, so it is audible and
-# it would train straight into the voice.
-#
-# Reference length vs a fixed line, everything else held constant:
-#     25.3s -> "Focus Who I was Hit the showers ..."   PHANTOM
-#     21.0s -> "Focus. What boys? Hit the showers ..." PHANTOM
-#     20.0s -> "Focus. Who I was. Hit the showers ..." PHANTOM
-#     16.0s -> "The rock was in the showers ..."       PHANTOM
-#     12.0s -> "All right boys, hit the showers ..."   CLEAN
-#
-# The model card advertises 3-25 s; the API docs say "3-10 seconds recommended". The
-# recommendation is the real number -- 25 s is where it stops erroring, not where it stops
-# degrading. Trailing silence alone does NOT fix it; length is the driver.
-REF_MAX_SECONDS = 12.0
+# No length cap. A first pass here trimmed anything over 12s, on the theory that a long
+# reference makes OmniVoice emit a phantom word before the line. That held on one specific
+# recording (cut mid-utterance, no closing silence) but not on a same-speaker pair Marc
+# tested at 19.8s and 41.1s -- both clean, and the 41.1s one gave the fuller, better take.
+# So length was never the real variable; whatever made the one bad reference bad was
+# specific to that file. Marc picks the reference and can hear whether it is good -- this
+# code does not need to second-guess it. Video extraction and the hard minimum (below the
+# API's own floor, generation would just fail) stay; nothing else does.
 REF_MIN_SECONDS = 3.0
-# The prompt also wants a beat of silence to close on; references cut mid-flow are worse.
-REF_TAIL_SILENCE = 0.5
 
 _VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".wmv", ".flv")
 
 
 def _prepare_reference(path: str, work_dir: str, print_fn=print) -> str:
-    """Return a path to a reference clip inside OmniVoice's window.
+    """Return a path to a usable reference clip.
 
-    Extracts the soundtrack from a video, trims an over-long recording, and refuses one
-    that is too short to clone from. Returns the original path untouched when it already
-    conforms, so the common case writes nothing.
+    Extracts the soundtrack from a video reference and refuses one that is too short to
+    clone from at all. Returns the original path untouched otherwise -- the common case
+    writes nothing.
     """
-    import torch
     import torchaudio
 
     src = path
@@ -130,20 +119,7 @@ def _prepare_reference(path: str, work_dir: str, print_fn=print) -> str:
             f"{REF_MIN_SECONDS:.0f}s to clone a voice from."
         )
 
-    if seconds > REF_MAX_SECONDS:
-        wav = wav[..., : int(REF_MAX_SECONDS * sr)]
-        print_fn(
-            f"Voice clone: reference is {seconds:.2f}s, using the first "
-            f"{REF_MAX_SECONDS:.0f}s -- longer references make the model emit a phantom "
-            f"word before every line"
-        )
-
-    # close the prompt on silence so it is not cut mid-flow
-    wav = torch.cat([wav, torch.zeros(wav.shape[0], int(REF_TAIL_SILENCE * sr))], dim=-1)
-
-    out = os.path.join(work_dir, ".voice_ref_prepared.wav")
-    torchaudio.save(out, wav, sr)
-    return out
+    return src
 
 
 def _caption(line: str, voice_description: str, trigger_word: str) -> str:
@@ -213,9 +189,11 @@ def ensure_voice_clips(config, audio_grid: AudioGrid, print_fn=print) -> Optiona
         n = _manifest.delete_generated(target, existing)
         print_fn(f"Voice clone: regenerate requested, removed {n} previous clip(s).")
 
-    total_s = sum(audio_grid.seconds_for_frames(f) for f in frame_counts)
+    # Estimate only -- generation is natural length now, not forced, so actual total
+    # is reported after the fact from what was really produced (see the histogram below).
+    est_s = sum(audio_grid.seconds_for_frames(f) for f in frame_counts)
     print_fn(
-        f"Voice clone: generating {len(frame_counts)} clip(s), {total_s:.1f}s total, "
+        f"Voice clone: generating {len(frame_counts)} clip(s), ~{est_s:.1f}s estimated, "
         f"via {config.backend} ({config.mode} mode)"
     )
 
@@ -237,11 +215,7 @@ def ensure_voice_clips(config, audio_grid: AudioGrid, print_fn=print) -> Optiona
                 if not config.instruct:
                     raise ValueError("design mode needs an 'instruct' string")
                 print_fn(f"Voice clone: designing a seed voice -- {config.instruct}")
-                seed_wav = backend.generate(
-                    [lines[0]],
-                    [audio_grid.seconds_for_frames(frame_counts[0])],
-                    instruct=config.instruct,
-                )[0]
+                seed_wav = backend.generate([lines[0]], instruct=config.instruct)[0]
                 _write_wav(seed_path, seed_wav, backend.sample_rate)
                 print_fn(f"Voice clone: seed voice written to {seed_path}")
             ref_audio, ref_text = seed_path, lines[0]
@@ -252,20 +226,18 @@ def ensure_voice_clips(config, audio_grid: AudioGrid, print_fn=print) -> Optiona
             raise ValueError(f"reference audio not found: {ref_audio}")
         ref_audio = _prepare_reference(ref_audio, target, print_fn=print_fn)
 
-        # Ask for the HOP-EXACT duration, not the nominal one: for 124 frames the model
-        # wants 207*800 = 165600 samples (5.175s) while 124/24 is 5.1667s. Requesting the
-        # hop-exact length lands the sample count right and leaves the dataloader's fit
-        # as a few-sample guard rather than a real cut.
-        durations = [
-            audio_grid.hop_exact_samples(f) / audio_grid.sample_rate for f in frame_counts
-        ]
+        # NATURAL length -- no duration requested. See backends.py for why forcing one
+        # produced audible repetition/stutter/over-emphasis. Each clip lands wherever the
+        # voice naturally delivers the line; the dataset loader (dataloader_mixins.py's
+        # voice-item path) re-derives the frame count from each file's actual on-disk
+        # duration at load time, so nothing here needs to hit a pre-chosen slot.
         wavs = backend.generate(
-            lines, durations, ref_audio=ref_audio, ref_text=ref_text,
+            lines, ref_audio=ref_audio, ref_text=ref_text,
             seed=int(getattr(config, 'seed', 42)),
         )
 
         hist = {}
-        for i, (wav, frames) in enumerate(zip(wavs, frame_counts)):
+        for i, wav in enumerate(wavs):
             name = f"voice_{i + 1:04d}.wav"
             _write_wav(os.path.join(target, name), wav, backend.sample_rate)
             with open(
@@ -275,13 +247,20 @@ def ensure_voice_clips(config, audio_grid: AudioGrid, print_fn=print) -> Optiona
             ) as f:
                 f.write(_caption(lines[i], config.voice_description, config.trigger_word))
             written.append(name)
-            hist[frames] = hist.get(frames, 0) + 1
+            # Informational only: which grid slot the loader will fit this clip into,
+            # for the histogram below. The loader makes the real decision independently.
+            actual_seconds = len(wav) / backend.sample_rate
+            slot = audio_grid.snap_down(actual_seconds) or audio_grid.frame_counts[0]
+            hist[slot] = hist.get(slot, 0) + 1
     finally:
         # Release before the diffusion model loads, whatever happened.
         backend.unload()
 
     _manifest.write(
         target, fingerprint, written, getattr(config, "regenerate_token", "")
+    )
+    actual_total_s = sum(
+        audio_grid.seconds_for_frames(f) * n for f, n in hist.items()
     )
     print_fn(
         "Voice clone: wrote "
@@ -290,4 +269,4 @@ def ensure_voice_clips(config, audio_grid: AudioGrid, print_fn=print) -> Optiona
         )
         + f" -> {target}"
     )
-    return {"action": action, "files": written, "total_seconds": total_s}
+    return {"action": action, "files": written, "total_seconds": actual_total_s}

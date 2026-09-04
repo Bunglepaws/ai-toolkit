@@ -94,16 +94,19 @@ def main():
         p.error(f'{arch} does not support audio-only training items')
 
     if args.dry_run:
+        # Generation is natural length now (see toolkit/voice_clone/backends.py) -- clip
+        # count is still estimated from target_seconds, but per-clip duration is not
+        # known until the model actually speaks the line, so this only shows the plan,
+        # not a duration table.
         counts = _pick_frame_counts(grid, float(cfg.target_seconds), cfg.duration_mix)
         lines = resolve_dialogue(list(cfg.dialogue or []), len(counts))
         validate_tags(lines)
-        total = sum(grid.seconds_for_frames(f) for f in counts)
-        print(f'{len(counts)} clip(s), {total:.1f}s total, mix={cfg.duration_mix}')
+        print(f'{len(counts)} clip(s) planned (~{cfg.target_seconds:.0f}s target), '
+              f'mix={cfg.duration_mix}')
         print(f'bank: {len(cfg.dialogue or DEFAULT_DIALOGUE)} line(s)')
         from toolkit.voice_clone import _caption
-        for i, (f, line) in enumerate(zip(counts, lines), 1):
-            print(f'  {i:>3}. {grid.seconds_for_frames(f):.3f}s '
-                  f'({grid.hop_exact_samples(f)} samples) | {line}')
+        for i, line in enumerate(lines, 1):
+            print(f'  {i:>3}. {line}')
             print(f'       -> {_caption(line, cfg.voice_description, cfg.trigger_word)}')
         return
 
