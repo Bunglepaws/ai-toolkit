@@ -112,6 +112,14 @@ export default function JobActionBar({
   };
 
   const isBusy = pending !== null || isJobBusy;
+  // Mark as Stopped is the recovery action for a job whose row says 'running'
+  // but whose trainer is gone, so it must NOT be gated on isJobBusy. That is
+  // save_now/sample still set on a running row -- exactly the state a job hung
+  // mid-save or mid-sample is left in, which is when this is needed most. Same
+  // reasoning as canStop in getAvaliableJobActions, which deliberately ignores
+  // isBusy so a stuck job can still be killed. Only the local in-flight lock
+  // applies here, to stop a double click firing two requests.
+  const isMarkStoppedBusy = pending !== null;
   const iconSizeClass = 'w-5 h-5 sm:w-6 sm:h-6';
   const actionButtonClass = 'ml-1 sm:ml-2 opacity-100 disabled:opacity-40 disabled:cursor-not-allowed';
   const menuItemClass = 'px-4 py-1 rounded flex items-center gap-2';
@@ -366,11 +374,11 @@ export default function JobActionBar({
               </div>
             </MenuItem>
           )}
-          <MenuItem disabled={isBusy}>
+          <MenuItem disabled={isMarkStoppedBusy}>
             <div
-              className={isBusy ? menuItemDisabledClass : menuItemEnabledClass}
+              className={isMarkStoppedBusy ? menuItemDisabledClass : menuItemEnabledClass}
               onClick={() => {
-                if (isBusy) return;
+                if (isMarkStoppedBusy) return;
                 let message = `Are you sure you want to mark this job as stopped? This will set the job status to 'stopped' if the status is hung. Only do this if you are 100% sure the job is stopped. This will NOT stop the job.`;
                 openConfirm({
                   title: 'Mark Job as Stopped',
