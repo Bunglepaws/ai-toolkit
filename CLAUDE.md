@@ -19,11 +19,11 @@ these known fork customizations are still present before considering the merge d
 - `toolkit/dataloader_mixins.py`: our `read_text_file` + JSON caption parsing (`caption`/`caption_short`/`extra_values`) and `PoiFileItemDTOMixin`
 - `ui/src/app/jobs/new/SimpleJob.tsx`: MRU LoRA input (`LoraPathInput`/`MruTextInput`), neg-prompt hidden for ideogram4, per-dataset Trigger Word field
 - `ui/src/app/jobs/new/options.tsx`: `sample.neg` in `DisableableSections` for ideogram4
-- `ui/src/app/layout.tsx`: `StopJobModal` and `StripAudioModal` alongside any new Ostris modals
+- `ui/src/app/layout.tsx`: `SaveStopJobModal` and `StripAudioModal` alongside any new Ostris modals
 - `ui/src/helpers/defaultSamples.ts`: `guidance_scale: 7` in `defaultIdeogramSamplesConfig`
 - `ui/src/components/SampleImageViewer.tsx`: both our `promptExpanded` state and Ostris's `showBoxes` state
 - `ui/src/components/SampleImageViewer.tsx` and `ui/src/components/DatasetImageViewer.tsx`: `videoMute` wired onto the `<video>` (sticky mute); `ui/src/hooks/useVideoMute.ts` is fork-only and shouldn't be touched by a merge at all
-- `ui/src/components/StopJobModal.tsx`, `SaveSnapshotModal.tsx`, `QueueStatusWidget.tsx`, `JobTrainingSessions.tsx`, and the `/api/jobs/[jobID]/save_and_pause`, `/save_and_requeue`, `/save_now` routes: fork-only, shouldn't be touched by a merge at all — confirm they still exist
+- `ui/src/components/SaveStopJobModal.tsx` (the single save/stop dialog; replaced the old `StopJobModal.tsx` + `SaveSnapshotModal.tsx` pair), `QueueStatusWidget.tsx`, `JobTrainingSessions.tsx`, and the `/api/jobs/[jobID]/save_and_pause`, `/save_and_requeue` routes: fork-only, shouldn't be touched by a merge at all — confirm they still exist
 
 A one-line `grep -c` per marker (see chat history for the exact commands) is enough — report which markers you
 checked and that they survived, don't just say "looks fine." Also `py_compile` any touched `.py` files and

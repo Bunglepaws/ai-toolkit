@@ -66,22 +66,6 @@ export const gracefulStopJob = (jobID: string) => {
   });
 };
 
-export const saveJob = (jobID: string) => {
-  return new Promise<void>((resolve, reject) => {
-    apiClient
-      .get(`/api/jobs/${jobID}/save`)
-      .then(res => res.data)
-      .then(data => {
-        console.log('Job save requested:', data);
-        resolve();
-      })
-      .catch(error => {
-        console.error('Error requesting job save:', error);
-        reject(error);
-      });
-  });
-};
-
 export const saveAndPauseJob = (jobID: string) => {
   return new Promise<void>((resolve, reject) => {
     apiClient

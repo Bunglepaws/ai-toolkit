@@ -81,9 +81,9 @@ check "Global mute preference storage key"   "ui/src/hooks/useVideoMute.ts"   "a
 
 echo
 echo "── UI: JobActionBar ─────────────────────────"
-check "SaveSnapshotModal import" \
+check "SaveStopJobModal import" \
   "ui/src/components/JobActionBar.tsx" \
-  "openSaveSnapshotModal"
+  "openSaveStopJobModal"
 check "Save snapshot button (canSave)" \
   "ui/src/components/JobActionBar.tsx" \
   "canSave"
@@ -93,9 +93,15 @@ check "Generate samples button (canSample)" \
 check "Edit sample prompts while running (canEditSample)" \
   "ui/src/components/JobActionBar.tsx" \
   "canEditSample"
-check "Save snapshot modal wired in JobActionBar" \
-  "ui/src/components/JobActionBar.tsx" \
-  "openSaveSnapshotModal"
+check "SaveStopJobModal rendered in layout" \
+  "ui/src/app/layout.tsx" \
+  "SaveStopJobModal"
+check "Save/stop dialog offers all four actions" \
+  "ui/src/components/SaveStopJobModal.tsx" \
+  "saveJobNow, saveAndPauseJob, saveAndRequeueJob, gracefulStopJob"
+check "Save and Stop Queue pins the job to the head of the queue" \
+  "ui/src/app/api/jobs/[jobID]/save_and_requeue/route.ts" \
+  "queue_position: 0"
 check "sampleJob imported" \
   "ui/src/components/JobActionBar.tsx" \
   "sampleJob"

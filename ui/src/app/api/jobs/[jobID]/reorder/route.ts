@@ -51,13 +51,24 @@ export async function POST(request: NextRequest, { params }: { params: { jobID: 
     reordered.splice(destIndex, 0, removed);
   }
 
-  // Renumber to 0..n-1 rather than swapping the two rows' positions. A swap
-  // between rows that happen to share a position writes each one its own value
-  // back, so the move silently does nothing. Renumbering also heals the
+  // A job that is still running but already flagged return_to_queue (Save and
+  // Stop Queue) is pinned to position 0 by that route, because it must come back
+  // at the head of the queue. It is not in `queueJobs` — nothing here is allowed
+  // to move it — so renumber the queued rows from 1 instead of 0 and leave slot 0
+  // to it. Without this, a reorder in the window between the click and the
+  // trainer actually exiting writes a queued job into slot 0 and the pin is lost.
+  const pendingRequeue = await prisma.job.count({
+    where: { gpu_ids: job.gpu_ids, status: { in: ['running', 'stopping'] }, return_to_queue: true },
+  });
+  const base = pendingRequeue > 0 ? 1 : 0;
+
+  // Renumber to base..base+n-1 rather than swapping the two rows' positions. A
+  // swap between rows that happen to share a position writes each one its own
+  // value back, so the move silently does nothing. Renumbering also heals the
   // duplicate, so a queue that got into that state fixes itself on the next
   // reorder instead of staying stuck.
   const writes = reordered
-    .map((j, idx) => ({ j, idx }))
+    .map((j, idx) => ({ j, idx: idx + base }))
     .filter(({ j, idx }) => j.queue_position !== idx);
 
   if (writes.length > 0) {

@@ -4,9 +4,8 @@ import { Eye, Trash2, Pen, Play, Pause, Cog, X, Copy, Save, OctagonX, Camera, Ar
 import { LuLoader } from 'react-icons/lu';
 import { Button } from '@headlessui/react';
 import { openConfirm } from '@/components/ConfirmModal';
-import { openSaveSnapshotModal } from '@/components/SaveSnapshotModal';
+import { openSaveStopJobModal } from '@/components/SaveStopJobModal';
 import { openResumeFromCheckpointModal } from '@/components/ResumeFromCheckpointModal';
-import { openStopJobModal } from '@/components/StopJobModal';
 import { Job } from '@prisma/client';
 import {
   startJob,
@@ -171,14 +170,11 @@ export default function JobActionBar({
         <Button
           onClick={() => {
             if (isBusy) return;
-            openSaveSnapshotModal({
-              job,
-              onRefresh,
-            });
+            openSaveStopJobModal({ job, onRefresh });
           }}
           disabled={isBusy}
           className={actionButtonClass}
-          title="Save Snapshot"
+          title="Save Snapshot / Stop Job"
         >
           <Save className={iconSizeClass} />
         </Button>
@@ -228,10 +224,10 @@ export default function JobActionBar({
           disabled={isBusy}
           onClick={() => {
             if (!canStop || isBusy) return;
-            openStopJobModal({ job, onRefresh: onRefresh });
+            openSaveStopJobModal({ job, onRefresh });
           }}
           className={actionButtonClass}
-          title="Stop Job"
+          title="Save Snapshot / Stop Job"
         >
           <Pause className={iconSizeClass} />
         </Button>

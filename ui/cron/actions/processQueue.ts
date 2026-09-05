@@ -328,14 +328,16 @@ export default async function processQueue() {
       }
 
       // find the next job in the queue
+      // Tie-break on created_at, matching the reorder API and the UI's
+      // compareQueueOrder. With queue_position alone, two rows sharing a position
+      // are ordered arbitrarily by SQLite, so the job the user sees at the top of
+      // the queue is not necessarily the one that gets picked.
       const nextJob: Job | null = await prisma.job.findFirst({
         where: {
           status: 'queued',
           gpu_ids: queue.gpu_ids,
         },
-        orderBy: {
-          queue_position: 'asc',
-        },
+        orderBy: [{ queue_position: 'asc' }, { created_at: 'asc' }],
       });
       if (nextJob) {
         console.log(`Starting job ${nextJob.id} on GPU(s) ${nextJob.gpu_ids}`);
