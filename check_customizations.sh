@@ -80,6 +80,13 @@ echo "── UI: useVideoMute ────────────────�
 check "Global mute preference storage key"   "ui/src/hooks/useVideoMute.ts"   "aitk_video_muted"
 
 echo
+echo "── UI: Datasets list columns ────────────────"
+check "Dataset stats API route exists"   "ui/src/app/api/datasets/stats/route.ts"   "captionExtensions"
+check "Dataset stats hook exists"   "ui/src/hooks/useDatasetStats.tsx"   "api/datasets/stats"
+check "Datasets page uses the stats hook"   "ui/src/app/datasets/page.tsx"   "useDatasetStats"
+check "Datasets sort preference storage key"   "ui/src/app/datasets/page.tsx"   "aitk_datasets_sort"
+
+echo
 echo "── UI: JobActionBar ─────────────────────────"
 check "SaveStopJobModal import" \
   "ui/src/components/JobActionBar.tsx" \

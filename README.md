@@ -76,6 +76,8 @@ This is a personal fork of [ostris/ai-toolkit](https://github.com/ostris/ai-tool
 
 ### UI — Datasets / Captions
 
+- **Dataset list columns** — the datasets grid shows a Modified date and a file Count alongside the name. Both are scanned from the top level of each dataset folder only (subfolders hold cached/derived files) and loaded asynchronously in chunks, so the list renders immediately and fills in as the scans return. Count includes image/video/audio files; Modified also considers `.txt` / `.json` / `.caption` files, so editing a caption updates the date without inflating the count.
+- **Sortable dataset columns** — Name, Modified and Count headers toggle ascending/descending; the chosen sort is remembered per browser in `localStorage` and restored on the next visit
 - **Find & replace honors caption ext** — find/replace works correctly for JSON captions and respects the selected caption extension type
 - **Find & replace in JSON** — updates the `caption` field inside the JSON structure, preserving other fields
 - **Find & replace captions** — bulk find-and-replace with AND/OR/quoted search
