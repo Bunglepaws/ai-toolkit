@@ -41,6 +41,7 @@ from toolkit.models.v2.text_encoders.qwen3_vl import (
     patch_qwen_vl_patch_embed,
 )
 from toolkit.basic import flush
+from toolkit.util.quantize import is_quantized_tensor
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
@@ -160,6 +161,14 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         self.is_flow_matching = True
         self.is_transformer = True
         self.target_lora_modules = ["SingleStreamDiT"]
+        # sampling LoRAs are attached as adapters, built lazily on the
+        # first sample and then toggled around each sample loop
+        self._sampling_lora_networks = []
+        self._sampling_lora_paths = []
+        self._sampling_lora_diffs = []
+        self._sampling_diffs_on = False
+        self._sampling_diff_backup = {}
+        self._sampling_lora_ready = False
 
         self.patch_size = KREA2_MMDIT_CONFIG["patch"]
         self.vae_scale_factor = 8  # Qwen-Image VAE is f8
@@ -398,132 +407,335 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
                 return True
         return False
 
-    def _merge_lora_file(self, path, strength, applied):
-        """Load one LoRA/diff file and add its weighted delta to transformer params.
+    # ------------------------------------------------------------------
+    # Sampling LoRAs (turbo / distill / filter-bypass)
+    #
+    # These are ATTACHED as LoRA adapters, never merged into the base weights.
+    # The merge approach this replaced was broken in three different ways
+    # depending on how the model happened to be quantized, because it did
+    # `param.data.add_(delta)` on whatever tensor the weight turned out to be:
+    #   - torchao (qfloat8 + layer_offloading) -> AffineQuantizedTensor has no
+    #     `aten.add_`, so the sample raised NotImplementedError and never ran.
+    #   - convrot8 -> OstrisLinear deletes the `weight` Parameter (it is a
+    #     property that dequantizes on read), so `named_parameters()` had no
+    #     entry to merge into and every tensor was skipped SILENTLY. Samples
+    #     generated that way quietly omitted the LoRA entirely.
+    #   - quanto (layer_offloading off) -> worked, but re-materialised the base
+    #     weights on every sample: measured 48-141 s per sample, more wall-clock
+    #     than a turbo LoRA saves at any realistic image count.
+    # An adapter sidesteps all of it: the base weights are never written, so the
+    # quantization backend stops mattering, and there is no per-sample merge --
+    # the network is built once and then toggled with `is_active`.
+    # ------------------------------------------------------------------
 
-        Appends a (param_name, delta_fp32, strength, restore_dtype) tuple to
-        `applied` for each tensor as soon as it is merged, so the caller can
-        reverse a partial merge if an exception is raised partway through.
-        `restore_dtype` is the dtype the param had before a quantized-tensor
-        dequantize (or None if it was never quantized) — _unmerge_lora casts
-        back to it as a defensive floor, so a dtype slip here can't survive
-        into the next training step even if this method is wrong about it.
-        """
-        param_dict = dict(self.model.named_parameters())
-
-        sd = load_file(path)
-        # normalise key prefix — strip diffusion_model. or transformer. so we have bare param paths
-        def _bare(k):
-            k = k.replace("diffusion_model.", "")
-            if k.startswith("transformer."):
-                k = k[len("transformer."):]
-            return k
-
-        sd = {_bare(k): v for k, v in sd.items()}
-
-        # --- .diff format: key path ends in .diff, target param replaces .diff with .weight ---
-        diff_keys = [k for k in sd if k.endswith(".diff")]
-        if diff_keys:
-            for dk in diff_keys:
-                param_name = dk[:-len(".diff")] + ".weight"
-                if param_name not in param_dict:
-                    self.print_and_status_update(f"  skip diff key (no param): {dk}")
-                    continue
-                param = param_dict[param_name]
-                restore_dtype = None
-                if hasattr(param.data, 'dequantize'):
-                    restore_dtype = param.data.dtype
-                    param.data = param.data.dequantize().to(restore_dtype)
-                delta = sd[dk].to(param.device, dtype=torch.float32)
-                param.data.add_(delta.to(param.dtype) * strength)
-                applied.append((param_name, delta, strength, restore_dtype))
-            return
-
-        # --- lora_A/lora_B (or lora_down/lora_up) format ---
-        bases: dict = {}
-        for k in sd:
-            for marker in (".lora_A.", ".lora_B.", ".lora_down.", ".lora_up.", ".alpha"):
-                if marker in k:
-                    idx = k.index(marker)
-                    base = k[:idx]
-                    part = k[idx + 1:].split(".")[0]  # e.g. "lora_A", "lora_B", "alpha"
-                    bases.setdefault(base, {})[part] = sd[k]
-                    break
-
-        for base, parts in bases.items():
-            down = parts.get("lora_A") if parts.get("lora_A") is not None else parts.get("lora_down")
-            up   = parts.get("lora_B") if parts.get("lora_B") is not None else parts.get("lora_up")
-            if down is None or up is None:
-                continue
-
-            param_name = base + ".weight"
-            if param_name not in param_dict:
-                continue
-
-            rank = down.shape[0]
-            alpha_val = float(parts["alpha"].item()) if "alpha" in parts else float(rank)
-            scale = alpha_val / rank
-
-            if down.dim() == 2 and up.dim() == 2:
-                delta = (up.float() @ down.float()) * scale
-            else:
-                continue
-
-            param = param_dict[param_name]
-            restore_dtype = None
-            if hasattr(param.data, 'dequantize'):
-                restore_dtype = param.data.dtype
-                param.data = param.data.dequantize().to(restore_dtype)
-            param.data.add_(delta.to(param.device, dtype=param.dtype) * strength)
-            applied.append((param_name, delta, strength, restore_dtype))
-
-    def _unmerge_lora(self, applied):
-        """Reverse all deltas from _merge_lora_file.
-
-        Casts each param back to its pre-merge dtype as a defensive floor
-        (see _merge_lora_file docstring) — cheap no-op when the dtype was
-        never touched, a safety net when it was.
-        """
-        param_dict = dict(self.model.named_parameters())
-        for param_name, delta, strength, restore_dtype in applied:
-            if param_name in param_dict:
-                param = param_dict[param_name]
-                param.data.sub_(delta.to(param.device, dtype=param.dtype) * strength)
-                if restore_dtype is not None and param.data.dtype != restore_dtype:
-                    param.data = param.data.to(restore_dtype)
-
-    def _prepare_sampling_lora(self, pipeline):
+    def _sampling_lora_slots(self):
+        """[(slot_attr, path, strength)] for each configured sampling LoRA."""
         sc = getattr(self, 'sample_config', None)
-        slots = [
-            ('sample_lora_path',   'sample_lora_strength',   1.0),
-            ('sample_lora_path_2', 'sample_lora_strength_2', 1.0),
-        ]
-        # Register the applied list before merging anything: _merge_lora_file
-        # appends each delta as it lands, so if it raises partway through,
-        # _after_sample_failure can still unmerge the partial merge instead of
-        # leaving the base weights corrupted for the rest of the run.
-        all_applied = []
-        self._sampling_lora_applied = all_applied
-        self._sampling_lora_ready = True
-        for path_attr, strength_attr, default_s in slots:
-            path = (getattr(sc, path_attr, None) if sc else None) or getattr(self.model_config, path_attr, None)
+        slots = []
+        for path_attr, strength_attr in (
+            ('sample_lora_path', 'sample_lora_strength'),
+            ('sample_lora_path_2', 'sample_lora_strength_2'),
+        ):
+            path = (getattr(sc, path_attr, None) if sc else None) or getattr(
+                self.model_config, path_attr, None
+            )
             if not path:
                 continue
-            if not os.path.exists(path):
-                self.print_and_status_update(f"Warning: sample LoRA not found: {path}")
+            strength = getattr(sc, strength_attr, None) if sc else None
+            if strength is None:
+                strength = getattr(self.model_config, strength_attr, None)
+            if strength is None:
+                strength = 1.0
+            slots.append((path_attr, path, float(strength)))
+        return slots
+
+    def _load_sampling_lora_state_dict(self, path):
+        """Load a sampling LoRA and return (state_dict, ranks, alphas).
+
+        Keys are normalised to ``transformer.<module path>.lora_(A|B).weight``,
+        which is what ``load_weights`` expects in peft format: it rewrites
+        lora_A/lora_B to lora_down/lora_up and ``.`` to ``$$`` so each key lands
+        on the module named ``transformer$$<module$$path>``.
+
+        ``ranks`` / ``alphas`` are keyed by bare module path so the caller can
+        build per-module dims and create modules for exactly what the file
+        covers -- nothing else gets a LoRA module.
+
+        ``diffs`` holds full-weight deltas from ``.diff``-format files (a whole
+        weight-shaped tensor rather than a low-rank pair), keyed by the target
+        parameter name. These target tiny unquantized modules -- krea2 keeps
+        ``txtfusion.projector`` and friends out of quantization on purpose --
+        so they are added to the weight directly and subtracted on teardown.
+        """
+        sd = load_file(path)
+
+        def _norm(k):
+            k = k.replace("diffusion_model.", "transformer.")
+            if not k.startswith("transformer."):
+                k = "transformer." + k
+            return k
+
+        sd = {_norm(k): v for k, v in sd.items()}
+
+        ranks, alphas, diffs = {}, {}, {}
+        for k, v in sd.items():
+            if k.endswith(".diff"):
+                # full-weight delta: target param is <module>.weight
+                diffs[k[: -len(".diff")][len("transformer."):] + ".weight"] = v
                 continue
-            strength = (getattr(sc, strength_attr, None) if sc else None) or getattr(self.model_config, strength_attr, default_s) or default_s
-            self.print_and_status_update(f"Merging sample LoRA: {os.path.basename(path)} (strength={strength})")
-            count_before = len(all_applied)
-            self._merge_lora_file(path, strength, all_applied)
-            self.print_and_status_update(f"  Applied {len(all_applied) - count_before} tensors")
+            matched = False
+            for marker, is_down in ((".lora_A.", True), (".lora_down.", True),
+                                    (".lora_B.", False), (".lora_up.", False)):
+                if marker in k:
+                    base = k[: k.index(marker)][len("transformer."):]
+                    if is_down and v.dim() == 2:
+                        # lora_down is [rank, in_features]
+                        ranks[base] = int(v.shape[0])
+                    matched = True
+                    break
+            if not matched and k.endswith(".alpha"):
+                base = k[: -len(".alpha")][len("transformer."):]
+                try:
+                    alphas[base] = float(v.item())
+                except Exception:
+                    pass
+
+        # load_weights matches on lora_A/lora_B in peft format, so normalise the
+        # older lora_down/lora_up spelling onto it
+        norm_sd = {
+            k.replace(".lora_down.", ".lora_A.").replace(".lora_up.", ".lora_B."): v
+            for k, v in sd.items()
+        }
+        return norm_sd, ranks, alphas, diffs
+
+    def _build_sampling_lora(self, path, strength):
+        """Build + attach one sampling LoRA network. Left inactive and on CPU."""
+        from toolkit.lora_special import LoRASpecialNetwork
+
+        self.print_and_status_update(
+            f"Loading sampling LoRA: {os.path.basename(path)} (strength={strength})"
+        )
+        state_dict, ranks, alphas, diffs = self._load_sampling_lora_state_dict(path)
+        if not ranks and not diffs:
+            raise RuntimeError(
+                f"Sampling LoRA has no usable lora_A/lora_B pairs or .diff "
+                f"tensors: {path}"
+            )
+        if diffs:
+            self._register_sampling_diffs(path, diffs, strength)
+        if not ranks:
+            # a .diff-only file (e.g. a single projector delta) -- nothing to
+            # attach, the deltas are applied around the sample loop instead
+            self.print_and_status_update(
+                f"  {len(diffs)} full-weight delta(s), no LoRA modules"
+            )
+            return None
+
+        def lora_name(module_path):
+            return "transformer$$" + module_path.replace(".", "$$")
+
+        # per-module dim/alpha rather than one network-wide rank: module
+        # creation is then restricted to exactly what the file covers, and any
+        # per-module rank in the file stays honest. peft-format files carry no
+        # .alpha, in which case alpha == rank and the module scales by 1.0 --
+        # which is what ComfyUI does with the same file.
+        modules_dim = {lora_name(b): r for b, r in ranks.items()}
+        modules_alpha = {
+            lora_name(b): alphas.get(b, float(r)) for b, r in ranks.items()
+        }
+
+        network_config = NetworkConfig(
+            **{
+                "type": "lora",
+                "linear": max(ranks.values()),
+                "linear_alpha": max(ranks.values()),
+                "transformer_only": True,
+            }
+        )
+        network = LoRASpecialNetwork(
+            text_encoder=None,
+            unet=self.model,
+            multiplier=strength,
+            lora_dim=network_config.linear,
+            alpha=network_config.linear_alpha,
+            modules_dim=modules_dim,
+            modules_alpha=modules_alpha,
+            train_unet=True,
+            train_text_encoder=False,
+            network_config=network_config,
+            network_type=network_config.type,
+            transformer_only=network_config.transformer_only,
+            is_transformer=True,
+            # a copy: create_modules appends to this list in place
+            target_lin_modules=list(self.target_lora_modules),
+            base_model=self,
+        )
+        network.apply_to(None, self.model, apply_text_encoder=False, apply_unet=True)
+        # Register before loading weights: apply_to() has already rewritten the
+        # module forwards, so from here on a failure leaves the transformer
+        # wrapped and the caller needs a handle to detach it again.
+        self._sampling_lora_networks.append(network)
+
+        attached = len(network.get_all_modules())
+        # Loud on a total miss. The merge path this replaced printed
+        # "Applied 0 tensors" and sampled anyway, so a LoRA that silently
+        # matched nothing looked exactly like one that worked.
+        if attached == 0:
+            raise RuntimeError(
+                f"Sampling LoRA matched 0 modules in the transformer: {path}. "
+                f"The file covers {len(ranks)} modules, none of which exist in "
+                f"this checkpoint -- check it is a krea2 LoRA."
+            )
+        if attached < len(ranks):
+            self.print_and_status_update(
+                f"  Warning: {attached} of {len(ranks)} modules in the file "
+                f"matched the transformer"
+            )
+
+        network.load_weights(state_dict)
+
+        # never trained, never merged -- only toggled around the sample loop
+        network.is_merged_in = False
+        for param in network.parameters():
+            param.requires_grad_(False)
+        network.eval()
+        network.is_active = False
+        network.force_to("cpu", self.torch_dtype)
+
+        self.print_and_status_update(
+            f"  Attached {attached} modules (strength={strength})"
+        )
+        return network
+
+    def _register_sampling_diffs(self, path, diffs, strength):
+        """Record .diff deltas for the sample loop, validating their targets now.
+
+        These are merged into the weight rather than attached, which is only
+        safe because the modules .diff files target are unquantized -- krea2
+        excludes them from quantization by name (get_quantization_exclude_modules).
+        Anything else is refused loudly rather than silently skipped: a quantized
+        target is what made the old merge path fail, either by raising on
+        `aten.add_` or, for OstrisLinear, by not appearing in named_parameters()
+        at all.
+        """
+        param_dict = dict(self.model.named_parameters())
+        for param_name, delta in diffs.items():
+            param = param_dict.get(param_name)
+            if param is None:
+                raise RuntimeError(
+                    f".diff target has no matching parameter: {param_name} "
+                    f"(from {os.path.basename(path)}). A quantized OstrisLinear "
+                    f"has no weight Parameter, so a delta cannot be merged into it."
+                )
+            # NB: not `hasattr(param.data, "dequantize")` -- every torch.Tensor
+            # has that method, so it is true for plain weights too. The toolkit's
+            # own check tests for a torchao subclass or the OstrisLinear marker.
+            if is_quantized_tensor(param.data):
+                raise RuntimeError(
+                    f".diff target {param_name} is quantized "
+                    f"({type(param.data).__name__}); a full-weight delta cannot "
+                    f"be merged into it (from {os.path.basename(path)})."
+                )
+            if tuple(param.shape) != tuple(delta.shape):
+                raise RuntimeError(
+                    f".diff shape {tuple(delta.shape)} does not match "
+                    f"{param_name} {tuple(param.shape)} "
+                    f"(from {os.path.basename(path)})."
+                )
+            self._sampling_lora_diffs.append((param_name, delta, float(strength)))
+
+    def _set_sampling_diffs(self, on: bool):
+        """Apply (or undo) the registered .diff deltas around the sample loop.
+
+        Undo restores a snapshot rather than subtracting the delta back off.
+        Add-then-subtract is not bit-exact in floating point -- w + d - d can
+        land a ulp away from w -- and these weights are touched on every sample
+        for the whole run, so the error would accumulate into the trained model.
+        The snapshot is exact and costs nothing worth counting: .diff files
+        target the small modules krea2 keeps out of quantization.
+        """
+        if not self._sampling_lora_diffs or self._sampling_diffs_on == on:
+            return
+        param_dict = dict(self.model.named_parameters())
+        with torch.no_grad():
+            if on:
+                self._sampling_diff_backup = {}
+                for param_name, delta, strength in self._sampling_lora_diffs:
+                    param = param_dict.get(param_name)
+                    if param is None:
+                        continue
+                    self._sampling_diff_backup[param_name] = param.data.detach().clone()
+                    param.data.add_(
+                        delta.to(param.device, dtype=param.dtype) * strength
+                    )
+            else:
+                for param_name, saved in self._sampling_diff_backup.items():
+                    param = param_dict.get(param_name)
+                    if param is not None:
+                        param.data.copy_(saved)
+                self._sampling_diff_backup = {}
+        self._sampling_diffs_on = on
+
+    def _detach_sampling_loras(self):
+        """Unwrap every sampling LoRA from the transformer entirely.
+
+        Valid because these are the outermost wrappers -- applied at sample
+        time, after the training network, the assistant adapter and the memory
+        manager -- so handing each module's saved org_forward back restores
+        exactly the chain that was there before. Detached in reverse order of
+        application for the same reason.
+        """
+        self._set_sampling_diffs(False)
+        for network in reversed(getattr(self, '_sampling_lora_networks', [])):
+            network.is_active = False
+            for module in network.get_all_modules():
+                org_module = module.orig_module_ref()
+                if org_module is not None and hasattr(module, "org_forward"):
+                    org_module.forward = module.org_forward
+        self._sampling_lora_networks = []
+        self._sampling_lora_paths = []
+        self._sampling_lora_diffs = []
+        self._sampling_lora_ready = False
+        flush()
+
+    def _prepare_sampling_lora(self, pipeline):
+        slots = self._sampling_lora_slots()
+        wanted = [path for _, path, _ in slots]
+
+        # rebuild if the job was pointed at different files since the last
+        # sample -- detach first so the stale modules stop wrapping the forwards
+        if getattr(self, '_sampling_lora_paths', []) != wanted:
+            self._detach_sampling_loras()
+
+        if not self._sampling_lora_networks and not self._sampling_lora_diffs:
+            built = []
+            for _, path, strength in slots:
+                if not os.path.exists(path):
+                    self.print_and_status_update(
+                        f"Warning: sample LoRA not found: {path}"
+                    )
+                    continue
+                self._build_sampling_lora(path, strength)
+                built.append(path)
+            self._sampling_lora_paths = built
+
+        strengths = {path: strength for _, path, strength in slots}
+        for network, path in zip(self._sampling_lora_networks, self._sampling_lora_paths):
+            network.force_to(self.device_torch, self.torch_dtype)
+            network.multiplier = strengths.get(path, network.multiplier)
+            network._update_torch_multiplier()
+            network.is_active = True
+        self._set_sampling_diffs(True)
+        self._sampling_lora_ready = True
 
     def _teardown_sampling_lora(self):
-        applied = getattr(self, '_sampling_lora_applied', None)
-        if applied:
-            self._unmerge_lora(applied)
-            self._sampling_lora_applied = None
+        """Deactivate and park the sampling weights back on CPU for training."""
+        self._set_sampling_diffs(False)
+        for network in getattr(self, '_sampling_lora_networks', []):
+            network.is_active = False
+            network.force_to("cpu", self.torch_dtype)
         self._sampling_lora_ready = False
+        flush()
 
     def _validate_sample_config(self, image_configs):
         if not self._has_sampling_lora():
