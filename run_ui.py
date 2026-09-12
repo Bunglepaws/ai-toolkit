@@ -3,6 +3,14 @@ import sys
 from dotenv import load_dotenv
 load_dotenv()
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "1")
+# We set these before huggingface_hub imports: Xet's parallel reconstructor
+# dies on large files with "Background writer channel closed". Sequential
+# writes keep the fast Xet transfer and stabilize the disk side.
+os.environ["HF_XET_HIGH_PERFORMANCE"] = os.getenv("HF_XET_HIGH_PERFORMANCE", "1")
+os.environ["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] = os.getenv(
+    "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", "1"
+)
+os.environ["HF_HUB_DISABLE_XET"] = os.getenv("HF_HUB_DISABLE_XET", "0")
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 
 seed = None

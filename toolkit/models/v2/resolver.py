@@ -11,9 +11,70 @@ into here.
 """
 
 import os
+import shutil
+import time
 from typing import Callable, Iterable, Optional
 
 from toolkit.paths import MODELS_PATH
+
+# Xet reports disk-full and crashed parallel writers as this generic string.
+_XET_WRITER_MARKERS = (
+    "Background writer channel closed",
+    "File reconstruction error",
+    "Internal Writer Error",
+)
+
+
+def _hf_hub_download(
+    *,
+    status_fn: Optional[Callable[[str], None]] = None,
+    **kwargs,
+) -> str:
+    """hf_hub_download with retries for Xet reconstruction crashes.
+
+    A 15GB text-encoder download can die at 70%+ with "Background writer
+    channel closed". The incomplete file is resumable, so we retry rather
+    than failing the job. The last error includes free space on local_dir
+    because Xet swallows ENOSPC into that same message.
+    """
+    import huggingface_hub
+
+    attempts = 3
+    last_err: Optional[BaseException] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return huggingface_hub.hf_hub_download(**kwargs)
+        except RuntimeError as e:
+            msg = str(e)
+            if not any(marker in msg for marker in _XET_WRITER_MARKERS):
+                raise
+            last_err = e
+            if attempt == attempts:
+                break
+            wait_s = 2 * attempt
+            notice = (
+                f"HuggingFace Xet writer error (attempt {attempt}/{attempts}), "
+                f"retrying in {wait_s}s: {msg}"
+            )
+            if status_fn is not None:
+                status_fn(notice)
+            else:
+                print(notice, flush=True)
+            time.sleep(wait_s)
+
+    dest = kwargs.get("local_dir") or ""
+    extra = ""
+    if dest:
+        try:
+            free_gb = shutil.disk_usage(dest).free / (1024 ** 3)
+            extra = f" Destination {dest} has {free_gb:.1f} GB free."
+        except OSError:
+            extra = f" Could not stat free space on {dest}."
+    raise RuntimeError(
+        f"HuggingFace download failed after {attempts} attempts: {last_err}.{extra} "
+        "This Xet error is often a full disk or a crashed parallel writer. "
+        "Free space and retry, or set HF_HUB_DISABLE_XET=1 to download over HTTP instead."
+    ) from last_err
 
 
 def comfy_precision_rank(filename: str, qtype: Optional[str] = None) -> int:
@@ -91,14 +152,16 @@ def resolve_comfy_candidates(
     if local_only:
         return None
 
-    import huggingface_hub
-
     best = ordered[0]
     local_rel = comfy_local_rel(best)
     if status_fn is not None:
         status_fn(f"Downloading {best} from {repo_id} into {MODELS_PATH}")
-    path = huggingface_hub.hf_hub_download(
-        repo_id=repo_id, filename=best, token=hf_token, local_dir=MODELS_PATH
+    path = _hf_hub_download(
+        repo_id=repo_id,
+        filename=best,
+        token=hf_token,
+        local_dir=MODELS_PATH,
+        status_fn=status_fn,
     )
     target = os.path.join(MODELS_PATH, local_rel)
     if os.path.abspath(path) != os.path.abspath(target):
@@ -179,12 +242,14 @@ def resolve_comfy_file(
     if local_only:
         return None
 
-    import huggingface_hub
-
     if status_fn is not None:
         status_fn(f"Downloading {rel_path} from {repo_id} into {MODELS_PATH}")
-    return huggingface_hub.hf_hub_download(
-        repo_id=repo_id, filename=rel_path, token=hf_token, local_dir=MODELS_PATH
+    return _hf_hub_download(
+        repo_id=repo_id,
+        filename=rel_path,
+        token=hf_token,
+        local_dir=MODELS_PATH,
+        status_fn=status_fn,
     )
 
 
@@ -212,9 +277,7 @@ def resolve_named_file(
         if os.path.exists(candidate):
             return candidate
 
-    import huggingface_hub
-
-    return huggingface_hub.hf_hub_download(
+    return _hf_hub_download(
         repo_id="/".join(splits[:2]),
         filename=rel_path,
         token=hf_token,
