@@ -1820,7 +1820,7 @@ class BaseModel:
             device = "cpu"
         elif role == "vae":
             device = self.vae_device_torch
-        return dict(
+        kwargs = dict(
             qtype=qtype,
             offload=offload,
             dtype=dtype,
@@ -1829,6 +1829,11 @@ class BaseModel:
             base_model=self,
             use_comfy_weights=mc.model_kwargs.get("use_comfy_weights", True),
         )
+        # We pass the holder's exclude list for the transformer. aitk_post_load
+        # used to ask only the v2 module class, so holder-only lists were ignored.
+        if role == "transformer":
+            kwargs["exclude_quant_modules"] = self.get_quantization_exclude_modules()
+        return kwargs
 
     def convert_lora_weights_before_save(self, state_dict):
         # can be overridden in child classes to convert weights before saving

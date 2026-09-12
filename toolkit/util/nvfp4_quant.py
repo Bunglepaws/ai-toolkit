@@ -25,10 +25,9 @@ backends, so nn.Module._apply dtype casts can't corrupt them):
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 from toolkit.util.convrot_quant import BLOCK, dequantize_nvfp4, quantize_nvfp4
-from toolkit.util.ostris_quant import OstrisQuantizer
+from toolkit.util.ostris_quant import OstrisQuantizer, linear_matched_dtype
 from toolkit.print import print_acc
 
 NVFP4_QTYPES = ("nvfp4",)
@@ -171,4 +170,4 @@ class Nvfp4Quantizer(OstrisQuantizer):
             x = x * pre_scale.to(dtype=x.dtype)
         with torch.no_grad():
             w = self._dequantize_weight(module, x.dtype)
-        return F.linear(x, w, module.bias)
+        return linear_matched_dtype(x, w, module.bias)

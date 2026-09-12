@@ -412,6 +412,23 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
     def get_transformer_block_names(cls):
         return ["blocks"]
 
+    @classmethod
+    def get_quantization_exclude_modules(cls):
+        # We keep the float32 islands, conditioning projection, token refiner,
+        # and AdaLN projections unquantized — they ship that way in the
+        # pre-quantized checkpoints (pruned files carry tiny fp16 adaln
+        # linears fed by the 8-dim time table). aitk_post_load reads this
+        # class, not the holder.
+        return [
+            "video_patch_proj*",
+            "audio_patch_proj*",
+            "time_embedder*",
+            "final_layer*",
+            "condition_proj*",
+            "token_refiner*",
+            "*adaln_proj*",
+        ]
+
     def __init__(self, params: Optional[MiniMaxH3TransformerParams] = None):
         super().__init__()
         if params is None:

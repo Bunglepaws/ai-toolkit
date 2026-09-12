@@ -1626,21 +1626,7 @@ class MinimaxH3Model(BaseModel):
         return ["blocks"]
 
     def get_quantization_exclude_modules(self) -> Optional[List[str]]:
-        # float32 islands, the conditioning projection, the token refiner and
-        # the AdaLN projections — all shipped unquantized in the pre-quantized
-        # checkpoints (pruned files carry tiny fp16 adaln linears fed by the
-        # 8-dim time table), so excluding them makes quantize with the
-        # checkpoint's own qtype an exact no-op and keeps the sensitive
-        # modulation path at full precision under any other qtype.
-        return [
-            "video_patch_proj*",
-            "audio_patch_proj*",
-            "time_embedder*",
-            "final_layer*",
-            "condition_proj*",
-            "token_refiner*",
-            "*adaln_proj*",
-        ]
+        return MiniMaxH3Transformer.get_quantization_exclude_modules()
 
     # ComfyUI's MiniMax-H3 keys are the original checkpoint keys, so the
     # standard diffusion_model prefix maps directly

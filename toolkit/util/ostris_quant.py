@@ -69,7 +69,28 @@ class OstrisQuantizer:
         # outside autograd; gradients still flow to x through the matmul
         with torch.no_grad():
             w = self.dequantize(module).to(x.dtype)
-        return F.linear(x, w, module.bias)
+        return linear_matched_dtype(x, w, module.bias)
+
+
+def linear_matched_dtype(
+    x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """F.linear in ``x``'s dtype with autocast disabled.
+
+    Autocast's matmul policy for 3D activations (packed video rows) downcasts
+    ``x`` to bf16 without also downcasting a dequantized weight built as a
+    plain Tensor, which raises ``self and mat2 must have the same dtype``.
+    We disable autocast and run in the dtype the caller already picked, so
+    fp32 islands stay fp32 and bf16 layers stay bf16.
+    """
+    if w.dtype != x.dtype:
+        w = w.to(x.dtype)
+    if bias is not None and bias.dtype != x.dtype:
+        bias = bias.to(dtype=x.dtype)
+    if x.device.type in ("cuda", "cpu"):
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            return F.linear(x, w, bias)
+    return F.linear(x, w, bias)
 
 
 _wrong_device_warned = False
