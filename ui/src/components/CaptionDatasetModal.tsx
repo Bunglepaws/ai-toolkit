@@ -107,12 +107,9 @@ export const CaptionDatasetModal: React.FC = () => {
   }, [modalInfo?.jobId]);
 
   useEffect(() => {
-    if (isGPUInfoLoaded) {
-      if (gpuIDs === null && gpuList.length > 0) {
-        setGpuIDs(`${gpuList[0].index}`);
-      }
-    }
-  }, [gpuList, isGPUInfoLoaded]);
+    if (!isGPUInfoLoaded || gpuIDs !== null) return;
+    setGpuIDs(gpuList.length > 0 ? `${gpuList[0].index}` : '0');
+  }, [gpuList, isGPUInfoLoaded, gpuIDs]);
 
   const handleClose = () => {
     if (modalInfo?.onClose) {
@@ -137,7 +134,7 @@ export const CaptionDatasetModal: React.FC = () => {
       .post('/api/jobs', {
         id: isEdit ? modalInfo.jobId : null,
         name: isEdit && existingJobName ? existingJobName : uuidv4(),
-        gpu_ids: gpuIDs,
+        gpu_ids: gpuIDs ?? '0',
         job_config: jobConfig,
         job_type: 'caption',
         job_ref: modalInfo.datasetPath,
@@ -146,7 +143,7 @@ export const CaptionDatasetModal: React.FC = () => {
         const jobId = res.data.id;
         await startJob(jobId);
         // start the queue as well
-        await startQueue(gpuIDs || '');
+        await startQueue(gpuIDs ?? '0');
         isSavingRef.current = false;
         setIsSaving(false);
         handleClose();

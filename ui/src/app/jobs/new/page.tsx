@@ -148,12 +148,9 @@ export default function TrainingForm() {
   }, [runId]);
 
   useEffect(() => {
-    if (isGPUInfoLoaded) {
-      if (gpuIDs === null && gpuList.length > 0) {
-        setGpuIDs(`${gpuList[0].index}`);
-      }
-    }
-  }, [gpuList, isGPUInfoLoaded]);
+    if (!isGPUInfoLoaded || gpuIDs !== null) return;
+    setGpuIDs(gpuList.length > 0 ? `${gpuList[0].index}` : '0');
+  }, [gpuList, isGPUInfoLoaded, gpuIDs]);
 
   useEffect(() => {
     if (isSettingsLoaded) {
@@ -178,7 +175,7 @@ export default function TrainingForm() {
       .post('/api/jobs', {
         id: runId,
         name: jobConfig.config.name,
-        gpu_ids: gpuIDs,
+        gpu_ids: gpuIDs ?? '0',
         job_config: jobConfig,
       })
       .then(res => {

@@ -71,6 +71,11 @@ export async function POST(request: Request) {
 
     if (isMac()) {
       gpu_ids = 'mps';
+    } else if (gpu_ids == null || gpu_ids === '') {
+      // The new-job form leaves this null until the monitor stream reports a
+      // GPU. Create is allowed before that, and nvidia-smi can also stay empty
+      // (PATH, first tick). GPU 0 is the only usable default on CUDA hosts.
+      gpu_ids = '0';
     }
 
     const extra: any = {};

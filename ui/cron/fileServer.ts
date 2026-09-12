@@ -416,6 +416,11 @@ function stripHopByHop(headers: http.IncomingHttpHeaders): http.IncomingHttpHead
 
 function proxy(req: http.IncomingMessage, res: http.ServerResponse, upstreamPort: number, attempt = 0): void {
   const bodyless = req.method === 'GET' || req.method === 'HEAD';
+  const urlPath = (req.url || '').split('?')[0];
+  // Keep-alive pooling is wrong for a never-ending SSE socket, and Nagle
+  // will hold the small init payload until a later packet — which on Vast's
+  // port proxy can mean the GPU dashboard never leaves the empty snapshot.
+  const isSse = urlPath === '/api/monitor';
   const upstreamReq = http.request(
     {
       host: UPSTREAM_HOST,
@@ -423,7 +428,7 @@ function proxy(req: http.IncomingMessage, res: http.ServerResponse, upstreamPort
       path: req.url,
       method: req.method,
       headers: stripHopByHop(req.headers),
-      agent: upstreamAgent,
+      agent: isSse ? false : upstreamAgent,
     },
     upstreamRes => {
       if (res.destroyed) {
@@ -431,6 +436,7 @@ function proxy(req: http.IncomingMessage, res: http.ServerResponse, upstreamPort
         upstreamRes.resume();
         return;
       }
+      res.socket?.setNoDelay(true);
       res.writeHead(upstreamRes.statusCode || 502, stripHopByHop(upstreamRes.headers));
       pipeline(upstreamRes, res, () => { });
     },

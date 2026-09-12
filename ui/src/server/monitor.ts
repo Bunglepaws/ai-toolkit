@@ -1,5 +1,6 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { promisify } from 'util';
+import fs from 'fs';
 import os from 'os';
 import si from 'systeminformation';
 import { loadMacstats } from '@/server/macstats';
@@ -35,7 +36,30 @@ const NV_BATCH_FLUSH_MS = 100;
 // Temperature refresh is decoupled from the tick (see refreshCpuTemp)
 const CPU_TEMP_REFRESH_MS = 5000;
 
+function resolveNvidiaSmi(): string {
+  const candidates =
+    process.platform === 'win32'
+      ? [
+          'nvidia-smi',
+          'C:\\Windows\\System32\\nvidia-smi.exe',
+          'C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe',
+        ]
+      : ['nvidia-smi', '/usr/bin/nvidia-smi', '/usr/local/nvidia/bin/nvidia-smi', '/usr/local/cuda/bin/nvidia-smi'];
+  for (const candidate of candidates) {
+    if (candidate === 'nvidia-smi') continue;
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      // ignore
+    }
+  }
+  return 'nvidia-smi';
+}
+
 function parseGpuLine(line: string): GpuInfo | null {
+  // nvidia-smi csv is usually ", "-separated; some container builds omit the space.
+  const parts = line.split(',').map(item => item.trim());
+  if (parts.length < 14) return null;
   const [
     index,
     name,
@@ -51,7 +75,7 @@ function parseGpuLine(line: string): GpuInfo | null {
     clockGraphics,
     clockMemory,
     fanSpeed,
-  ] = line.split(', ').map(item => item.trim());
+  ] = parts;
   if (isNaN(parseInt(index))) return null;
   return {
     index: parseInt(index),
@@ -92,6 +116,7 @@ class SystemMonitor {
   private latestGpu: GPUApiResponse = { hasNvidiaSmi: false, isMac: this.isMac, gpus: [] };
   private macGpuName = 'Apple GPU';
   private nvChild: ChildProcess | null = null;
+  private nvBin: string | null = null;
   private nvBatch: GpuInfo[] = [];
   private nvStdoutBuffer = '';
   private nvFlushTimer: NodeJS.Timeout | null = null;
@@ -100,6 +125,8 @@ class SystemMonitor {
   private nvEverGotLine = false;
   private nvOneShotMode = false;
   private nvOneShotInFlight = false;
+  private nvLoggedStderr = false;
+  private nvLoggedGpus = false;
   private lastNvLineAt = 0;
   private tickInFlight = false;
   private lastCpuTemp = 0;
@@ -113,6 +140,12 @@ class SystemMonitor {
     if (this.isMac) {
       this.initMacGpuName();
     } else {
+      this.nvBin = resolveNvidiaSmi();
+      // One-shot first: the -lms loop's stdout is fully buffered when piped
+      // (typical in Docker), and -lms itself is missing or exits immediately
+      // on some Vast/cloud driver builds. Without this the dashboard stays
+      // empty until a 15s watchdog, or forever if the child keeps dying.
+      void this.sampleNvOneShot();
       this.startNvLoop();
     }
     // Never leave a resident nvidia-smi behind.
@@ -358,25 +391,34 @@ class SystemMonitor {
     if (this.nvUnavailable || this.nvOneShotMode || this.nvChild) return;
 
     // A hard-killed server (SIGKILL never runs the exit hook) can orphan the
-    // resident loop child. Our exact query string only ever appears in
-    // children we spawned, so reap any stray once at boot — after it
-    // completes, to not race the kill against our own fresh child.
+    // resident loop child. Cap the reap so a hung pkill (seen in some
+    // containers) cannot block nvidia-smi from ever starting.
     if (!this.nvReaped && process.platform !== 'win32') {
       this.nvReaped = true;
-      // No loop flag in the pattern so strays from any past cadence match
-      execFile('pkill', ['-9', '-f', `nvidia-smi ${NV_QUERY_ARGS.join(' ')}`], () => this.startNvLoop());
+      const proceed = () => this.startNvLoop();
+      const timer = setTimeout(proceed, 400);
+      execFile('pkill', ['-9', '-f', 'nvidia-smi --query-gpu='], () => {
+        clearTimeout(timer);
+        proceed();
+      });
       return;
     }
     this.nvReaped = true;
 
+    const bin = this.nvBin || 'nvidia-smi';
+    // Loop flag first: some nvidia-smi builds reject -lms when it trails the
+    // query args. stdbuf -oL defeats glibc full-buffering on a pipe.
+    const args = ['-lms', String(MONITOR_TICK_MS), ...NV_QUERY_ARGS];
+    const stdbuf = process.platform !== 'win32' && fs.existsSync('/usr/bin/stdbuf');
+
     let child: ChildProcess;
     try {
-      child = spawn('nvidia-smi', [...NV_QUERY_ARGS, '-lms', String(MONITOR_TICK_MS)], {
-        env: NV_ENV,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      child = stdbuf
+        ? spawn('stdbuf', ['-oL', bin, ...args], { env: NV_ENV, stdio: ['ignore', 'pipe', 'pipe'] })
+        : spawn(bin, args, { env: NV_ENV, stdio: ['ignore', 'pipe', 'pipe'] });
     } catch {
-      this.markNvUnavailable();
+      this.nvOneShotMode = true;
+      void this.sampleNvOneShot();
       return;
     }
     this.nvChild = child;
@@ -385,22 +427,40 @@ class SystemMonitor {
     this.lastNvLineAt = Date.now();
 
     child.stdout!.on('data', (chunk: Buffer) => this.onNvData(chunk.toString()));
-    child.stderr!.on('data', () => {
-      // nvidia-smi warnings are not actionable here
+    child.stderr!.on('data', (chunk: Buffer) => {
+      const text = chunk.toString().trim();
+      if (text && !this.nvLoggedStderr) {
+        this.nvLoggedStderr = true;
+        console.warn('Monitor: nvidia-smi stderr:', text.slice(0, 500));
+      }
     });
     child.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'ENOENT') {
-        this.markNvUnavailable();
+        this.markNvUnavailable(`nvidia-smi not found (${bin})`);
+      } else {
+        console.warn('Monitor: nvidia-smi spawn error:', err.message);
+        this.nvOneShotMode = true;
       }
     });
-    child.on('exit', () => {
+    child.on('exit', (code, signal) => {
       if (this.nvChild !== child) return;
       this.nvChild = null;
       if (this.nvFlushTimer) {
         clearTimeout(this.nvFlushTimer);
         this.nvFlushTimer = null;
       }
-      if (!this.nvUnavailable && !this.nvOneShotMode) {
+      if (this.nvUnavailable) return;
+      if (!this.nvEverGotLine) {
+        // -lms exited without a single CSV line. Retrying the same command
+        // forever leaves hasNvidiaSmi false. One-shot is the known-good path.
+        console.warn(
+          `Monitor: nvidia-smi loop exited without output (code=${code} signal=${signal}), falling back to one-shot`,
+        );
+        this.nvOneShotMode = true;
+        void this.sampleNvOneShot();
+        return;
+      }
+      if (!this.nvOneShotMode) {
         setTimeout(() => this.startNvLoop(), 5000);
       }
     });
@@ -425,12 +485,18 @@ class SystemMonitor {
   private flushNvBatch(): void {
     this.nvFlushTimer = null;
     if (this.nvBatch.length === 0) return;
-    this.latestGpu = {
-      hasNvidiaSmi: true,
-      isMac: false,
-      gpus: this.nvBatch.sort((a, b) => a.index - b.index),
-    };
+    const gpus = this.nvBatch.sort((a, b) => a.index - b.index);
+    this.latestGpu = { hasNvidiaSmi: true, isMac: false, gpus };
+    this.logGpusOnce(gpus);
     this.nvBatch = [];
+  }
+
+  private logGpusOnce(gpus: GpuInfo[]): void {
+    if (this.nvLoggedGpus || gpus.length === 0) return;
+    this.nvLoggedGpus = true;
+    console.log(
+      `Monitor: nvidia-smi reported ${gpus.length} GPU(s): ${gpus.map(g => `#${g.index} ${g.name}`).join(', ')}`,
+    );
   }
 
   private nvWatchdog(): void {
@@ -448,8 +514,9 @@ class SystemMonitor {
   private async sampleNvOneShot(): Promise<void> {
     if (this.nvUnavailable || this.nvOneShotInFlight) return;
     this.nvOneShotInFlight = true;
+    const bin = this.nvBin || 'nvidia-smi';
     try {
-      const { stdout } = await execFileAsync('nvidia-smi', NV_QUERY_ARGS, { env: NV_ENV });
+      const { stdout } = await execFileAsync(bin, NV_QUERY_ARGS, { env: NV_ENV, timeout: 8000 });
       const gpus = stdout
         .trim()
         .split('\n')
@@ -457,9 +524,12 @@ class SystemMonitor {
         .filter((gpu): gpu is GpuInfo => gpu !== null)
         .sort((a, b) => a.index - b.index);
       this.latestGpu = { hasNvidiaSmi: true, isMac: false, gpus };
+      if (gpus.length > 0) this.nvEverGotLine = true;
+      this.logGpusOnce(gpus);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        this.markNvUnavailable();
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        this.markNvUnavailable(`nvidia-smi not found (${bin})`);
       } else {
         console.error('Monitor: one-shot nvidia-smi failed:', err);
       }
@@ -468,13 +538,13 @@ class SystemMonitor {
     }
   }
 
-  private markNvUnavailable(): void {
+  private markNvUnavailable(reason = 'nvidia-smi not found or not accessible'): void {
     this.nvUnavailable = true;
     this.latestGpu = {
       hasNvidiaSmi: false,
       isMac: false,
       gpus: [],
-      error: 'nvidia-smi not found or not accessible',
+      error: reason,
     };
   }
 }
