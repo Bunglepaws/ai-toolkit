@@ -223,7 +223,8 @@ export async function POST(request: NextRequest) {
           datasetStats = JSON.parse((job as any).dataset_stats || '{}');
         } catch { /* ignore */ }
 
-        const processType: string = jobConfig?.config?.process?.[0]?.type ?? '';
+        // process[0].type is always "diffusion_trainer"; arch is the model family key
+        const processType: string = jobConfig?.config?.process?.[0]?.model?.arch ?? '';
         const modelFamily = getModelFamily(processType);
 
         let sampleMedia: MediaItem[] = [];
