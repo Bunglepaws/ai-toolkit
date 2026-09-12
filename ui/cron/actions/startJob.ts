@@ -175,6 +175,17 @@ const watchDetachedJob = (pid: number, jobID: string, logPath: string) => {
   if (timer.unref) timer.unref();
 };
 
+const ensureDirectory = (dirPath: string) => {
+  try {
+    const st = fs.statSync(dirPath);
+    if (st.isDirectory()) return;
+    throw new Error(`Training path exists but is not a directory: ${dirPath}`);
+  } catch (e: any) {
+    if (e?.code !== 'ENOENT') throw e;
+  }
+  fs.mkdirSync(dirPath, { recursive: true });
+};
+
 const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
   // starts and watches the job asynchronously
   //
@@ -186,6 +197,19 @@ const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
   return new Promise<void>(async resolve => {
     try {
       await launchJob(job, sampleOnly);
+    } catch (error: any) {
+      // mkdir / JSON.parse / writeFile used to throw uncaught here and kill the
+      // worker, which stops the whole queue. Mark the job failed instead.
+      const message = `Error launching job: ${error?.message || 'Unknown error'}`;
+      console.error(message);
+      try {
+        await prisma.job.update({
+          where: { id: job.id },
+          data: { status: 'error', info: message, pid: null },
+        });
+      } catch (updateError) {
+        console.error('Error updating job after launch failure:', updateError);
+      }
     } finally {
       resolve();
     }
@@ -198,11 +222,10 @@ const launchJob = async (job: Job, sampleOnly: boolean = false) => {
 
     // setup the training
     const trainingRoot = await getTrainingFolder();
+    ensureDirectory(trainingRoot);
 
     const trainingFolder = path.join(trainingRoot, job.name);
-    if (!fs.existsSync(trainingFolder)) {
-      fs.mkdirSync(trainingFolder, { recursive: true });
-    }
+    ensureDirectory(trainingFolder);
 
     // make the config file
     const configPath = path.join(trainingFolder, '.job_config.json');

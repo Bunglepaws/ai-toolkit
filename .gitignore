@@ -175,6 +175,11 @@ cython_debug/
 /config/*
 !/config/examples
 !/config/_PUT_YOUR_CONFIGS_HERE).txt
+# We ignore a root-level file named output so it cannot replace this directory.
+# A tracked file here made mkdir(jobDir) fail with ENOTDIR on machines using
+# the default training folder.
+/output
+!/output/
 /output/*
 !/output/.gitkeep
 /extensions/*
