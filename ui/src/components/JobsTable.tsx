@@ -13,7 +13,7 @@ import { CgSpinner } from 'react-icons/cg';
 import useGPUInfo from '@/hooks/useGPUInfo';
 import { ChevronUp, ChevronDown, ChevronsUp, GripVertical, Trash2 } from 'lucide-react';
 import { openConfirm } from '@/components/ConfirmModal';
-import { deleteJob, getTotalSteps, reorderJob, reorderJobToIndex, stopJob } from '@/utils/jobs';
+import { deleteJob, getEpochInfo, getTotalSteps, reorderJob, reorderJobToIndex, stopJob } from '@/utils/jobs';
 import JobAlertsPanel, { JobAlert } from '@/components/JobAlertsPanel';
 
 interface JobsTableProps {
@@ -22,6 +22,16 @@ interface JobsTableProps {
   filter?: string;
   job_type?: string | null;
 }
+
+// Queue order. Must match the reorder API's `orderBy` exactly
+// ([queue_position asc, created_at asc] in api/jobs/[jobID]/reorder). If the two
+// disagree on a tie, the row shown at #2 can be index 0 on the server, and every
+// attempt to move it up is dropped as a no-op that still returns success.
+const compareQueueOrder = (a: Job, b: Job) => {
+  const posDiff = (a.queue_position ?? 0) - (b.queue_position ?? 0);
+  if (posDiff !== 0) return posDiff;
+  return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+};
 
 export default function JobsTable({ onlyActive = false, filter = '', job_type = null }: JobsTableProps) {
   const { jobs, setJobs, status, refreshJobs } = useJobsList({ onlyActive, reloadInterval: 5000, job_type });
@@ -107,6 +117,46 @@ export default function JobsTable({ onlyActive = false, filter = '', job_type = 
     if (dragOverJobId !== jobId) setDragOverJobId(jobId);
   };
 
+  // Move a job to an arbitrary index within its queue, reflowing everyone in
+  // between (not just swapping with the drop target) — matches the backend's
+  // splice+renumber for targetIndex reorders, so drag-drop across multiple
+  // positions previews correctly instead of only swapping the two endpoints.
+  const reorderJobToLocalIndex = (jobID: string, targetIndex: number) => {
+    setJobs(prev => {
+      const job = prev.find(j => j.id === jobID);
+      if (!job) return prev;
+      const queueJobs = prev
+        .filter(j => j.status === 'queued' && j.gpu_ids === job.gpu_ids)
+        .sort(compareQueueOrder);
+      const currentIdx = queueJobs.findIndex(j => j.id === jobID);
+      if (currentIdx === -1) return prev;
+      const clamped = Math.max(0, Math.min(targetIndex, queueJobs.length - 1));
+      if (clamped === currentIdx) return prev;
+      const reordered = [...queueJobs];
+      reordered.splice(currentIdx, 1);
+      reordered.splice(clamped, 0, job);
+      const basePos = Math.min(...queueJobs.map(j => j.queue_position ?? 0));
+      const updated = new Map(reordered.map((j, i) => [j.id, { ...j, queue_position: basePos + i }]));
+      return prev.map(j => updated.get(j.id) ?? j);
+    });
+  };
+
+  // Move a job to the front of its queue in local state
+  const moveJobToFront = (jobID: string) => {
+    setJobs(prev => {
+      const job = prev.find(j => j.id === jobID);
+      if (!job) return prev;
+      const queueJobs = prev
+        .filter(j => j.status === 'queued' && j.gpu_ids === job.gpu_ids)
+        .sort(compareQueueOrder);
+      if (queueJobs[0]?.id === jobID) return prev;
+      const reordered = [job, ...queueJobs.filter(j => j.id !== jobID)];
+      const basePos = Math.min(...queueJobs.map(j => j.queue_position ?? 0));
+      const updated = new Map(reordered.map((j, i) => [j.id, { ...j, queue_position: basePos + i }]));
+      return prev.map(j => updated.get(j.id) ?? j);
+    });
+  };
+
   const handleDrop = async (e: React.DragEvent, targetJobId: string, queuedJobs: Job[]) => {
     e.preventDefault();
     if (!draggedJobId || draggedJobId === targetJobId) {
@@ -116,14 +166,15 @@ export default function JobsTable({ onlyActive = false, filter = '', job_type = 
     }
     const targetIndex = queuedJobs.findIndex(j => j.id === targetJobId);
     if (targetIndex === -1) return;
+    reorderJobToLocalIndex(draggedJobId, targetIndex);
     try {
       await reorderJobToIndex(draggedJobId, targetIndex);
-      refresh();
     } catch (err) {
       console.error('Failed to reorder job:', err);
     } finally {
       setDraggedJobId(null);
       setDragOverJobId(null);
+      refresh();
     }
   };
 
@@ -181,37 +232,26 @@ export default function JobsTable({ onlyActive = false, filter = '', job_type = 
   }, [jobs, filter]);
 
   const handleReorder = async (jobID: string, direction: 'up' | 'down') => {
-    setJobs(prev => {
-      const job = prev.find(j => j.id === jobID);
-      if (!job) return prev;
-      const queueJobs = prev.filter(j => j.status === 'queued' && j.gpu_ids === job.gpu_ids)
-        .sort((a, b) => (a.queue_position ?? 0) - (b.queue_position ?? 0));
+    // Preview via the same splice+renumber the server does, rather than swapping
+    // the two rows' queue_position values: a swap between rows that share a
+    // position writes each one its own value back and previews as no change.
+    const job = jobs.find(j => j.id === jobID);
+    if (job) {
+      const queueJobs = jobs
+        .filter(j => j.status === 'queued' && j.gpu_ids === job.gpu_ids)
+        .sort(compareQueueOrder);
       const idx = queueJobs.findIndex(j => j.id === jobID);
       const swapIdx = direction === 'up' ? idx - 1 : idx + 1;
-      if (swapIdx < 0 || swapIdx >= queueJobs.length) return prev;
-      const neighbour = queueJobs[swapIdx];
-      return prev.map(j => {
-        if (j.id === jobID) return { ...j, queue_position: neighbour.queue_position };
-        if (j.id === neighbour.id) return { ...j, queue_position: job.queue_position };
-        return j;
-      });
-    });
+      if (idx !== -1 && swapIdx >= 0 && swapIdx < queueJobs.length) {
+        reorderJobToLocalIndex(jobID, swapIdx);
+      }
+    }
     try { await reorderJob(jobID, direction); } catch (e) { console.error('Failed to reorder job:', e); }
     refresh();
   };
 
   const handleMoveToTop = async (jobID: string) => {
-    setJobs(prev => {
-      const job = prev.find(j => j.id === jobID);
-      if (!job) return prev;
-      const queueJobs = prev.filter(j => j.status === 'queued' && j.gpu_ids === job.gpu_ids)
-        .sort((a, b) => (a.queue_position ?? 0) - (b.queue_position ?? 0));
-      if (queueJobs[0]?.id === jobID) return prev;
-      const reordered = [job, ...queueJobs.filter(j => j.id !== jobID)];
-      const basePos = Math.min(...queueJobs.map(j => j.queue_position ?? 0));
-      const updated = new Map(reordered.map((j, i) => [j.id, { ...j, queue_position: basePos + i }]));
-      return prev.map(j => updated.get(j.id) ?? j);
-    });
+    moveJobToFront(jobID);
     try { await reorderJobToIndex(jobID, 0); } catch (e) { console.error('Failed to move job to top:', e); }
     refresh();
   };
@@ -321,10 +361,18 @@ export default function JobsTable({ onlyActive = false, filter = '', job_type = 
           return <></>;
         }
 
+        const epochInfo = getEpochInfo(row);
+
         return (
           <div>
             <div className="text-xs text-gray-400">
               {row.step} / {totalSteps}
+              {epochInfo && (
+                <span className="ml-2 text-gray-500">
+                  ep {epochInfo.completed}
+                  {epochInfo.total !== null && `/~${epochInfo.total}`}
+                </span>
+              )}
             </div>
             <div className="bg-gray-700 rounded-full h-1.5">
               <div
@@ -427,7 +475,7 @@ export default function JobsTable({ onlyActive = false, filter = '', job_type = 
           if (!aIsActive && bIsActive) return 1;
           if (a.queue_position === null) return 1;
           if (b.queue_position === null) return -1;
-          return a.queue_position - b.queue_position;
+          return compareQueueOrder(a, b);
         });
       }
     });

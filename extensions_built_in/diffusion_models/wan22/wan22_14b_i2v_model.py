@@ -1,5 +1,8 @@
 import torch
-from toolkit.models.wan21.wan_utils import add_first_frame_conditioning
+from toolkit.models.wan21.wan_utils import (
+    add_first_frame_conditioning,
+    encode_first_frame_condition,
+)
 from toolkit.prompt_utils import PromptEmbeds
 from PIL import Image
 import torch
@@ -14,9 +17,36 @@ from .wan22_14b_model import Wan2214bModel
 
 class Wan2214bI2VModel(Wan2214bModel):
     arch = "wan22_14b_i2v"
-    # get_noise_prediction VAE-encodes the first frame every step, so the raw
-    # image tensor must be loaded even when latents are cached to disk
+    # get_noise_prediction needs first-frame conditioning every step. For i2v video
+    # datasets that is precomputed into the latent cache (see
+    # encode_first_frame_condition_for_cache below), so no pixels are needed. Any
+    # other dataset shape still falls back to encoding raw pixels per step, which
+    # means the raw tensor has to be loaded even when latents are cached.
     requires_pixels_with_cached_latents = True
+
+    def encode_first_frame_condition_for_cache(self, first_frames, latent):
+        """Precompute the v2.1 first-frame conditioning latent during latent caching.
+
+        Called by LatentCachingMixin while the VAE is still on the GPU. Deriving
+        num_frames and the target size from `latent` the same way
+        add_first_frame_conditioning derives them from latent_model_input keeps the
+        cached tensor identical to what the per-step path would have produced.
+        """
+        num_latent_frames = latent.shape[-3]
+        num_frames = (num_latent_frames - 1) * 4 + 1
+        vae_scale_factor = self.vae.config.scale_factor_spatial
+        condition = encode_first_frame_condition(
+            first_frame=first_frames,
+            num_frames=num_frames,
+            target_height=latent.shape[-2] * vae_scale_factor,
+            target_width=latent.shape[-1] * vae_scale_factor,
+            batch_size=first_frames.shape[0],
+            vae=self.vae,
+            device=self.device_torch,
+            dtype=self.torch_dtype,
+        )
+        # stored per-item, so drop the batch dim like first_frame_latent does
+        return condition.squeeze(0)
     
     
     def generate_single_image(
@@ -159,25 +189,42 @@ class Wan2214bI2VModel(Wan2214bModel):
         # videos come in (bs, num_frames, channels, height, width)
         # images come in (bs, channels, height, width)
         with torch.no_grad():
-            frames = batch.tensor
-            if len(frames.shape) == 4:
-                first_frames = frames
-            elif len(frames.shape) == 5:
-                first_frames = frames[:, 0]
+            cached_condition = getattr(batch, 'first_frame_conditions', None)
+            if cached_condition is not None:
+                # Precomputed during latent caching. Nothing below needs a VAE
+                # forward pass, so the VAE can stay parked on CPU for the whole run.
+                conditioned_latent = add_first_frame_conditioning(
+                    latent_model_input=latent_model_input,
+                    vae=self.vae,
+                    latent_condition=cached_condition,
+                )
             else:
-                raise ValueError(f"Unknown frame shape {frames.shape}")
-            
-            # the vae may be parked on cpu when latents are cached to disk,
-            # but we need it every step to encode the first-frame conditioning
-            if self.vae.device != latent_model_input.device:
-                self.vae.to(latent_model_input.device)
+                frames = batch.tensor
+                if frames is None:
+                    raise ValueError(
+                        "wan22_14b_i2v needs either a cached first-frame conditioning "
+                        "latent or raw pixels. Delete this dataset's _latent_cache so it "
+                        "regenerates with 'first_frame_condition', or turn off "
+                        "cache_latents_to_disk."
+                    )
+                if len(frames.shape) == 4:
+                    first_frames = frames
+                elif len(frames.shape) == 5:
+                    first_frames = frames[:, 0]
+                else:
+                    raise ValueError(f"Unknown frame shape {frames.shape}")
 
-            # Add conditioning using the standalone function
-            conditioned_latent = add_first_frame_conditioning(
-                latent_model_input=latent_model_input,
-                first_frame=first_frames,
-                vae=self.vae
-            )
+                # the vae may be parked on cpu when latents are cached to disk,
+                # but this path needs it to encode the first-frame conditioning
+                if self.vae.device != latent_model_input.device:
+                    self.vae.to(latent_model_input.device)
+
+                # Add conditioning using the standalone function
+                conditioned_latent = add_first_frame_conditioning(
+                    latent_model_input=latent_model_input,
+                    first_frame=first_frames,
+                    vae=self.vae
+                )
         
         noise_pred = self.model(
             hidden_states=conditioned_latent,

@@ -8,10 +8,11 @@ import classNames from 'classnames';
 import { Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
 import { openConfirm } from './ConfirmModal';
 import { apiClient } from '@/utils/api';
-import { isVideo, isAudio } from '@/utils/basic';
+import { isVideo, isAudio, encodeFilePathForUrl } from '@/utils/basic';
 import AudioPlayer from './AudioPlayer';
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
 import BoundingBoxOverlay, { parseBoundingBoxes } from './BoundingBoxOverlay';
+import useVideoMute from '@/hooks/useVideoMute';
 
 interface Props {
   imgPath: string | null; // current image path
@@ -268,7 +269,7 @@ export default function SampleImageViewer({
     let objectUrl: string | null = null;
 
     const controller = new AbortController();
-    fetch(`/api/img/${encodeURIComponent(displayedImgPath)}`, { signal: controller.signal })
+    fetch(`/api/img/${encodeFilePathForUrl(displayedImgPath)}`, { signal: controller.signal })
       .then(r => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.blob();
@@ -337,6 +338,7 @@ export default function SampleImageViewer({
   }, [isOpen, onCancel, handleArrowUp, handleArrowDown, handleArrowLeft, handleArrowRight, handleDelete]);
 
   // Touch swipe navigation
+  const videoMute = useVideoMute();
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const multiTouchRef = useRef(false);
   const zoomedRef = useRef(false);
@@ -405,14 +407,16 @@ export default function SampleImageViewer({
                 (isAudio(displayedImgPath) ? (
                   <div className="w-[500px] h-[260px] max-w-full sm:max-w-[95vw] max-h-[55vh] self-stretch">
                     <AudioPlayer
-                      src={`/api/img/${encodeURIComponent(displayedImgPath)}`}
+                      src={`/api/img/${encodeFilePathForUrl(displayedImgPath)}`}
                       title={displayedImgPath.replace(/^.*[\\/]/, '')}
                       autoPlay
                     />
                   </div>
                 ) : isVideo(displayedImgPath) ? (
                   <video
-                    src={`/api/img/${encodeURIComponent(displayedImgPath)}`}
+                    ref={videoMute.ref}
+                    onVolumeChange={videoMute.onVolumeChange}
+                    src={`/api/img/${encodeFilePathForUrl(displayedImgPath)}`}
                     className="w-auto h-auto max-w-full sm:max-w-[95vw] max-h-[82vh] object-contain"
                     preload="none"
                     playsInline
@@ -482,7 +486,7 @@ export default function SampleImageViewer({
                 <div key={imgPath} className="flex space-x-2 mr-4">
                   {showingControlIdx !== null && (
                     <img
-                      src={`/api/img/${encodeURIComponent(imgPath!)}`}
+                      src={`/api/img/${encodeFilePathForUrl(imgPath!)}?thumb=1`}
                       alt="Main"
                       className="max-h-12 max-w-12 object-contain bg-black border-2 border-gray-700 hover:border-gray-500 rounded cursor-pointer"
                       onClick={() => setShowingControlIdx(null)}
@@ -492,7 +496,7 @@ export default function SampleImageViewer({
                   {controlImages.map((ci, idx) => (
                     <img
                       key={idx}
-                      src={`/api/img/${encodeURIComponent(ci)}`}
+                      src={`/api/img/${encodeFilePathForUrl(ci)}?thumb=1`}
                       alt={`Control ${idx + 1}`}
                       className={`max-h-12 max-w-12 object-contain bg-black border-2 rounded cursor-pointer ${
                         showingControlIdx === idx ? 'border-blue-500' : 'border-gray-700 hover:border-gray-500'
@@ -543,7 +547,7 @@ export default function SampleImageViewer({
                       <MenuItem>
                         <a
                           className="cursor-pointer px-4 py-1 hover:bg-gray-800 rounded block"
-                          href={`/api/img/${encodeURIComponent(imgPath)}`}
+                          href={`/api/img/${encodeFilePathForUrl(imgPath)}`}
                           download={imgPath.replace(/^.*[\\/]/, '')}
                         >
                           Download

@@ -17,8 +17,17 @@ set -euo pipefail
 # -----------------------------
 ROOT="/mnt/c/Data/git/AIToolkitWSL"
 REPO_DIR="${ROOT}/ai-toolkit"
-VENV_DIR="${REPO_DIR}/venv"
 UI_DIR="${REPO_DIR}/ui"
+
+# The venv lives on the distro's ext4, NOT under /mnt/c. Importing torch +
+# transformers + diffusers costs ~67s across the drvfs bridge versus ~2s native —
+# the venv is 56k small files, which is drvfs's worst case.
+#
+# It must be invoked by this real path. <repo>/venv is a symlink here for
+# convenience, but going through it does NOT help: Python keeps the invocation
+# path as sys.prefix, so every site-packages read is still translated across the
+# bridge (measured 30s vs 2s).
+VENV_DIR="/home/marcbate/venvs/ai-toolkit"
 
 UI_PORT="8675"
 UI_URL="http://localhost:${UI_PORT}"
@@ -33,10 +42,26 @@ DO_NPM_INSTALL_ON_UPDATE="0"
 # Default is 0 to skip them.
 RUN_ENV_CHECKS="0"
 
-# Hugging Face cache on Windows NTFS
-export HF_HOME="/mnt/c/Users/marc.bate/.cache/huggingface"
-export HUGGINGFACE_HUB_CACHE="/mnt/c/Users/marc.bate/.cache/huggingface/hub"
-export TRANSFORMERS_CACHE="/mnt/c/Users/marc.bate/.cache/huggingface/hub"
+# Hugging Face cache on a dedicated ext4 VHD (C:\Data\WSL\hf-cache.vhdx).
+# It lives on a real Linux filesystem rather than under /mnt/c because the WSL
+# drvfs bridge caps at ~225 MB/s regardless of how fast the underlying Windows
+# drive is (measured: 223 MB/s on /mnt/c, 228 MB/s on a second NVMe, 13.3 GB/s
+# here). Loading a 25GB transformer went from ~112s to a couple of seconds.
+HF_CACHE_MOUNT="/mnt/wsl/hfcache"
+export HF_HOME="${HF_CACHE_MOUNT}/huggingface"
+export HUGGINGFACE_HUB_CACHE="${HF_HOME}/hub"
+export TRANSFORMERS_CACHE="${HF_HOME}/hub"
+
+# Non-diffusers (ComfyUI-style) checkpoint downloads, e.g. MiniMax H3's
+# separate DiT/text-encoder/VAE safetensors, default to <repo>/models on the
+# NTFS-backed repo dir if left unset. Keep them on the same ext4 disk as the
+# HF cache above to avoid the drvfs bottleneck.
+export MODELS_PATH="${HF_CACHE_MOUNT}/aitk-models"
+
+# The UI worker spawns training processes via resolvePythonPath(), which would
+# otherwise find the <repo>/venv symlink and pay the drvfs import cost on every
+# job start. Point it at the real interpreter.
+export AITK_PYTHON="${VENV_DIR}/bin/python3"
 
 # Optional stability knobs
 export GIT_LFS_SKIP_SMUDGE=1
@@ -132,6 +157,38 @@ have_cmd ffmpeg || die "ffmpeg not found in WSL. Run: sudo apt-get update && sud
 
 [[ -d "${REPO_DIR}/.git" ]] || die "Repo not found at ${REPO_DIR}"
 [[ -f "${VENV_DIR}/bin/activate" ]] || die "venv not found at ${VENV_DIR}. Create/fix it first."
+
+# WSL does not re-attach the HF cache VHD after a reboot. Fail loudly rather than
+# starting, because HF_HOME would silently point at an empty directory and every
+# model would re-download (~325GB) instead of erroring.
+grep -q " ${HF_CACHE_MOUNT} " /proc/mounts || die "HF cache disk not mounted at ${HF_CACHE_MOUNT}.
+Attach it from an elevated Windows prompt:
+  wsl --mount --vhd \"C:\\Data\\WSL\\hf-cache.vhdx\" --name hfcache"
+
+# Training processes are spawned detached (startJob.ts uses detached + unref), so
+# they keep running after this script exits. Restarting the stack while one is
+# alive hands a fresh worker a database full of rows it did not create, alongside
+# a live trainer it never spawned — which is how two jobs ended up sharing one
+# GPU (90s/it instead of <5s/it, no OOM, just CUDA spilling to shared memory).
+LIVE_TRAINERS="$(pgrep -af 'run_ui\.py' 2>/dev/null || true)"
+if [[ -n "${LIVE_TRAINERS}" ]]; then
+  echo
+  echo "WARNING: training is already running. Stopping this script does not stop it."
+  echo
+  echo "${LIVE_TRAINERS}"
+  echo
+  echo "Restarting the UI on top of a live trainer risks a second job on the same GPU."
+  echo "Safe if you only need the UI back (a crashed UI does not kill training)."
+  read -r -p "Continue anyway? [y/N] " _trainer_answer
+  case "${_trainer_answer}" in
+    [Yy]|[Yy][Ee][Ss])
+      echo "---- Continuing with a trainer still running."
+      ;;
+    *)
+      die "Aborted. Stop the job from the UI, or wait for it to finish, then re-run."
+      ;;
+  esac
+fi
 
 cd "${REPO_DIR}"
 
@@ -303,14 +360,19 @@ mkdir -p "$(dirname "${LOG_FILE}")"
 cd "${UI_DIR}"
 
 # Only rebuild if source files changed since the last build.
-# Checks src/, public/, package.json, next.config.*, and tsconfig files.
+# Checks src/, cron/, public/, package.json, next.config.*, and tsconfig files.
+#
+# cron/ matters as much as src/: the background worker runs from the compiled
+# dist/cron/*.js, so edits to pythonPath.ts / processQueue.ts / startJob.ts do
+# nothing until `npm run build` recompiles them. Leaving cron/ out of this check
+# meant worker fixes silently ran as stale builds.
 NEXT_BUILD="${UI_DIR}/.next/BUILD_ID"
 UI_NEEDS_BUILD=0
 
 if [[ ! -f "${NEXT_BUILD}" ]]; then
   echo "---- No existing build found, will build."
   UI_NEEDS_BUILD=1
-elif find "${UI_DIR}/src" "${UI_DIR}/public" \
+elif find "${UI_DIR}/src" "${UI_DIR}/cron" "${UI_DIR}/public" \
          "${UI_DIR}/package.json" "${UI_DIR}/tsconfig.json" \
          "${UI_DIR}/tsconfig.worker.json" \
          -newer "${NEXT_BUILD}" -print -quit 2>/dev/null | grep -q .; then

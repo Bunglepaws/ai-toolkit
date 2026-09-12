@@ -2,7 +2,7 @@
 
 import { Job } from '@prisma/client';
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { MdExpandMore, MdExpandLess } from 'react-icons/md';
+import { MdExpandMore, MdExpandLess, MdFileDownload } from 'react-icons/md';
 
 interface Session {
   id: number | null;
@@ -90,6 +90,53 @@ function parseDuration(raw: string): number | null {
 
 const gridCols = '1.6fr 1fr 0.7fr 0.9fr 0.9fr 1fr 1fr';
 
+function csvEscape(value: string): string {
+  if (/[",\n]/.test(value)) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
+}
+
+function downloadSessionsCsv(jobName: string, sessions: Session[], totals: {
+  startup: number;
+  sampling: number;
+  training: number;
+  grand: number;
+}) {
+  const header = ['Start', 'End', 'Start Step', 'Startup (s)', 'Sampling (s)', 'Training (s)', 'Total (s)'];
+  const rows = sessions.map(s => [
+    formatDateTime(s.start_time),
+    s.in_progress ? 'in progress' : s.end_time !== null ? formatDateTime(s.end_time) : '',
+    s.start_step ? String(s.start_step) : '',
+    s.startup_seconds !== null ? String(Math.round(s.startup_seconds)) : '',
+    s.sampling_seconds !== null ? String(Math.round(s.sampling_seconds)) : '',
+    s.training_seconds !== null ? String(Math.round(s.training_seconds)) : '',
+    s.total_seconds !== null ? String(Math.round(s.total_seconds)) : '',
+  ]);
+  const subtotalRow = [
+    'Subtotals',
+    '',
+    '',
+    String(Math.round(totals.startup)),
+    String(Math.round(totals.sampling)),
+    String(Math.round(totals.training)),
+    String(Math.round(totals.grand)),
+  ];
+
+  const lines = [header, subtotalRow, ...rows].map(row => row.map(csvEscape).join(','));
+  const csv = lines.join('\r\n');
+
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${jobName}_training_sessions.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 interface Props {
   job: Job;
 }
@@ -99,6 +146,7 @@ export default function JobTrainingSessions({ job }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editValue, setEditValue] = useState('');
+  const [editOriginalSeconds, setEditOriginalSeconds] = useState<number | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const fetchSessions = useCallback(async () => {
@@ -124,8 +172,10 @@ export default function JobTrainingSessions({ job }: Props) {
 
   const startEdit = (session: Session) => {
     if (session.id === null) return;
+    const formatted = session.training_seconds !== null ? formatDuration(session.training_seconds) : '';
     setEditingId(session.id);
-    setEditValue(session.training_seconds !== null ? formatDuration(session.training_seconds) : '');
+    setEditValue(formatted);
+    setEditOriginalSeconds(session.training_seconds);
   };
 
   const cancelEdit = () => {
@@ -137,6 +187,11 @@ export default function JobTrainingSessions({ job }: Props) {
     const seconds = editValue.trim() === '' ? null : parseDuration(editValue);
     if (editValue.trim() !== '' && seconds === null) {
       // bad input — keep editing
+      return;
+    }
+    // No real change — parsed value matches what was there before
+    if (seconds === editOriginalSeconds) {
+      cancelEdit();
       return;
     }
     setEditingId(null);
@@ -203,7 +258,25 @@ export default function JobTrainingSessions({ job }: Props) {
               ~ estimated from step timestamps — model load time not included
             </p>
           )}
-          <p className="text-xs text-gray-700 pb-1">Click a training time to override it.</p>
+          <div className="flex items-center justify-between pb-1">
+            <p className="text-xs text-gray-700">Click a training time to override it.</p>
+            <button
+              type="button"
+              onClick={() =>
+                downloadSessionsCsv(job.name, visibleSessions, {
+                  startup: visibleStartupTotal,
+                  sampling: visibleSamplingTotal,
+                  training: visibleTrainingTotal,
+                  grand: visibleGrandTotal,
+                })
+              }
+              className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors"
+              title="Export to CSV"
+            >
+              <MdFileDownload />
+              Export CSV
+            </button>
+          </div>
           <div className="max-h-80 overflow-y-auto overflow-x-auto">
             <div className="min-w-[560px]">
               <div

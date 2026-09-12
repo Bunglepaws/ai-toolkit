@@ -55,7 +55,7 @@ check "NOT SAMPLED placeholder cells" \
   "NOT SAMPLED"
 check "steps array for row step labels" \
   "ui/src/components/SampleImages.tsx" \
-  "const steps ="
+  "rowStepLabel"
 check "stepLabel passed to SampleImageCard" \
   "ui/src/components/SampleImages.tsx" \
   "stepLabel="
@@ -69,11 +69,28 @@ check "Reads prompt from file metadata" \
   "ui/src/components/SampleImageViewer.tsx" \
   "metadataPrompt"
 
+check "Sticky video mute hook wired in"   "ui/src/components/SampleImageViewer.tsx"   "videoMute"
+
+echo
+echo "── UI: DatasetImageViewer ───────────────────"
+check "Sticky video mute hook wired in"   "ui/src/components/DatasetImageViewer.tsx"   "videoMute"
+
+echo
+echo "── UI: useVideoMute ─────────────────────────"
+check "Global mute preference storage key"   "ui/src/hooks/useVideoMute.ts"   "aitk_video_muted"
+
+echo
+echo "── UI: Datasets list columns ────────────────"
+check "Dataset stats API route exists"   "ui/src/app/api/datasets/stats/route.ts"   "captionExtensions"
+check "Dataset stats hook exists"   "ui/src/hooks/useDatasetStats.tsx"   "api/datasets/stats"
+check "Datasets page uses the stats hook"   "ui/src/app/datasets/page.tsx"   "useDatasetStats"
+check "Datasets sort preference storage key"   "ui/src/app/datasets/page.tsx"   "aitk_datasets_sort"
+
 echo
 echo "── UI: JobActionBar ─────────────────────────"
-check "SaveSnapshotModal import" \
+check "SaveStopJobModal import" \
   "ui/src/components/JobActionBar.tsx" \
-  "openSaveSnapshotModal"
+  "openSaveStopJobModal"
 check "Save snapshot button (canSave)" \
   "ui/src/components/JobActionBar.tsx" \
   "canSave"
@@ -83,9 +100,15 @@ check "Generate samples button (canSample)" \
 check "Edit sample prompts while running (canEditSample)" \
   "ui/src/components/JobActionBar.tsx" \
   "canEditSample"
-check "Save snapshot modal wired in JobActionBar" \
-  "ui/src/components/JobActionBar.tsx" \
-  "openSaveSnapshotModal"
+check "SaveStopJobModal rendered in layout" \
+  "ui/src/app/layout.tsx" \
+  "SaveStopJobModal"
+check "Save/stop dialog offers all four actions" \
+  "ui/src/components/SaveStopJobModal.tsx" \
+  "saveJobNow, saveAndPauseJob, saveAndRequeueJob, gracefulStopJob"
+check "Save and Stop Queue pins the job to the head of the queue" \
+  "ui/src/app/api/jobs/[jobID]/save_and_requeue/route.ts" \
+  "queue_position: 0"
 check "sampleJob imported" \
   "ui/src/components/JobActionBar.tsx" \
   "sampleJob"
@@ -152,22 +175,69 @@ check "JobStoppedException defined" \
 check "maybe_stop in UITrainer" \
   "extensions_built_in/sd_trainer/UITrainer.py" \
   "def maybe_stop"
-check "should_save reads 'save' column (not save_now)" \
+check "should_save reads 'save_now' column (ostris canonical schema)" \
   "extensions_built_in/sd_trainer/DiffusionTrainer.py" \
-  "SELECT save FROM Job"
-check "No duplicate should_save definitions" \
+  "SELECT save_now FROM Job"
+# Duplicate method definitions.
+#
+# This is the signature of a merge resolved by keeping BOTH sides. Python
+# accepts it silently -- the later definition wins and the earlier one becomes
+# dead code -- so py_compile passes and the marker greps above pass too (a
+# duplicate makes a marker MORE present, not less). It has happened twice:
+# should_save, and then should_sample, where the live and dead copies differed
+# in whether the DB read was retried.
+#
+# Checked generically rather than per symbol: the point is to catch the next
+# one without having been bitten by it first.
+echo
+echo "── Python: no duplicate method definitions ──"
+for f in \
   "extensions_built_in/sd_trainer/DiffusionTrainer.py" \
-  "def should_save"  # checked by count below
+  "extensions_built_in/sd_trainer/UITrainer.py" \
+  "extensions_built_in/sd_trainer/SDTrainer.py" \
+  "jobs/process/BaseSDTrainProcess.py"
+do
+  [[ -f "$REPO/$f" ]] || continue
+  # method defs only (4-space indent), name captured, duplicates reported
+  DUPES=$(grep -oE "^    def [a-zA-Z_][a-zA-Z0-9_]*" "$REPO/$f" 2>/dev/null \
+            | sort | uniq -d | sed 's/^    def //' | tr '\n' ' ')
+  if [[ -z "$DUPES" ]]; then
+    echo "  ✓  $(basename "$f"): no duplicated methods"
+    ((PASS++))
+  else
+    echo "  ✗  MISSING: $(basename "$f") defines these twice: $DUPES"
+    echo "       a later definition silently shadows the earlier one"
+    ((FAIL++))
+    FAILURES+=("Duplicate methods in $(basename "$f"): $DUPES")
+  fi
+done
 
-# Check for duplicate definitions (should be exactly 1)
-COUNT=$(grep -c "def should_save" "$REPO/extensions_built_in/sd_trainer/DiffusionTrainer.py" 2>/dev/null || echo 0)
-if [[ "$COUNT" -eq 1 ]]; then
-  echo "  ✓  Exactly one should_save definition"
-  ((PASS++))
+# Undefined names / redefinitions across the files a merge is most likely to
+# touch. py_compile only proves a file PARSES -- it passed on the unloader
+# calling an undefined _detach_and_cpu and an unimported flush, which then
+# raised NameError at runtime. pyflakes catches both that and the duplicates
+# above. Skipped (not failed) when pyflakes isn't installed.
+echo
+echo "── Python: pyflakes (undefined names) ───────"
+PY="$REPO/.venv/Scripts/python.exe"
+[[ -x "$PY" ]] || PY="python"
+if "$PY" -m pyflakes --version >/dev/null 2>&1; then
+  PF=$("$PY" -m pyflakes \
+        "$REPO/extensions_built_in/sd_trainer/DiffusionTrainer.py" \
+        "$REPO/extensions_built_in/sd_trainer/UITrainer.py" \
+        "$REPO/toolkit/unloader.py" \
+        2>/dev/null | grep -E "undefined name|redefinition of" || true)
+  if [[ -z "$PF" ]]; then
+    echo "  ✓  No undefined names or redefinitions"
+    ((PASS++))
+  else
+    echo "  ✗  MISSING: pyflakes findings:"
+    echo "$PF" | sed 's/^/       /'
+    ((FAIL++))
+    FAILURES+=("pyflakes: undefined names or redefinitions")
+  fi
 else
-  echo "  ✗  MISSING: should_save defined $COUNT times (expected 1) — duplicate methods!"
-  ((FAIL++))
-  FAILURES+=("Duplicate should_save in DiffusionTrainer")
+  echo "  ~  pyflakes not installed, skipping (pip install pyflakes)"
 fi
 
 echo
@@ -205,9 +275,29 @@ echo "── Python: LTX-2.3 distilled LoRA ──────────"
 check "distill_lora_path support in ltx2.py" \
   "extensions_built_in/diffusion_models/ltx2/ltx2.py" \
   "distill_lora"
-check "filter_lora_state_dict_for_quantized_model used in ltx2.py (prevents weight corruption on quantized layers)" \
-  "extensions_built_in/diffusion_models/ltx2/ltx2.py" \
-  "filter_lora_state_dict_for_quantized_model"
+# Checks the files that actually CALL it. It was previously asserted against
+# ltx2.py, where the name only ever appeared on an import line and was never
+# called - so the check passed on dead code while the real call sites went
+# unguarded. The 2026-08-29 ostris merge dropped the import from qwen_image.py
+# and that landed as a runtime NameError this check did not catch.
+check "filter_lora_state_dict_for_quantized_model called in qwen_image.py (prevents weight corruption on quantized layers)" \
+  "extensions_built_in/diffusion_models/qwen_image/qwen_image.py" \
+  "lora_state_dict = filter_lora_state_dict_for_quantized_model"
+check "filter_lora_state_dict_for_quantized_model called in wan22_14b_model.py (prevents weight corruption on quantized layers)" \
+  "extensions_built_in/diffusion_models/wan22/wan22_14b_model.py" \
+  "= filter_lora_state_dict_for_quantized_model"
+
+echo
+echo "── Python: MiniMax-H3 turbo LoRA ────────────"
+check "turbo sampling LoRA in minimax_h3.py" \
+  "extensions_built_in/diffusion_models/minimax_h3/minimax_h3.py" \
+  "_build_turbo_lora"
+check "_detach_turbo_lora (unwraps forwards on file change)" \
+  "extensions_built_in/diffusion_models/minimax_h3/minimax_h3.py" \
+  "_detach_turbo_lora"
+check "sample.minimax_h3_turbo_lora section wired to minimax_h3" \
+  "ui/src/app/jobs/new/options.tsx" \
+  "sample.minimax_h3_turbo_lora"
 
 echo
 echo "── Python: Gemma API ────────────────────────"

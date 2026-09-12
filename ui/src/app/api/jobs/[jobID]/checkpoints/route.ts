@@ -12,9 +12,11 @@ export interface CheckpointEntry {
   mtimeMs: number;
 }
 
-// Matches plain (_000001000.safetensors) and WAN 2.2 split variants
-// (_000010016_high_noise.safetensors, _000010016_low_noise.safetensors)
-const STEP_RE = /_(\d{9})(?:_(?:high|low)_noise)?\.safetensors$/;
+// Matches plain (_00001.safetensors) and WAN 2.2 split variants
+// (_00010016_high_noise.safetensors, _00010016_low_noise.safetensors).
+// \d{5,} covers both the current 5-digit padding and legacy 9-digit files
+// that haven't been renamed by a resumed training run yet.
+const STEP_RE = /_(\d{5,})(?:_(?:high|low)_noise)?\.safetensors$/;
 
 export async function GET(_req: NextRequest, { params }: { params: { jobID: string } }) {
   const { jobID } = await params;
@@ -65,10 +67,13 @@ export async function GET(_req: NextRequest, { params }: { params: { jobID: stri
     }
   }
 
-  // Check for optimizer archives
+  // Check for optimizer archives. Try the current 5-digit padding first, then
+  // fall back to legacy 9-digit padding for files not yet renamed.
   for (const [step, entry] of stepMap) {
-    const archive = `optimizer_${String(step).padStart(9, '0')}.pt`;
-    entry.hasOptimizer = fs.existsSync(path.join(jobFolder, archive));
+    const archive5 = `optimizer_${String(step).padStart(5, '0')}.pt`;
+    const archive9 = `optimizer_${String(step).padStart(9, '0')}.pt`;
+    entry.hasOptimizer =
+      fs.existsSync(path.join(jobFolder, archive5)) || fs.existsSync(path.join(jobFolder, archive9));
   }
 
   const checkpoints = Array.from(stepMap.values()).sort((a, b) => b.step - a.step);

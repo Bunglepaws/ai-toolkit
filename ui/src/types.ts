@@ -57,6 +57,29 @@ export interface GPUApiResponse {
 }
 
 /**
+ * System monitor stream (SSE at /api/monitor)
+ */
+
+// Rolling history only logs load + memory; everything else (temps, fans,
+// power, clocks) is instantaneous-only via MonitorSample.
+export interface MonitorHistoryPoint {
+  t: number; // epoch ms
+  cpu: { load: number; memUsedMb: number };
+  // one entry per GPU, same order as MonitorSample.gpu.gpus (sorted by index)
+  gpus: { load: number; memUsedMb: number }[];
+}
+
+export interface MonitorSample {
+  t: number;
+  cpu: CpuInfo | null;
+  gpu: GPUApiResponse;
+}
+
+export interface MonitorInit extends MonitorSample {
+  history: MonitorHistoryPoint[];
+}
+
+/**
  * Training configuration
  */
 
@@ -85,10 +108,12 @@ export interface SaveConfig {
 }
 
 export interface DatasetConfig {
+  batch_size?: number;
   folder_path: string;
   mask_path: string | null;
   mask_min_value: number;
   default_caption: string;
+  trigger_word: string | null;
   caption_ext: string;
   caption_dropout_rate: number;
   shuffle_tokens?: boolean;
@@ -112,6 +137,8 @@ export interface DatasetConfig {
   control_path_2?: string | null;
   control_path_3?: string | null;
   auto_frame_count?: boolean;
+  voice_placeholder_size?: number;
+  stop_after_step?: number | null;
 }
 
 export interface EMAConfig {
@@ -121,6 +148,8 @@ export interface EMAConfig {
 
 export interface ValidationItem {
   image_path: string;
+  audio_path?: string;
+  caption_path?: string;
   prompt: string;
 }
 
@@ -167,6 +196,8 @@ export interface TrainConfig {
   max_loss?: number | null;
   validation_config?: ValidationConfig;
   combine_datasets?: boolean;
+  do_guidance_loss?: boolean;
+  guidance_loss_target?: number;
 }
 
 export interface QuantizeKwargsConfig {
@@ -191,6 +222,7 @@ export interface ModelConfig {
   use_gemma_api?: boolean;
   cache_quantized_model?: boolean;
   extras_name_or_path?: string;
+  te_name_or_path?: string;
   unconditional_lora_path?: string;
   compile?: boolean;
   block_compile?: boolean;
@@ -234,6 +266,10 @@ export interface SampleConfig {
   sample_steps: number;
   num_frames: number;
   fps: number;
+  // Sample length in seconds. UI-facing source of truth for video samples;
+  // num_frames is derived from it (snapped to the model's frame grid) and
+  // remains what the trainer reads. Absent on jobs created before this existed.
+  duration?: number;
   // LoRA applied only during sampling (not training). WAN 2.2 uses path + path_2 for two-stage LightX2V.
   sample_lora_path?: string | null;
   sample_lora_path_2?: string | null;
@@ -256,6 +292,25 @@ export interface SliderConfig {
   anchor_class?: string | null;
 }
 
+export interface VoiceCloneConfig {
+  enabled: boolean;
+  mode: 'clone' | 'design';
+  reference_path: string;
+  reference_text: string;
+  instruct: string;
+  voice_seed_path: string;
+  target_dataset: string;
+  target_seconds: number;
+  duration_mix: 'long' | 'even' | 'short';
+  voice_description: string;
+  trigger_word: string;
+  dialogue: string[];
+  backend: string;
+  seed: number;
+  // nonce, not a boolean -- a checkbox would re-run on every resume
+  regenerate_token: string;
+}
+
 export interface ProcessConfig {
   type: string;
   sqlite_db_path?: string;
@@ -271,6 +326,7 @@ export interface ProcessConfig {
   logging: LoggingConfig;
   model: ModelConfig;
   sample: SampleConfig;
+  voice_clone?: VoiceCloneConfig;
 }
 
 export interface ConfigObject {
@@ -310,6 +366,9 @@ export interface CaptionProcessConfig {
     fixed_caption?: string;
     caption_extension?: string;
     thinking?: boolean;
+    batch_size?: number;
+    layer_offloading?: boolean;
+    layer_offloading_percent?: number;
   }
 }
 

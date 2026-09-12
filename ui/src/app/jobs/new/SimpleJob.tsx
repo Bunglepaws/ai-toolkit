@@ -8,9 +8,11 @@ import {
   defaultQtype,
   jobTypeOptions,
   SampleTags,
+  isOstrisBackedQtype,
+  parseQtypeAra,
 } from './options';
-import { defaultCompileOptions, defaultDatasetConfig } from './jobConfig';
-import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
+import { defaultCompileOptions, defaultDatasetConfig, defaultVoiceCloneConfig } from './jobConfig';
+import { GroupedSelectOption, JobConfig, SelectOption, VoiceCloneConfig } from '@/types';
 import { objectCopy, tagsToObj, objToTags } from '@/utils/basic';
 import {
   TextInput,
@@ -33,6 +35,13 @@ import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
 import { isMac } from '@/helpers/basic';
+import {
+  defaultFrameGrid,
+  durationToFrameCount,
+  frameCountToDuration,
+  formatDuration,
+  isUntestedFps,
+} from '@/helpers/videoFrames';
 import useSettings from '@/hooks/useSettings';
 
 const MRU_LORA_KEY = 'aitk_mru_lora_paths';
@@ -147,6 +156,18 @@ type Props = {
 
 const isDev = process.env.NODE_ENV === 'development';
 
+// The complete OmniVoice non-verbal vocabulary. Anything outside this renders as literal
+// spoken words, so the dialogue box offers them rather than leaving them to be typed.
+const NON_VERBAL_TAGS = [
+  { tag: '[laughter]', hint: 'laughing' },
+  { tag: '[sigh]', hint: 'sighing' },
+  { tag: '[confirmation-en]', hint: 'mm-hmm / audible yes' },
+  { tag: '[question-en]', hint: 'questioning hum' },
+  { tag: '[surprise-oh]', hint: "surprised 'oh'" },
+  { tag: '[surprise-ah]', hint: "surprised 'ah'" },
+  { tag: '[dissatisfaction-hnn]', hint: "disgruntled 'hnn'" },
+];
+
 export default function SimpleJob({
   jobConfig,
   setJobConfig,
@@ -184,6 +205,106 @@ export default function SimpleJob({
   }, [modelArch, jobType]);
 
   const isVideoModel = !!(modelArch?.group === 'video');
+
+  // Video samples are configured in seconds; the frame count is derived from
+  // duration x fps and snapped onto the architecture's frame grid (WAN n+1,
+  // LTX 8n+1, H3 17n+5). num_frames stays in the config as the value the
+  // trainer reads. Jobs saved before `duration` existed back-fill from it.
+  const frameGrid = modelArch?.frameGrid ?? defaultFrameGrid;
+  const sampleFps = jobConfig.config.process[0].sample.fps;
+  const sampleDuration = useMemo(() => {
+    const stored = jobConfig.config.process[0].sample.duration;
+    if (stored !== undefined && stored !== null) return stored;
+    return frameCountToDuration(jobConfig.config.process[0].sample.num_frames, sampleFps);
+  }, [
+    jobConfig.config.process[0].sample.duration,
+    jobConfig.config.process[0].sample.num_frames,
+    sampleFps,
+  ]);
+  const sampleFrameCount = useMemo(
+    () => durationToFrameCount(sampleDuration, sampleFps, frameGrid),
+    [sampleDuration, sampleFps, frameGrid],
+  );
+  const fpsUntested = isUntestedFps(sampleFps, modelArch?.supportedFps);
+
+  const setSampleDuration = useCallback(
+    (duration: number | null, fps: number = sampleFps) => {
+      const seconds = duration ?? 0;
+      setJobConfig(seconds, 'config.process[0].sample.duration');
+      setJobConfig(durationToFrameCount(seconds, fps, frameGrid), 'config.process[0].sample.num_frames');
+    },
+    [setJobConfig, sampleFps, frameGrid],
+  );
+  // Clone Voice card. Clip count mirrors the backend: ceil(seconds / 5.167), the longest
+  // legal H3 slot -- shown live so the seconds field is not abstract.
+  // MERGE with defaults, don't only fall back when absent. Toggling the enable checkbox
+  // writes a nested path, so a config that never had a voice_clone block ends up with a
+  // PARTIAL one -- and a missing `dialogue` array throws on .join(), which the page's
+  // ErrorBoundary surfaces as the misleading "Advanced job detected".
+  const vc: VoiceCloneConfig = {
+    ...defaultVoiceCloneConfig,
+    ...(jobConfig.config.process[0].voice_clone ?? {}),
+  };
+  const vcDialogue = Array.isArray(vc.dialogue) ? vc.dialogue : [];
+  const voiceClipCount = Math.max(1, Math.ceil((vc.target_seconds || 0) / 5.167));
+  const voiceDialogueRef = useRef<HTMLTextAreaElement>(null);
+  const [voiceAdvanced, setVoiceAdvanced] = useState(false);
+  // What is actually in the target folder. Generation happens inside the training job, so
+  // nothing here observes it -- without this the card cannot tell "never generated" from
+  // "already generated and current", which is what made the rebuild button look inert.
+  const [voiceManifest, setVoiceManifest] = useState<{
+    exists: boolean;
+    count: number;
+    missing?: number;
+  } | null>(null);
+  useEffect(() => {
+    if (!vc.enabled || !vc.target_dataset) {
+      setVoiceManifest(null);
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/datasets/voice-manifest?path=${encodeURIComponent(vc.target_dataset)}`)
+      .then(r => r.json())
+      .then(d => {
+        if (!cancelled) setVoiceManifest(d);
+      })
+      .catch(() => {
+        if (!cancelled) setVoiceManifest(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [vc.enabled, vc.target_dataset]);
+  // A voice dataset holds audio-only items: their video side is a zeros placeholder pinned to
+  // voice_placeholder_size, never bucketed and never trained on. So resolution, frame count,
+  // crop/flip and control pickers are all inert for it -- hide them rather than leave settings
+  // that look live and do nothing.
+  const isVoiceDataset = (d: { folder_path?: string }) =>
+    !!vc.enabled && !!vc.target_dataset && d.folder_path === vc.target_dataset;
+
+  // Picking a target folder also wires it in as a dataset. Generating clips into a folder
+  // no dataset entry references is a silent no-op -- the run trains as if the voice were
+  // never made -- and this card is the only place with the context to prevent it.
+  // Add/ensure only: never removes a dataset, since the user may have put images there.
+  const setVoiceTargetDataset = (folderPath: string) => {
+    setJobConfig(folderPath, 'config.process[0].voice_clone.target_dataset');
+    if (!folderPath) return;
+    const datasets = objectCopy(jobConfig.config.process[0].datasets) as any[];
+    const idx = datasets.findIndex(d => d.folder_path === folderPath);
+    if (idx === -1) {
+      const newDataset = objectCopy(defaultDatasetConfig) as any;
+      newDataset.folder_path = folderPath;
+      newDataset.controls = modelArch?.controls ?? [];
+      // voice items are audio-only; both are required or the dataset refuses to load
+      newDataset.do_audio = true;
+      newDataset.cache_latents_to_disk = true;
+      datasets.push(newDataset);
+    } else {
+      datasets[idx].do_audio = true;
+      datasets[idx].cache_latents_to_disk = true;
+    }
+    setJobConfig(datasets, 'config.process[0].datasets');
+  };
   const isAudioModel = !!(modelArch?.group === 'audio');
 
   const taggedSampleArr: Record<string, any>[] | null = useMemo(() => {
@@ -427,6 +548,34 @@ export default function SimpleJob({
                 placeholder=""
               />
             )}
+            {modelArch?.customModelSelectOptions?.map(customOption => (
+              <SelectInput
+                key={customOption.label}
+                label={customOption.label}
+                value={customOption.getValue(jobConfig) ?? ''}
+                doc={customOption.doc}
+                onChange={value => customOption.onChange(value, jobConfig, setJobConfig)}
+                options={customOption.options}
+              />
+            ))}
+            {modelArch?.modelNotes && (
+              <div className="pt-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const gateUrl = modelArch.gateUrl as string;
+                    openDoc({
+                      title: `Notes - ${modelArch.label}`,
+                      description: <div className="space-y-3">{modelArch.modelNotes}</div>,
+                    });
+                  }}
+                  className="w-full flex items-center gap-2 rounded-md bg-blue-950/60 border border-blue-800 px-3 py-2 text-sm text-blue-200 hover:bg-blue-900/60 text-left"
+                >
+                  <Info className="w-4 h-4 shrink-0 text-blue-400" />
+                  <span>Model notes</span>
+                </button>
+              </div>
+            )}
             {modelArch?.gateUrl && (
               <div className="pt-2">
                 <button
@@ -471,9 +620,9 @@ export default function SimpleJob({
                       ),
                     });
                   }}
-                  className="w-full flex items-center gap-2 rounded-md bg-blue-950/60 border border-blue-800 px-3 py-2 text-sm text-blue-200 hover:bg-blue-900/60 text-left"
+                  className="w-full flex items-center gap-2 rounded-md bg-yellow-950/60 border border-yellow-800 px-3 py-2 text-sm text-yellow-200 hover:bg-yellow-900/60 text-left"
                 >
-                  <Info className="w-4 h-4 shrink-0 text-blue-400" />
+                  <Info className="w-4 h-4 shrink-0 text-yellow-400" />
                   <span>
                     Gated model. <span className="underline">Learn more.</span>
                   </span>
@@ -527,6 +676,7 @@ export default function SimpleJob({
             {modelArch?.additionalSections?.includes('model.spatial_upscaler_path') && (
               <TextInput
                 label="Spatial Upscaler Path"
+                className="md:col-span-2"
                 value={jobConfig.config.process[0].model.spatial_upscaler_path ?? ''}
                 docKey="config.process[0].model.spatial_upscaler_path"
                 onChange={(value: string | undefined) => {
@@ -538,7 +688,22 @@ export default function SimpleJob({
                 placeholder="Path to .safetensors upscaler model (optional)"
               />
             )}
-            {modelArch?.additionalSections?.includes('model.layer_offloading') && !isMac() && !useGemmaApi && (
+            {modelArch?.additionalSections?.includes('model.te_name_or_path') && !useGemmaApi && (
+              <TextInput
+                label="Text Encoder Path Override"
+                className="md:col-span-2"
+                value={jobConfig.config.process[0].model.te_name_or_path ?? ''}
+                docKey="config.process[0].model.te_name_or_path"
+                onChange={(value: string | undefined) => {
+                  if (value?.trim() === '') {
+                    value = undefined;
+                  }
+                  setJobConfig(value, 'config.process[0].model.te_name_or_path');
+                }}
+                placeholder="Path to .safetensors text encoder (optional — defaults to the arch's own resolution)"
+              />
+            )}
+            {modelArch?.additionalSections?.includes('model.layer_offloading') && !isMac() && (
               <>
                 <Checkbox
                   label={
@@ -564,18 +729,20 @@ export default function SimpleJob({
                       max={100}
                       step={1}
                     />
-                    <SliderInput
-                      label="Text Encoder Offload %"
-                      value={Math.round(
-                        (jobConfig.config.process[0].model.layer_offloading_text_encoder_percent ?? 1) * 100,
-                      )}
-                      onChange={value =>
-                        setJobConfig(value * 0.01, 'config.process[0].model.layer_offloading_text_encoder_percent')
-                      }
-                      min={0}
-                      max={100}
-                      step={1}
-                    />
+                    {!useGemmaApi && (
+                      <SliderInput
+                        label="Text Encoder Offload %"
+                        value={Math.round(
+                          (jobConfig.config.process[0].model.layer_offloading_text_encoder_percent ?? 1) * 100,
+                        )}
+                        onChange={value =>
+                          setJobConfig(value * 0.01, 'config.process[0].model.layer_offloading_text_encoder_percent')
+                        }
+                        min={0}
+                        max={100}
+                        step={1}
+                      />
+                    )}
                   </div>
                 )}
               </>
@@ -615,14 +782,40 @@ export default function SimpleJob({
                   options={quantizationOptions}
                 />
               )}
-              {jobConfig.config.process[0].model.quantize && (
-                <Checkbox
-                  label="Cache Quantized Model"
-                  docKey="model.cache_quantized_model"
-                  checked={jobConfig.config.process[0].model.cache_quantized_model ?? false}
-                  onChange={value => setJobConfig(value, 'config.process[0].model.cache_quantized_model')}
-                />
-              )}
+              {jobConfig.config.process[0].model.quantize &&
+                (() => {
+                  const { base, ara } = parseQtypeAra(jobConfig.config.process[0].model.qtype || '');
+                  // An accuracy recovery adapter's own quantization only round-trips
+                  // through the ostris backends (uintN / convrot*) -- see
+                  // quantize_model's ARA branch in toolkit/util/quantize.py. qfloat8
+                  // and float8 go through a different save path that has nothing to
+                  // persist when an ARA is attached, so the cache would silently do
+                  // nothing.
+                  const cacheUnsupported = !!ara && !isOstrisBackedQtype(base);
+                  if (cacheUnsupported && jobConfig.config.process[0].model.cache_quantized_model) {
+                    // don't let a combination that can't work linger in a saved config
+                    setJobConfig(false, 'config.process[0].model.cache_quantized_model');
+                  }
+                  return (
+                    <>
+                      <Checkbox
+                        label="Cache Quantized Model"
+                        docKey="model.cache_quantized_model"
+                        checked={
+                          !cacheUnsupported && (jobConfig.config.process[0].model.cache_quantized_model ?? false)
+                        }
+                        disabled={cacheUnsupported}
+                        onChange={value => setJobConfig(value, 'config.process[0].model.cache_quantized_model')}
+                      />
+                      {cacheUnsupported && (
+                        <p className="text-xs text-yellow-500 mt-1">
+                          Caching isn't supported for this accuracy recovery adapter with a {base} base quantization —
+                          only 4/8-bit and convrot quantization can be cached with an adapter attached.
+                        </p>
+                      )}
+                    </>
+                  );
+                })()}
               <FormGroup label="Compile Options">
                 <></>
               </FormGroup>
@@ -824,7 +1017,7 @@ export default function SimpleJob({
                   onChange={value => setJobConfig(value, 'config.process[0].save.save_with_step_num')}
               />
             </FormGroup>
-          </Card>claude
+          </Card>
         </div>
         <div className={sampleOnly ? 'hidden' : ''}>
           <Card title="Training">
@@ -875,6 +1068,14 @@ export default function SimpleJob({
                     { value: 'prodigy8bit', label: 'Prodigy8Bit' },
                   ]}
                 />
+                {isAudioModel && jobConfig.config.process[0].train.optimizer === 'automagic3' && (
+                  <p className="text-xs text-yellow-500 mt-1">
+                    This has never worked well for you on audio models — loss has stalled flat in
+                    4 of 5 past ACE-Step runs with automagic3 (automagic v3 has no effective max_lr
+                    clamp, so per-tensor LR can decay to near-zero before anything is learned).
+                    AdamW8Bit or Automagic v2 have consistently trained instead.
+                  </p>
+                )}
                 <NumberInput
                   label="Learning Rate"
                   className="pt-2"
@@ -1081,6 +1282,39 @@ export default function SimpleJob({
                     )}
                   </>
                 )}
+                <FormGroup label="Other" className="pt-2">
+                  <>
+                    <Checkbox
+                      label="Contrastive Guidance Loss"
+                      docKey={'train.do_guidance_loss'}
+                      className="pt-1"
+                      checked={jobConfig.config.process[0].train.do_guidance_loss || false}
+                      onChange={value => {
+                        if (value) {
+                          setJobConfig(true, 'config.process[0].train.do_guidance_loss');
+                          if (!jobConfig.config.process[0].train.guidance_loss_target) {
+                            setJobConfig(4.0, 'config.process[0].train.guidance_loss_target');
+                          }
+                        } else {
+                          setJobConfig(undefined, 'config.process[0].train.do_guidance_loss');
+                          setJobConfig(undefined, 'config.process[0].train.guidance_loss_target');
+                        }
+                      }}
+                    />
+                    {jobConfig.config.process[0].train.do_guidance_loss && (
+                      <>
+                        <NumberInput
+                          label="Guidance Loss Target"
+                          docKey={'train.guidance_loss_target'}
+                          value={(jobConfig.config.process[0].train.guidance_loss_target as number) || 4.0}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.guidance_loss_target')}
+                          placeholder="eg. 3.0"
+                          min={0}
+                        />
+                      </>
+                    )}
+                  </>
+                </FormGroup>
               </div>
             </div>
           </Card>
@@ -1093,7 +1327,9 @@ export default function SimpleJob({
               if (value) {
                 setJobConfig(
                   {
-                    validation_items: [{ image_path: '', prompt: '' }],
+                    validation_items: isAudioModel
+                      ? [{ audio_path: '', caption_path: '', prompt: '' }]
+                      : [{ image_path: '', prompt: '' }],
                     resolution: 1024,
                     validate_every_n_steps: 1,
                     validation_sigmas: [0.5],
@@ -1108,12 +1344,31 @@ export default function SimpleJob({
             {validationConfig && (
               <>
                 <p className="text-sm text-gray-400 mb-4">
-                  Validation runs a stable loss check on a fixed set of images. Each image is encoded once at startup
-                  and predicted at the selected sigmas with fixed seeds, so the result is always deterministic and
-                  comparable across the run. The average loss is logged as val/loss every time validation runs. The
-                  images need to match the concept of your dataset, but{' '}
-                  <span className="font-bold text-gray-300">do not include the validation images in the dataset</span>.
-                  They must be images containing the concept you want to train, but not an image trained on.
+                  {isAudioModel ? (
+                    <>
+                      Validation runs a stable loss check on a fixed set of held-out audio files. Each file is
+                      encoded once at startup and predicted at the selected sigmas with fixed seeds, so the result is
+                      always deterministic and comparable across the run. The average loss is logged as val/loss
+                      every time validation runs. Point each item at an audio file and either a caption file (using
+                      the same {'<CAPTION>/<LYRICS>/<BPM>/...'} tagged format as training captions) or a prompt typed
+                      directly, but{' '}
+                      <span className="font-bold text-gray-300">
+                        do not include the validation audio in the training dataset
+                      </span>
+                      .
+                    </>
+                  ) : (
+                    <>
+                      Validation runs a stable loss check on a fixed set of images. Each image is encoded once at
+                      startup and predicted at the selected sigmas with fixed seeds, so the result is always
+                      deterministic and comparable across the run. The average loss is logged as val/loss every time
+                      validation runs. The images need to match the concept of your dataset, but{' '}
+                      <span className="font-bold text-gray-300">
+                        do not include the validation images in the dataset
+                      </span>
+                      . They must be images containing the concept you want to train, but not an image trained on.
+                    </>
+                  )}
                 </p>
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                   <NumberInput
@@ -1126,14 +1381,16 @@ export default function SimpleJob({
                     min={1}
                     required
                   />
-                  <NumberInput
-                    label="Validation Resolution"
-                    value={validationConfig.resolution}
-                    onChange={value => setJobConfig(value, 'config.process[0].train.validation_config.resolution')}
-                    placeholder="eg. 512"
-                    min={64}
-                    required
-                  />
+                  {!isAudioModel && (
+                    <NumberInput
+                      label="Validation Resolution"
+                      value={validationConfig.resolution}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.validation_config.resolution')}
+                      placeholder="eg. 512"
+                      min={64}
+                      required
+                    />
+                  )}
                   <SelectInput
                     label="Validation Sigmas"
                     value={(validationConfig.validation_sigmas ?? [1.0, 0.75, 0.5, 0.25]).join(', ')}
@@ -1153,56 +1410,116 @@ export default function SimpleJob({
                 </div>
                 <div className="mt-4">
                   <label className="block text-xs text-gray-300 mb-2">
-                    Validation Images ({validationConfig.validation_items.length})
+                    {isAudioModel ? 'Validation Audio' : 'Validation Images'} (
+                    {validationConfig.validation_items.length})
                   </label>
                   {validationConfig.validation_items.map((item, i) => (
                     <div key={i} className="rounded-lg pl-4 pr-1 py-3 mb-4 bg-gray-950">
-                      <div className="flex items-center space-x-4">
-                        <SampleControlImage
-                          instruction="Add Image"
-                          src={item.image_path === '' ? null : item.image_path}
-                          onNewImageSelected={imagePath => {
-                            setJobConfig(
-                              imagePath ?? '',
-                              `config.process[0].train.validation_config.validation_items[${i}].image_path`,
-                            );
-                          }}
-                        />
-                        <div className="flex-1">
-                          <TextInput
-                            label="Prompt"
-                            value={item.prompt}
-                            onChange={value =>
+                      {isAudioModel ? (
+                        <div className="flex items-center space-x-4">
+                          <div className="flex-1 grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <TextInput
+                              label="Audio Path"
+                              value={item.audio_path ?? ''}
+                              onChange={value =>
+                                setJobConfig(
+                                  value,
+                                  `config.process[0].train.validation_config.validation_items[${i}].audio_path`,
+                                )
+                              }
+                              placeholder="C:\path\to\Girl.mp3"
+                            />
+                            <TextInput
+                              label="Caption Path"
+                              value={item.caption_path ?? ''}
+                              onChange={value =>
+                                setJobConfig(
+                                  value,
+                                  `config.process[0].train.validation_config.validation_items[${i}].caption_path`,
+                                )
+                              }
+                              placeholder="C:\path\to\Girl.caption"
+                            />
+                            <TextInput
+                              label="Prompt (used if no caption path)"
+                              value={item.prompt}
+                              onChange={value =>
+                                setJobConfig(
+                                  value,
+                                  `config.process[0].train.validation_config.validation_items[${i}].prompt`,
+                                )
+                              }
+                              placeholder="<CAPTION>...</CAPTION><LYRICS>...</LYRICS>"
+                            />
+                          </div>
+                          <div>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setJobConfig(
+                                  validationConfig.validation_items.filter((_, index) => index !== i),
+                                  'config.process[0].train.validation_config.validation_items',
+                                )
+                              }
+                              className="rounded-full p-1 text-sm"
+                            >
+                              <X />
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="flex items-center space-x-4">
+                          <SampleControlImage
+                            instruction="Add Image"
+                            src={item.image_path === '' ? null : item.image_path}
+                            onNewImageSelected={imagePath => {
                               setJobConfig(
-                                value,
-                                `config.process[0].train.validation_config.validation_items[${i}].prompt`,
-                              )
-                            }
-                            placeholder="Enter prompt"
+                                imagePath ?? '',
+                                `config.process[0].train.validation_config.validation_items[${i}].image_path`,
+                              );
+                            }}
                           />
+                          <div className="flex-1">
+                            <TextInput
+                              label="Prompt"
+                              value={item.prompt}
+                              onChange={value =>
+                                setJobConfig(
+                                  value,
+                                  `config.process[0].train.validation_config.validation_items[${i}].prompt`,
+                                )
+                              }
+                              placeholder="Enter prompt"
+                            />
+                          </div>
+                          <div>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setJobConfig(
+                                  validationConfig.validation_items.filter((_, index) => index !== i),
+                                  'config.process[0].train.validation_config.validation_items',
+                                )
+                              }
+                              className="rounded-full p-1 text-sm"
+                            >
+                              <X />
+                            </button>
+                          </div>
                         </div>
-                        <div>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setJobConfig(
-                                validationConfig.validation_items.filter((_, index) => index !== i),
-                                'config.process[0].train.validation_config.validation_items',
-                              )
-                            }
-                            className="rounded-full p-1 text-sm"
-                          >
-                            <X />
-                          </button>
-                        </div>
-                      </div>
+                      )}
                     </div>
                   ))}
                   <button
                     type="button"
                     onClick={() =>
                       setJobConfig(
-                        [...validationConfig.validation_items, { image_path: '', prompt: '' }],
+                        [
+                          ...validationConfig.validation_items,
+                          isAudioModel
+                            ? { audio_path: '', caption_path: '', prompt: '' }
+                            : { image_path: '', prompt: '' },
+                        ],
                         'config.process[0].train.validation_config.validation_items',
                       )
                     }
@@ -1255,6 +1572,221 @@ export default function SimpleJob({
           </Card>
         </div>
         <div className={sampleOnly ? 'hidden' : ''}>
+          {modelArch?.additionalSections?.includes('voice_clone') && (
+            <Card title="Clone Voice">
+              <>
+                <Checkbox
+                  label="Generate voice clips before training"
+                  checked={vc.enabled}
+                  onChange={value => {
+                    if (!jobConfig.config.process[0].voice_clone) {
+                      setJobConfig(
+                        { ...defaultVoiceCloneConfig, enabled: value },
+                        'config.process[0].voice_clone',
+                      );
+                    } else {
+                      setJobConfig(value, 'config.process[0].voice_clone.enabled');
+                    }
+                  }}
+                  docKey="voice_clone.enabled"
+                />
+                {vc.enabled && (
+                  <div className="mt-4 space-y-4">
+                    {/* One input on the face: the recording to clone. Everything else has a
+                        working default and lives under Advanced. */}
+                    {vc.mode === 'clone' ? (
+                      <TextInput
+                        label="Reference recording"
+                        value={vc.reference_path}
+                        onChange={value => setJobConfig(value, 'config.process[0].voice_clone.reference_path')}
+                        placeholder="absolute path to a 3-25s audio or video file"
+                        docKey="voice_clone.reference_path"
+                      />
+                    ) : (
+                      <TextInput
+                        label="Voice description"
+                        value={vc.instruct}
+                        onChange={value => setJobConfig(value, 'config.process[0].voice_clone.instruct')}
+                        placeholder="male, young adult, low pitch, british accent"
+                        docKey="voice_clone.instruct"
+                      />
+                    )}
+                    <p className="-mt-2 text-xs text-gray-400">
+                      {voiceClipCount} clips will be generated into{' '}
+                      {vc.target_dataset ? vc.target_dataset.split(/[\\/]/).pop() : <em>a dataset (set one under Advanced)</em>}
+                      , captioned with the job&apos;s trigger word.
+                    </p>
+
+                    <button
+                      type="button"
+                      onClick={() => setVoiceAdvanced(v => !v)}
+                      className="text-xs text-gray-400 hover:text-gray-200 underline"
+                    >
+                      {voiceAdvanced ? 'Hide advanced' : 'Advanced'}
+                    </button>
+
+                    {voiceAdvanced && (
+                    <>
+                    <SelectInput
+                      label="Source"
+                      value={vc.mode}
+                      onChange={value => setJobConfig(value, 'config.process[0].voice_clone.mode')}
+                      options={[
+                        { value: 'clone', label: 'Clone a reference recording' },
+                        { value: 'design', label: 'Design a voice from a description' },
+                      ]}
+                      docKey="voice_clone.mode"
+                    />
+                    {vc.mode === 'clone' && (
+                      <TextInput
+                        label="Reference transcript (optional)"
+                        value={vc.reference_text}
+                        onChange={value => setJobConfig(value, 'config.process[0].voice_clone.reference_text')}
+                        placeholder="leave blank to auto-transcribe with Whisper"
+                      />
+                    )}
+
+                    <SelectInput
+                      label="Write clips into"
+                      value={vc.target_dataset}
+                      onChange={value => setVoiceTargetDataset(value as string)}
+                      options={[{ value: '', label: 'Please select...' }, ...datasetOptions]}
+                      docKey="voice_clone.target_dataset"
+                    />
+                    {vc.target_dataset && (
+                      <p className="-mt-2 text-xs text-gray-400">
+                        Added to Datasets below with Do Audio and Cache Latents to Disk enabled.
+                      </p>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <NumberInput
+                        label={`Voice length (seconds) - ${voiceClipCount} clips`}
+                        value={vc.target_seconds}
+                        onChange={value => setJobConfig(value, 'config.process[0].voice_clone.target_seconds')}
+                        placeholder="60"
+                        docKey="voice_clone.target_seconds"
+                        min={5}
+                      />
+                      <NumberInput
+                        label="Seed"
+                        value={vc.seed}
+                        onChange={value => setJobConfig(value, 'config.process[0].voice_clone.seed')}
+                        placeholder="42"
+                        min={0}
+                      />
+                    </div>
+
+                    <TextInput
+                      label="Caption the voice"
+                      value={vc.voice_description}
+                      onChange={value => setJobConfig(value, 'config.process[0].voice_clone.voice_description')}
+                      placeholder="a man speaking calmly, low pitch"
+                      docKey="voice_clone.voice_description"
+                    />
+                    <TextInput
+                      label="Trigger word (optional)"
+                      value={vc.trigger_word}
+                      onChange={value => setJobConfig(value, 'config.process[0].voice_clone.trigger_word')}
+                      placeholder={
+                        jobConfig.config.process[0].trigger_word
+                          ? `inherits "${jobConfig.config.process[0].trigger_word}" from the job`
+                          : 'leave blank to use the job trigger word'
+                      }
+                    />
+
+                    <div>
+                      <div className="flex flex-wrap gap-1 mb-2">
+                        {NON_VERBAL_TAGS.map(t => (
+                          <button
+                            key={t.tag}
+                            type="button"
+                            title={t.hint}
+                            onClick={() => {
+                              // Insert at the caret rather than appending a new line -- the
+                              // dialogue box is one string under the hood (joined by \n), so
+                              // splice the tag into that string at the textarea's own
+                              // selectionStart/End, then split back into the array.
+                              const el = voiceDialogueRef.current;
+                              const full = vcDialogue.join('\n');
+                              const start = el?.selectionStart ?? full.length;
+                              const end = el?.selectionEnd ?? full.length;
+                              const insert = `${t.tag} `;
+                              const nextFull = full.slice(0, start) + insert + full.slice(end);
+                              setJobConfig(
+                                nextFull.split('\n').filter((l: string) => l.trim() !== ''),
+                                'config.process[0].voice_clone.dialogue',
+                              );
+                              const caret = start + insert.length;
+                              requestAnimationFrame(() => {
+                                el?.focus();
+                                el?.setSelectionRange(caret, caret);
+                              });
+                            }}
+                            className="px-2 py-0.5 text-xs rounded bg-gray-700 hover:bg-gray-600 text-gray-200"
+                          >
+                            {t.tag}
+                          </button>
+                        ))}
+                      </div>
+                      <TextAreaInput
+                        ref={voiceDialogueRef}
+                        label="Dialogue (one line per clip, ~13-16 words each)"
+                        value={vcDialogue.join('\n')}
+                        onChange={value =>
+                          setJobConfig(
+                            value.split('\n').filter((l: string) => l.trim() !== ''),
+                            'config.process[0].voice_clone.dialogue',
+                          )
+                        }
+                        placeholder="Leave blank to use the built-in 12-line bank."
+                        docKey="voice_clone.dialogue"
+                        rows={6}
+                      />
+                      <p className="mt-1 text-xs text-gray-400">
+                        Avoid starting a line with a tag &mdash; a laugh or sigh at the front of most
+                        clips gets learned as part of the voice, and every generation then opens with
+                        it. Mid-line is fine.
+                      </p>
+                    </div>
+
+                    </>
+                    )}
+
+                    <div className="rounded bg-gray-800/60 border border-gray-700 p-3">
+                      <p className="text-xs text-gray-300">
+                        Clips are generated <b>when this job starts</b>, as its first step - before the
+                        model loads, so it takes the queue&apos;s GPU slot and cannot collide with another
+                        training run. Nothing happens at the moment you press anything here.
+                      </p>
+                      <div className="flex items-center gap-3 mt-3">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setJobConfig(String(Date.now()), 'config.process[0].voice_clone.regenerate_token')
+                          }
+                          className="px-3 py-1.5 text-sm rounded bg-orange-800 hover:bg-orange-700 text-white"
+                        >
+                          Rebuild clips on next run
+                        </button>
+                        <span className="text-xs text-gray-400">
+                          {vc.regenerate_token
+                            ? 'Queued: existing clips will be deleted and rebuilt the next time this job runs.'
+                            : voiceManifest?.exists
+                              ? `${voiceManifest.count} clip${voiceManifest.count === 1 ? '' : 's'} already generated${
+                                  voiceManifest.missing ? ` (${voiceManifest.missing} missing from disk)` : ''
+                                } - press this only to force a rebuild.`
+                              : 'No clips yet - they are created automatically the first time this job runs. This button is only for forcing a rebuild.'}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </>
+            </Card>
+          )}
+        </div>
+        <div className={sampleOnly ? 'hidden' : ''}>
           <Card title="Datasets">
             <>
               {jobConfig.config.process[0].datasets.map((dataset, i) => (
@@ -1288,6 +1820,13 @@ export default function SimpleJob({
                     </button>
                   </div>
                   <h2 className="text-lg font-bold mb-4">Dataset {i + 1}</h2>
+                  {isVoiceDataset(dataset) && (
+                    <p className="-mt-3 mb-4 text-xs text-gray-400">
+                      Voice dataset. Its clips train the audio stream only &mdash; the video side is a
+                      zeros placeholder with its loss zeroed &mdash; so resolution, frame count, cropping
+                      and control settings do not apply and are hidden.
+                    </p>
+                  )}
                   <div className={datasetStyleClass}>
                     <div>
                       <SelectInput
@@ -1296,7 +1835,7 @@ export default function SimpleJob({
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].folder_path`)}
                         options={[{ value: defaultDatasetConfig.folder_path, label: 'Please select...' }, ...datasetOptions]}
                       />
-                      {modelArch?.additionalSections?.includes('datasets.control_path') && (
+                      {modelArch?.additionalSections?.includes('datasets.control_path') && !isVoiceDataset(dataset) && (
                         <SelectInput
                           label="Control Dataset"
                           docKey="datasets.control_path"
@@ -1308,7 +1847,7 @@ export default function SimpleJob({
                           options={[{ value: '', label: 'None' }, ...datasetOptions]}
                         />
                       )}
-                      {modelArch?.additionalSections?.includes('datasets.multi_control_paths') && (
+                      {modelArch?.additionalSections?.includes('datasets.multi_control_paths') && !isVoiceDataset(dataset) && (
                         <>
                           <SelectInput
                             label="Control Dataset 1"
@@ -1366,6 +1905,17 @@ export default function SimpleJob({
                         placeholder="eg. 1"
                         docKey={'dataset.num_repeats'}
                       />
+                      <NumberInput
+                        label="Batch Size"
+                        value={dataset.batch_size ?? null}
+                        className="pt-2"
+                        onChange={value =>
+                          setJobConfig(value == null ? undefined : value, `config.process[0].datasets[${i}].batch_size`)
+                        }
+                        placeholder={`${jobConfig.config.process[0].train.batch_size}`}
+                        min={1}
+                        allowEmpty
+                      />
                     </div>
                     <div>
                       <TextInput
@@ -1374,9 +1924,23 @@ export default function SimpleJob({
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].default_caption`)}
                         placeholder="eg. A photo of a cat"
                       />
+                      <TextInput
+                        label="Trigger Word"
+                        className="pt-2"
+                        docKey="datasets.trigger_word"
+                        value={dataset.trigger_word || ''}
+                        onChange={(value: string | null) => {
+                          if (value?.trim() === '') {
+                            value = null;
+                          }
+                          setJobConfig(value, `config.process[0].datasets[${i}].trigger_word`);
+                        }}
+                        placeholder="Uses the global Trigger Word if left blank"
+                      />
                       <NumberInput
                         label="Caption Dropout Rate"
                         className="pt-2"
+                        docKey="datasets.caption_dropout_rate"
                         value={dataset.caption_dropout_rate}
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].caption_dropout_rate`)}
                         placeholder="eg. 0.05"
@@ -1395,7 +1959,7 @@ export default function SimpleJob({
                         ]}
                       />
 
-                      {modelArch?.additionalSections?.includes('datasets.num_frames') && !dataset.auto_frame_count && (
+                      {modelArch?.additionalSections?.includes('datasets.num_frames') && !dataset.auto_frame_count && !isVoiceDataset(dataset) && (
                         <NumberInput
                           label="Num Frames"
                           className="pt-2"
@@ -1422,7 +1986,7 @@ export default function SimpleJob({
                           checked={dataset.is_reg || false}
                           onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].is_reg`)}
                         />
-                        {modelArch?.additionalSections?.includes('datasets.auto_frame_count') && (
+                        {modelArch?.additionalSections?.includes('datasets.auto_frame_count') && !isVoiceDataset(dataset) && (
                           <Checkbox
                             label="Auto Frame Count"
                             checked={dataset.auto_frame_count || false}
@@ -1430,7 +1994,7 @@ export default function SimpleJob({
                             docKey="datasets.auto_frame_count"
                           />
                         )}
-                        {modelArch?.additionalSections?.includes('datasets.do_i2v') && (
+                        {modelArch?.additionalSections?.includes('datasets.do_i2v') && !isVoiceDataset(dataset) && (
                           <Checkbox
                             label="Do I2V"
                             checked={dataset.do_i2v || false}
@@ -1466,7 +2030,7 @@ export default function SimpleJob({
                             docKey="datasets.audio_normalize"
                           />
                         )}
-                        {modelArch?.additionalSections?.includes('datasets.audio_preserve_pitch') && (
+                        {modelArch?.additionalSections?.includes('datasets.audio_preserve_pitch') && !isVoiceDataset(dataset) && (
                           <Checkbox
                             label="Audio Preserve Pitch"
                             checked={dataset.audio_preserve_pitch || false}
@@ -1481,7 +2045,7 @@ export default function SimpleJob({
                           />
                         )}
                       </FormGroup>
-                      {!isAudioModel && (
+                      {!isAudioModel && !isVoiceDataset(dataset) && (
                         <FormGroup label="Flipping" docKey={'datasets.flip'} className="mt-2">
                           <Checkbox
                             label={
@@ -1504,7 +2068,7 @@ export default function SimpleJob({
                         </FormGroup>
                       )}
                     </div>
-                    {!isAudioModel && (
+                    {!isAudioModel && !isVoiceDataset(dataset) && (
                       <div>
                         <FormGroup label="Resolutions" className="pt-2">
                           <div className="grid grid-cols-2 gap-2">
@@ -1623,24 +2187,45 @@ export default function SimpleJob({
                   />
                   {isVideoModel && (
                     <div>
-                      <NumberInput
-                        label="Num Frames"
-                        value={jobConfig.config.process[0].sample.num_frames}
-                        onChange={value => setJobConfig(value, 'config.process[0].sample.num_frames')}
-                        placeholder="eg. 0"
-                        className="pt-2"
-                        min={0}
-                        required
-                      />
+                      <div className="pt-2 flex items-end gap-3">
+                        <NumberInput
+                          label="Duration (seconds)"
+                          value={sampleDuration}
+                          onChange={value => setSampleDuration(value)}
+                          placeholder="eg. 3"
+                          className="flex-1"
+                          min={0}
+                          required
+                        />
+                        <div className="text-xs text-gray-400 pb-2 whitespace-nowrap">
+                          {sampleFrameCount} frames
+                          {Math.abs(frameCountToDuration(sampleFrameCount, sampleFps) - sampleDuration) > 0.005 && (
+                            <span className="text-gray-500">
+                              {' '}
+                              · {formatDuration(frameCountToDuration(sampleFrameCount, sampleFps))}s
+                            </span>
+                          )}
+                        </div>
+                      </div>
                       <NumberInput
                         label="FPS"
-                        value={jobConfig.config.process[0].sample.fps}
-                        onChange={value => setJobConfig(value, 'config.process[0].sample.fps')}
-                        placeholder="eg. 0"
+                        value={sampleFps}
+                        onChange={value => {
+                          setJobConfig(value, 'config.process[0].sample.fps');
+                          // keep the derived frame count in step with the new fps
+                          setSampleDuration(sampleDuration, value ?? 0);
+                        }}
+                        placeholder="eg. 24"
                         className="pt-2"
                         min={0}
                         required
                       />
+                      {fpsUntested && (
+                        <div className="pt-1 text-xs text-yellow-500">
+                          Untested framerate for this model
+                          {modelArch?.supportedFps ? ` (tested: ${modelArch.supportedFps.join(', ')} fps)` : ''}.
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -2172,6 +2757,49 @@ export default function SimpleJob({
                 )}
               </div>
             )}
+            {/* Sampling LoRA — MiniMax-H3 (4-step turbo / step distill) */}
+            {modelArch?.additionalSections?.includes('sample.minimax_h3_turbo_lora') && (
+              <div className="mt-4 border-t border-gray-700 pt-4">
+                <Checkbox
+                  label="Use turbo LoRA during sampling"
+                  docKey="sample.minimax_h3_turbo_lora"
+                  checked={
+                    jobConfig.config.process[0].sample.sample_lora_path !== null &&
+                    jobConfig.config.process[0].sample.sample_lora_path !== undefined
+                  }
+                  onChange={value => {
+                    if (value) {
+                      setJobConfig('', 'config.process[0].sample.sample_lora_path');
+                      setJobConfig(1.0, 'config.process[0].sample.sample_lora_strength');
+                    } else {
+                      setJobConfig(null, 'config.process[0].sample.sample_lora_path');
+                    }
+                  }}
+                />
+                {jobConfig.config.process[0].sample.sample_lora_path !== null &&
+                  jobConfig.config.process[0].sample.sample_lora_path !== undefined && (
+                  <div className="mt-2 pl-2 space-y-2">
+                    <LoraPathInput
+                      label="Turbo LoRA Path"
+                      value={jobConfig.config.process[0].sample.sample_lora_path ?? ''}
+                      onChange={v => setJobConfig(v, 'config.process[0].sample.sample_lora_path')}
+                    />
+                    <SliderInput
+                      label="Strength"
+                      value={jobConfig.config.process[0].sample.sample_lora_strength ?? 1.0}
+                      onChange={value => setJobConfig(value, 'config.process[0].sample.sample_lora_strength')}
+                      min={0}
+                      max={2}
+                      step={0.05}
+                    />
+                    <p className="text-xs text-gray-500">
+                      Applied only while generating samples and removed again before training resumes. Drop Sample Steps
+                      to 4–8 to get the speedup.
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
             {modelArch?.additionalSections?.includes('sample.krea2_sampling_lora') && (
               <div className="mt-4 border-t border-gray-700 pt-4">
                 <Checkbox
@@ -2194,6 +2822,15 @@ export default function SimpleJob({
                 {jobConfig.config.process[0].sample.sample_lora_path !== null &&
                   jobConfig.config.process[0].sample.sample_lora_path !== undefined && (
                   <div className="mt-2 pl-2 space-y-3">
+                    {jobConfig.config.process[0].model.layer_offloading && (
+                      <p className="text-xs text-yellow-500">
+                        Layer offloading is on — sample LoRA merging currently fails on offloaded (quantized)
+                        layers and falls back to dequantizing them on the fly. That undoes the memory savings
+                        layer offloading gives you on those layers (risking OOM on high-res buckets) and,
+                        since a turbo/distill LoRA's whole point is speed, quietly gives up that benefit too.
+                        Turn off layer offloading, or drop the sample LoRA, to avoid this.
+                      </p>
+                    )}
                     <div className="space-y-2">
                       <LoraPathInput
                         label="LoRA 1 Path"

@@ -21,6 +21,8 @@ import AdvancedConfigEditor from '@/components/AdvancedConfigEditor';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { apiClient } from '@/utils/api';
 import CheckConfigModal from '@/components/CheckConfigModal';
+import usePollLoop from '@/hooks/usePollLoop';
+import { toast } from 'sonner';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -201,6 +203,35 @@ export default function TrainingForm() {
         }, 2000),
       );
   };
+
+  // Full config can't be changed once a job is running, so if the queue picks this
+  // job up while its editor is open, close the editor. Only reacts to a not-running
+  // -> running transition: a job that was already running when the page opened is
+  // either the sampleOnly editor (still valid) or a stale link, neither of which
+  // should yank the page out from under the user.
+  const wasRunningRef = useRef<boolean | null>(null);
+  const hasClosedRef = useRef(false);
+  usePollLoop(
+    () => {
+      if (!runId || sampleOnly || hasClosedRef.current) return;
+      return apiClient
+        .get(`/api/jobs?id=${runId}`)
+        .then(res => res.data)
+        .then(data => {
+          const isRunning = data?.status === 'running';
+          const wasRunning = wasRunningRef.current;
+          wasRunningRef.current = isRunning;
+          if (wasRunning === false && isRunning) {
+            hasClosedRef.current = true;
+            toast.info('This job started running. Config is locked while training, so unsaved edits were discarded.');
+            router.push(`/jobs/${runId}`);
+          }
+        })
+        .catch(error => console.error('Error polling job status:', error));
+    },
+    runId && !sampleOnly ? 4000 : null,
+    [runId, sampleOnly],
+  );
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

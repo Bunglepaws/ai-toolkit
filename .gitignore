@@ -125,8 +125,14 @@ celerybeat.pid
 .venv
 .python
 .node
+.ffmpeg
+.mingit
+.uv
 env/
 venv/
+# the venv now lives outside the repo (distro ext4); <repo>/venv is a symlink to
+# it, which "venv/" does not match since that only matches directories
+/venv
 ENV/
 env.bak/
 venv.bak/
@@ -185,6 +191,13 @@ cython_debug/
 aitk_db.db
 aitk_db.db-wal
 aitk_db.db-shm
+# dated safety snapshots taken before schema changes, plus their -wal/-shm siblings.
+# The aitk_db*.db pattern above does not catch these: they end in the timestamp, not .db
+aitk_db.db.bak-*
+# stray root-level node_modules (ui/ has its own rule); nothing should install here
+/node_modules/
+# JetBrains config for the WSL-side project
+.ideaWSL/
 /notes.md
 /data
 .claude
@@ -193,3 +206,6 @@ aitk_db.db-shm
 /fixit.sh
 /Krea2_turbo_00003_.png
 /scripts/embed_civitai_metadata was working.ps1
+original_repo
+.next
+testing/.model_test_outputs

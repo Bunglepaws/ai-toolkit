@@ -16,6 +16,9 @@ AITK_Status = Literal["running", "stopped", "error", "completed"]
 
 
 class UITrainer(SDTrainer):
+    # See DiffusionTrainer.STOP_WATCHER_SAVE_GRACE_SEC.
+    STOP_WATCHER_SAVE_GRACE_SEC = 300
+
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super(UITrainer, self).__init__(process_id, job, config, **kwargs)
         self.sqlite_db_path = self.config.get("sqlite_db_path", "./aitk_db.db")
@@ -29,14 +32,25 @@ class UITrainer(SDTrainer):
         if self.job_id is None:
             raise Exception("AITK_JOB_ID not set")
         self.is_stopping = False
+        # >0 while a checkpoint write is pending or in flight; the stop watcher
+        # refuses to interrupt while raised. See DiffusionTrainer for the full note.
+        self._save_guard = 0
         # Create a thread pool for database operations
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Track all async tasks
         self._async_tasks = []
         # Initialize the status
         self._run_async_operation(self._update_status("running", "Starting"))
+        # Clear any `stop_after_save` left over from a previous run before the
+        # first maybe_stop() can act on it. See DiffusionTrainer for the full note.
+        self.update_db_key("stop_after_save", 0)
         self._stop_watcher_started = False
-        # self.start_stop_watcher(interval_sec=2.0)
+        if os.name == "nt":
+            # On Windows the stop route cannot send us SIGINT from outside
+            # (no console to deliver a Ctrl+C to), so watch the stop flag
+            # and raise the interrupt from inside. On Linux the route
+            # sends a real SIGINT to the pid and this is unnecessary.
+            self.start_stop_watcher(interval_sec=2.0)
     
     def start_stop_watcher(self, interval_sec: float = 5.0):
         """
@@ -52,29 +66,40 @@ class UITrainer(SDTrainer):
         t.start()
 
     def _stop_watcher_thread(self, interval_sec: float):
+        deferred_since: float | None = None
         while True:
             try:
                 if self.should_stop():
-                    # Mark and update status (non-blocking; uses existing infra)
-                    self.is_stopping = True
-                    self._run_async_operation(
-                        self._update_status("stopped", "Job stopped (remote)")
-                    )
-                    # Best-effort flush pending async ops
-                    try:
-                        asyncio.run(self.wait_for_all_async())
-                    except RuntimeError:
-                        pass
-                    # Try to stop DB thread pool quickly
-                    try:
-                        self.thread_pool.shutdown(wait=False, cancel_futures=True)
-                    except TypeError:
-                        self.thread_pool.shutdown(wait=False)
+                    if self.is_stopping:
+                        # maybe_stop() already started the graceful shutdown;
+                        # a second interrupt would only break its cleanup.
+                        return
+                    # `stop` now unambiguously means "interrupt now"; save-then-stop
+                    # uses stop_after_save, which this thread never reads. Only an
+                    # in-flight write is worth waiting for. See DiffusionTrainer.
+                    if self._save_guard > 0:
+                        now = time.time()
+                        if deferred_since is None:
+                            deferred_since = now
+                        if now - deferred_since < self.STOP_WATCHER_SAVE_GRACE_SEC:
+                            time.sleep(interval_sec)
+                            continue
+                        print("")
+                        print(
+                            f"Checkpoint write still running after "
+                            f"{self.STOP_WATCHER_SAVE_GRACE_SEC}s; stopping anyway."
+                        )
                     print("")
                     print("****************************************************")
                     print("    Stop signal received; terminating process.      ")
                     print("****************************************************")
-                    os.kill(os.getpid(), signal.SIGINT)
+                    # Deliver a real KeyboardInterrupt to the main thread so
+                    # on_error runs the normal shutdown (final DB write, last
+                    # log). os.kill(pid, SIGINT) must not be used here: on
+                    # Windows it is TerminateProcess and kills us instantly.
+                    # Leave the thread pool alone -- on_error still needs it.
+                    signal.raise_signal(signal.SIGINT)
+                    return
                 time.sleep(interval_sec)
             except Exception:
                 time.sleep(interval_sec)
@@ -130,9 +155,26 @@ class UITrainer(SDTrainer):
 
         return _check_return_to_queue()
 
+    def should_stop_after_save(self):
+        """Cooperative 'save then stop'. Separate from `stop` on purpose -- the
+        stop-watcher raises SIGINT on `stop` and would kill the step before the
+        checkpoint was written. See DiffusionTrainer for the full note."""
+        def _check():
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT stop_after_save FROM Job WHERE id = ?", (self.job_id,))
+                row = cursor.fetchone()
+                return False if row is None else row[0] == 1
+
+        return _check()
+
+    def reset_stop_after_save(self):
+        self.update_db_key("stop_after_save", 0)
+
     def should_save(self):
         # Reads `save_now` (ostris' canonical on-demand-save schema). Save-and-pause
-        # sets `save_now` + `stop` together; save() writes before the stop is raised.
+        # pairs it with `stop_after_save`; see maybe_save/maybe_stop.
         def _check_save():
             with self._db_connect() as conn:
                 cursor = conn.cursor()
@@ -147,9 +189,19 @@ class UITrainer(SDTrainer):
         self.update_db_key("save_now", 0)
 
     def maybe_save(self):
+        """Returns True if a checkpoint was actually written this step, so the
+        caller can tell maybe_sample() not to write an identical one again."""
         if self.should_save():
-            self.reset_save()
-            self.save(self.step_num)
+            # raise before reset_save() clears the flag so the watcher never sees
+            # `stop` with no save pending mid-window
+            self._save_guard += 1
+            try:
+                self.reset_save()
+                self.save(self.step_num)
+            finally:
+                self._save_guard -= 1
+            return True
+        return False
 
     def should_sample(self):
         def _check_sample():
@@ -200,25 +252,59 @@ class UITrainer(SDTrainer):
         except Exception as e:
             print(f"Warning: Could not reload sample config from DB: {e}")
 
-    def maybe_sample(self):
+    def maybe_sample(self, already_saved: bool = False):
         if self.should_sample():
             self.reload_sample_config()
             self.reset_sample()
             self.reset_stop_sample()  # clear any stale abort request from a previous sample
-            self.save(self.step_num)
+            # skip the save if maybe_save() already wrote this exact step -- see
+            # the matching note in DiffusionTrainer.maybe_sample()
+            if not already_saved:
+                self.save(self.step_num)
             self.sample(self.step_num)
 
+    def _reset_control_flags(self):
+        """Clear the on-demand control flags (and the launcher-owned `pid`) once
+        this job has committed to a terminal state (stopped/queued). Node never
+        clears these on a clean, self-reported exit -- see the comment on
+        watchDetachedJob in ui/cron/actions/startJob.ts -- so if we don't do it
+        here they persist forever and the UI keeps treating the row as busy/in
+        flight (stale pid, stop/save/save_now still set)."""
+        if self.accelerator.is_main_process:
+            self.update_db_key("stop", False)
+            self.update_db_key("save", False)
+            self.update_db_key("save_now", 0)
+            self.update_db_key("return_to_queue", False)
+            # The return_to_queue branch raises before the stop_after_save branch
+            # can reset it. See DiffusionTrainer for the full note.
+            self.update_db_key("stop_after_save", 0)
+            self.update_db_key("pid", None)
+
     def maybe_stop(self):
+        # Hard stop: the user asked to stop now, nothing to wait for.
         if self.should_stop():
             self.is_stopping = True
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
+            self._reset_control_flags()
             raise JobStoppedException("Job stopped")
+        # Cooperative stops must never pre-empt a pending save -- see the
+        # matching note in DiffusionTrainer.maybe_stop().
+        if self.should_save():
+            return
         if self.should_return_to_queue():
             self.is_stopping = True
             self._run_async_operation(
                 self._update_status("queued", "Job queued"))
+            self._reset_control_flags()
             raise JobStoppedException("Job returning to queue")
+        if self.should_stop_after_save():
+            self.reset_stop_after_save()
+            self.is_stopping = True
+            self._run_async_operation(
+                self._update_status("stopped", "Job stopped"))
+            self._reset_control_flags()
+            raise JobStoppedException("Job stopped")
 
     async def _update_key(self, key, value):
         if not self.accelerator.is_main_process:
@@ -246,10 +332,81 @@ class UITrainer(SDTrainer):
 
         await self._execute_db_operation(_do_update)
 
+    async def _update_step_and_epoch(self):
+        if not self.accelerator.is_main_process:
+            return
+
+        def _do_update():
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor.execute(
+                        "UPDATE Job SET step = ?, epoch = ? WHERE id = ?",
+                        (int(self.step_num), int(self.epoch_num), self.job_id)
+                    )
+                finally:
+                    cursor.execute("COMMIT")
+
+        await self._execute_db_operation(_do_update)
+
     def update_step(self):
-        """Non-blocking update of the step count."""
+        """Non-blocking update of the step count (and the epoch it belongs to).
+
+        Both columns go out in a single UPDATE so the UI can never read a step
+        from one moment paired with an epoch from another.
+        """
         if self.accelerator.is_main_process:
-            self._run_async_operation(self._update_key("step", self.step_num))
+            self._note_epoch_progress()
+            self._run_async_operation(self._update_step_and_epoch())
+
+    def _persist_steps_per_epoch(self):
+        """Mark epoch tracking as live for this session but not yet measured.
+
+        -1 is a sentinel meaning "this job reports epochs, length still unknown";
+        0 means "no epoch info at all" (a job that has not run since the epoch
+        columns were added). The UI distinguishes the two so it can show the epoch
+        number immediately and add the projected total once one is measured."""
+        try:
+            self.update_db_key("steps_per_epoch", -1.0)
+        except Exception as e:
+            print(f"[AITK] Warning: could not flag epoch tracking: {e}")
+
+    # --- epoch length measurement -------------------------------------------
+    # len(dataloader) is NOT the number of iterations the train loop pulls in a
+    # pass (bucketed datasets batch inside the dataset, reg datasets alternate,
+    # and the dataset can change size between sessions), so epoch length is
+    # measured from observed rollovers instead: the gap between two consecutive
+    # increments of epoch_num is exactly one epoch, by definition.
+    _prev_rollover_step = None
+    _last_epoch_seen = None
+
+    def _note_epoch_progress(self):
+        """Called once per step. Writes steps_per_epoch after a full epoch is observed."""
+        try:
+            ep = int(self.epoch_num)
+            st = int(self.step_num)
+            if self._last_epoch_seen is None:
+                self._last_epoch_seen = ep
+                return
+            if ep == self._last_epoch_seen:
+                return
+            self._last_epoch_seen = ep
+            if self._prev_rollover_step is None:
+                # We joined this epoch partway through (fresh start or resume), so
+                # its span is a lower bound, not a measurement. Anchor and measure
+                # from the next rollover onward.
+                self._prev_rollover_step = st
+                return
+            span = st - self._prev_rollover_step
+            self._prev_rollover_step = st
+            if span > 0:
+                # Most recent epoch only, not an average: the dataset can grow
+                # mid-run (datasets get added between sessions) and the latest
+                # span is the one that projects the remaining steps correctly.
+                self.update_db_key("steps_per_epoch", float(span))
+        except Exception as e:
+            print(f"[AITK] Warning: could not measure epoch length: {e}")
 
     def update_db_key(self, key, value):
         """Non-blocking update a key in the database."""
@@ -312,6 +469,15 @@ class UITrainer(SDTrainer):
         if getattr(self, "progress_bar", None) is not None:
             self.progress_bar.close()
             self.progress_bar = None
+        # A bare KeyboardInterrupt (ctrl+c, or the Windows stop-watcher's
+        # raise_signal) reaches here without maybe_stop() having run, so
+        # is_stopping/status aren't set yet -- do it here. JobStoppedException
+        # means maybe_stop() already set both (status may be "queued" rather
+        # than "stopped" for return-to-queue), so don't touch status for it.
+        if isinstance(e, KeyboardInterrupt) and not self.is_stopping:
+            self.is_stopping = True
+            if self.accelerator.is_main_process:
+                self.update_status("stopped", "Job stopped")
         is_intentional = self.is_stopping or isinstance(e, (KeyboardInterrupt, JobStoppedException))
         if self.accelerator.is_main_process and not is_intentional:
             self.update_status("error", str(e))
@@ -350,8 +516,8 @@ class UITrainer(SDTrainer):
     def end_step_hook(self):
         super(UITrainer, self).end_step_hook()
         self.update_step()
-        self.maybe_save()
-        self.maybe_sample()
+        saved_this_step = self.maybe_save()
+        self.maybe_sample(already_saved=saved_this_step)
         self.maybe_stop()
 
     def hook_before_model_load(self):
@@ -384,6 +550,7 @@ class UITrainer(SDTrainer):
         self.update_step()
         self.update_status("running", "Training")
         self.timer.add_after_print_hook(self.handle_timing_print_hook)
+        self._persist_steps_per_epoch()
 
     def status_update_hook_func(self, string):
         self.update_status("running", string)
@@ -423,7 +590,12 @@ class UITrainer(SDTrainer):
         # first would raise "Job stopped" before the model is ever written to disk.
         # The stop check at the end (and in end_step_hook) handles the stop cleanly
         # after the save completes.
-        self.update_status("running", "Saving model")
-        super().save(step)
+        # The guard keeps the stop watcher from interrupting a half-written file.
+        self._save_guard += 1
+        try:
+            self.update_status("running", "Saving model")
+            super().save(step)
+        finally:
+            self._save_guard -= 1
         self.maybe_stop()
         self.update_status("running", "Training")

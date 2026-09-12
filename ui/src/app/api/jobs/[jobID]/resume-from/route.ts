@@ -5,9 +5,11 @@ import fs from 'fs';
 import { getTrainingFolder } from '@/server/settings';
 import sqlite3 from 'sqlite3';
 
-// Matches plain and WAN 2.2 split variants (_high_noise / _low_noise)
-const STEP_RE = /_(\d{9})(?:_(?:high|low)_noise)?\.safetensors$/;
-const OPT_ARCHIVE_RE = /^optimizer_(\d{9})\.pt$/;
+// Matches plain and WAN 2.2 split variants (_high_noise / _low_noise).
+// \d{5,} covers both the current 5-digit padding and legacy 9-digit files
+// that haven't been renamed by a resumed training run yet.
+const STEP_RE = /_(\d{5,})(?:_(?:high|low)_noise)?\.safetensors$/;
+const OPT_ARCHIVE_RE = /^optimizer_(\d{5,})\.pt$/;
 const SAMPLE_RE = /[_-](\d{9})[_-]\d+\.(jpg|jpeg|png|webp|mp4)$/;
 
 function openDb(filename: string) {
@@ -102,7 +104,6 @@ export async function POST(req: NextRequest, { params }: { params: { jobID: stri
 
   const trainingFolder = await getTrainingFolder();
   const jobFolder = path.join(trainingFolder, job.name);
-  const padded = String(targetStep).padStart(9, '0');
 
   // Guard: at least one safetensors file must exist for the target step
   let files: string[];
@@ -123,8 +124,12 @@ export async function POST(req: NextRequest, { params }: { params: { jobID: stri
   const deletedFiles: string[] = [];
 
   // ── 1. Restore optimizer archive for targetStep (if it exists) ────────────
+  // Try the current 5-digit padding first, then fall back to legacy 9-digit
+  // padding for archives not yet renamed.
   const optimizerPath = path.join(jobFolder, 'optimizer.pt');
-  const archivePath = path.join(jobFolder, `optimizer_${padded}.pt`);
+  const archivePath5 = path.join(jobFolder, `optimizer_${String(targetStep).padStart(5, '0')}.pt`);
+  const archivePath9 = path.join(jobFolder, `optimizer_${String(targetStep).padStart(9, '0')}.pt`);
+  const archivePath = fs.existsSync(archivePath5) ? archivePath5 : archivePath9;
   if (fs.existsSync(archivePath)) {
     // Atomic: rename current optimizer.pt to a temp backup, then restore archive
     const backupPath = path.join(jobFolder, 'optimizer_rollback_backup.pt');
@@ -143,7 +148,7 @@ export async function POST(req: NextRequest, { params }: { params: { jobID: stri
       }
       throw e;
     }
-    deletedFiles.push(`optimizer_${padded}.pt → optimizer.pt`);
+    deletedFiles.push(`${path.basename(archivePath)} → optimizer.pt`);
   }
 
   // ── 2. Delete all safetensors with step > targetStep ─────────────────────

@@ -171,7 +171,7 @@ class Critic:
     def save(self, step=None):
         self.process.update_training_metadata()
         save_meta = get_meta_for_safetensors(self.process.meta, self.process.job.name)
-        step_num = f"_{str(step).zfill(9)}" if step is not None else ''
+        step_num = f"_{str(step).zfill(5)}" if step is not None else ''
         save_path = os.path.join(
             self.process.save_root, f"CRITIC_{self.process.job.name}{step_num}.safetensors"
         )

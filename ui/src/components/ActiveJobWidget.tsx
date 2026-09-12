@@ -1,20 +1,41 @@
 'use client';
 
 import Link from 'next/link';
+import { useEffect, useRef, useState } from 'react';
 import { CgSpinner } from 'react-icons/cg';
 import useJobsList from '@/hooks/useJobsList';
 import { getTotalSteps } from '@/utils/jobs';
 
+// one job card is 59px tall, plus the 8px bottom padding on the list wrapper.
+// below this the panel can't show a single card without clipping it, so we
+// render the spacer empty instead of a scrolling sliver.
+const MIN_PANEL_HEIGHT = 67;
+
 export default function ActiveJobWidget() {
   const { jobs } = useJobsList({ onlyActive: true, reloadInterval: 5000 });
+  // the panel is a flex-1 spacer, so its height comes from the leftover sidebar
+  // space rather than its content — measuring it can't feed back into itself
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [hasRoom, setHasRoom] = useState(true);
 
-  if (!jobs || jobs.length === 0) return null;
+  useEffect(() => {
+    const el = panelRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver(entries => {
+      setHasRoom(entries[0].contentRect.height >= MIN_PANEL_HEIGHT);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const showJobs = hasRoom && jobs && jobs.length > 0;
 
   return (
-    <div className="px-3 pb-2">
-      <div className="w-[196px]">
-        <ul className="max-h-48 overflow-y-auto space-y-2">
-          {jobs.map(job => {
+    <div ref={panelRef} className="flex-1 min-h-0 overflow-y-auto">
+      {showJobs && (
+        <div className="px-3 pb-2">
+          <ul className="space-y-2">
+            {jobs.map(job => {
             let totalSteps: number | undefined;
             try {
               totalSteps = getTotalSteps(job);
@@ -65,9 +86,10 @@ export default function ActiveJobWidget() {
                 </Link>
               </li>
             );
-          })}
-        </ul>
-      </div>
+            })}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }

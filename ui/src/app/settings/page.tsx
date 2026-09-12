@@ -129,6 +129,28 @@ export default function Settings() {
                 </div>
 
                 <div>
+                  <label htmlFor="GEMMA_API_MODEL_ID_SOURCE" className="block text-sm font-medium mb-2">
+                    Gemma API Model ID Source (LTX-2.5)
+                    <div className="text-gray-500 text-sm ml-1">
+                      Released LTX-2.5 checkpoints don&apos;t carry the identifier the Gemma API needs, so
+                      LTX-2.5 jobs using the API read it from a different local checkpoint instead — point this
+                      at an LTX-2.3 dev checkpoint (e.g. <code>ltx-2.3-22b-dev.safetensors</code>), which does
+                      carry it. Only used to look up the id; that file isn&apos;t loaded for anything else.
+                      Not needed for LTX-2 / LTX-2.3, whose own checkpoints already carry it.
+                    </div>
+                  </label>
+                  <input
+                    type="text"
+                    id="GEMMA_API_MODEL_ID_SOURCE"
+                    name="GEMMA_API_MODEL_ID_SOURCE"
+                    value={settings.GEMMA_API_MODEL_ID_SOURCE}
+                    onChange={handleChange}
+                    className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
+                    placeholder="e.g. M:\models\diffusion_models\ltx-2.3-22b-dev.safetensors"
+                  />
+                </div>
+
+                <div>
                   <label htmlFor="TRAINING_FOLDER" className="block text-sm font-medium mb-2">
                     Training Folder Path
                     <div className="text-gray-500 text-sm ml-1">
@@ -187,6 +209,68 @@ export default function Settings() {
                     className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
                     placeholder="Leave blank to use Training Folder/quantized"
                   />
+                </div>
+
+                <div>
+                  <label htmlFor="MODELS_PATH" className="block text-sm font-medium mb-2">
+                    Models Folder Path
+                    <div className="text-gray-500 text-sm ml-1">
+                      Some models support loading ComfyUI model weights directly. Models that do will be loaded
+                      from/downloaded to this path. Must be an absolute path. If blank, it will default to the models
+                      folder in the project root.
+                    </div>
+                  </label>
+                  <input
+                    type="text"
+                    id="MODELS_PATH"
+                    name="MODELS_PATH"
+                    value={settings.MODELS_PATH}
+                    onChange={handleChange}
+                    className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
+                    placeholder="Enter models folder path"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="OMNIVOICE_MODEL_PATH" className="block text-sm font-medium mb-2">
+                    OmniVoice Model Path
+                    <div className="text-gray-500 text-sm ml-1">
+                      TTS weights used by Clone Voice to generate voice training clips. Must be an absolute path to a
+                      local OmniVoice checkpoint folder. If blank, Clone Voice will refuse to run rather than
+                      downloading several gigabytes on its own.
+                    </div>
+                  </label>
+                  <input
+                    type="text"
+                    id="OMNIVOICE_MODEL_PATH"
+                    name="OMNIVOICE_MODEL_PATH"
+                    value={settings.OMNIVOICE_MODEL_PATH}
+                    onChange={handleChange}
+                    className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
+                    placeholder="e.g. M:\models\omnivoice\OmniVoice-bf16"
+                  />
+                </div>
+
+                <div>
+                  <label className="flex items-start gap-3 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      name="AITK_SAMPLE_PREVIEW"
+                      checked={settings.AITK_SAMPLE_PREVIEW === 'true'}
+                      onChange={handleChange}
+                      className="mt-1 h-4 w-4 rounded border-gray-600 bg-gray-800 text-blue-500 focus:ring-blue-500"
+                    />
+                    <span className="text-sm font-medium">
+                      Live Sample Preview
+                      <div className="text-gray-500 text-sm font-normal mt-1">
+                        Decodes the clip forming during a sample through a tiny VAE and shows it as it denoises, so a
+                        bad generation can be caught and skipped early instead of waiting for it to finish. Supported
+                        for MiniMax-H3, LTX-2, and LTX-2.3 (needs the matching tiny VAE checkpoint under{' '}
+                        <code>vae_approx</code> in the models folder). Adds a small decode+encode cost per sample
+                        step — turn off if that overhead ever matters more than the preview.
+                      </div>
+                    </span>
+                  </label>
                 </div>
               </div>
             </div>

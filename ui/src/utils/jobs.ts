@@ -66,22 +66,6 @@ export const gracefulStopJob = (jobID: string) => {
   });
 };
 
-export const saveJob = (jobID: string) => {
-  return new Promise<void>((resolve, reject) => {
-    apiClient
-      .get(`/api/jobs/${jobID}/save`)
-      .then(res => res.data)
-      .then(data => {
-        console.log('Job save requested:', data);
-        resolve();
-      })
-      .catch(error => {
-        console.error('Error requesting job save:', error);
-        reject(error);
-      });
-  });
-};
-
 export const saveAndPauseJob = (jobID: string) => {
   return new Promise<void>((resolve, reject) => {
     apiClient
@@ -109,6 +93,24 @@ export const stopSampleJob = (jobID: string) => {
       })
       .catch(error => {
         console.error('Error requesting sample abort:', error);
+        reject(error);
+      });
+  });
+};
+
+// Skips only the clip currently rendering and moves to the next prompt,
+// unlike stopSampleJob which abandons the whole batch and returns to training.
+export const skipCurrentSample = (jobID: string) => {
+  return new Promise<void>((resolve, reject) => {
+    apiClient
+      .get(`/api/jobs/${jobID}/skip_sample`)
+      .then(res => res.data)
+      .then(data => {
+        console.log('Sample skip requested:', data);
+        resolve();
+      })
+      .catch(error => {
+        console.error('Error requesting sample skip:', error);
         reject(error);
       });
   });
@@ -290,6 +292,40 @@ export const getAvaliableJobActions = (job: Job, isAnyJobRunning: boolean = fals
 export const getNumberOfSamples = (job: Job) => {
   const jobConfig = getJobConfig(job);
   return jobConfig.config.process[0].sample?.prompts?.length || 0;
+};
+
+/**
+ * Epoch info for a job, or null when the job has no epoch data at all
+ * (steps_per_epoch = 0 — it has not run since the epoch columns were added).
+ *
+ * `completed` is the trainer's own counter, the same value written to checkpoint
+ * metadata as training_info.epoch. Never derived from step: epoch length is not
+ * constant across a run, because datasets get added between sessions.
+ *
+ * `total` is a forward PROJECTION — completed epochs plus however many more the
+ * remaining step budget buys at the most recently measured epoch length. It is
+ * deliberately not `totalSteps / stepsPerEpoch`: that assumes every past epoch
+ * was the same length as the current one, which understates progress badly on a
+ * job whose dataset grew mid-run. null when no epoch has been measured yet
+ * (steps_per_epoch < 0, the "tracking live, length unknown" sentinel).
+ */
+export const getEpochInfo = (job: Job) => {
+  const perEpoch = (job as any).steps_per_epoch as number | undefined;
+  if (!perEpoch) {
+    return null;
+  }
+  const completed = ((job as any).epoch as number | undefined) ?? 0;
+  if (perEpoch < 0) {
+    return { completed, stepsPerEpoch: null, total: null };
+  }
+  const totalSteps = getTotalSteps(job);
+  const remaining = totalSteps > 0 ? Math.max(0, totalSteps - job.step) : 0;
+  return {
+    completed,
+    stepsPerEpoch: Math.round(perEpoch),
+    // floor: a budget that buys 1.9 more epochs completes 1 of them.
+    total: totalSteps > 0 ? completed + Math.floor(remaining / perEpoch) : null,
+  };
 };
 
 export const getTotalSteps = (job: Job) => {

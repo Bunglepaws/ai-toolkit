@@ -1,13 +1,14 @@
 'use client';
 import { isMac } from '@/helpers/basic';
 import { defaultSampleConfig } from '@/helpers/defaultSamples';
-import { JobConfig, SampleConfig, DatasetConfig, SliderConfig } from '@/types';
+import { JobConfig, SampleConfig, DatasetConfig, SliderConfig, VoiceCloneConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
   mask_path: null,
   mask_min_value: 0.1,
   default_caption: '',
+  trigger_word: null,
   caption_ext: 'txt',
   caption_dropout_rate: 0.05,
   cache_latents_to_disk: false,
@@ -35,6 +36,45 @@ export const defaultCompileOptions = {
   block_compile: true,
   compile_mode: 'default',
   compile_fullgraph: false,
+};
+
+// Mirrors DEFAULT_DIALOGUE in toolkit/voice_clone/sentences.py, which stays authoritative
+// for configs written by hand or by the CLI (an empty dialogue there falls back to it).
+// Prefilled here so the box shows what will actually be said rather than sitting blank.
+// ~13-16 words each, which fills a 5.167s clip without sounding rushed or slowed.
+export const defaultVoiceDialogue: string[] = [
+  'Alright boys, hit the showers. You\'ve earned every bit of that one out there today.',
+  'Nice work, big guy. I honestly didn\'t think you had that last set in you.',
+  'Come here a second, let me get a look at that shoulder before you take off.',
+  'Yeah, that\'s it. Slow, controlled, all the way down. Just like that, perfect.',
+  'You\'ve been holding out on me. Where\'s all of this been hiding lately, huh?',
+  'You\'re going to be the death of me one day, you know that, right?',
+  'Towel off and come meet me in my office, we\'ve got some things to talk about.',
+  'Well now, somebody\'s been putting in the extra work over the summer, haven\'t they?',
+  'Chin up, chest out, own the room. That\'s how a champion walks in here.',
+  'Lock the door behind you, I don\'t want anybody walking in on this tonight.',
+  'You sure you can handle another round, or do you need a minute first?',
+  'Good boy. That\'s exactly what I\'ve been wanting to see out of you.',
+];
+
+export const defaultVoiceCloneConfig: VoiceCloneConfig = {
+  enabled: false,
+  mode: 'clone',
+  reference_path: '',
+  reference_text: '',
+  instruct: '',
+  voice_seed_path: '',
+  target_dataset: '',
+  // 60s -> 12 clips at 5.167s. Just above the smallest measured-sufficient amount
+  // (~45s across 9 clips on LTX-2.3); 120 matches the CoachBate recipe.
+  target_seconds: 60,
+  duration_mix: 'long',
+  voice_description: 'a man speaking calmly, low pitch',
+  trigger_word: '',
+  dialogue: defaultVoiceDialogue,
+  backend: 'omnivoice',
+  seed: 42,
+  regenerate_token: '',
 };
 
 export const defaultJobConfig: JobConfig = {
@@ -119,6 +159,7 @@ export const defaultJobConfig: JobConfig = {
           compile: false,
         },
         sample: defaultSampleConfig,
+        voice_clone: defaultVoiceCloneConfig,
       },
     ],
   },

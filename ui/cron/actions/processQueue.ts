@@ -2,7 +2,51 @@ import prisma from '../prisma';
 
 import { Job, Queue } from '@prisma/client';
 import fs from 'fs';
+import { execFileSync } from 'child_process';
 import startJob from './startJob';
+
+/**
+ * The process's command line, or null when it cannot be read.
+ *
+ * null means "could not determine" and is deliberately distinct from an empty
+ * result, because the caller treats the two very differently: unknown is
+ * resolved conservatively (assume the trainer lives), while a definite "no such
+ * process" is what lets a recycled PID be recognised as dead.
+ */
+function processCommandLine(pid: number): string | null {
+  if (process.platform !== 'win32') {
+    try {
+      // /proc/<pid>/cmdline is NUL-separated
+      return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+    } catch {
+      return null;
+    }
+  }
+
+  // Windows has no /proc. Without this the check degrades to "does any process
+  // hold this PID", so a recycled PID reads as a live trainer and stalls the
+  // queue permanently — the stack runs natively on Windows now, so this is the
+  // normal path, not an edge case.
+  try {
+    const out = execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction SilentlyContinue; ` +
+          `if (-not $p) { 'NOPROC' } elseif (-not $p.CommandLine) { 'UNKNOWN' } else { $p.CommandLine }`,
+      ],
+      { encoding: 'utf8', timeout: 10000, windowsHide: true },
+    ).trim();
+
+    if (out === 'NOPROC') return '';
+    if (out === 'UNKNOWN' || out === '') return null;
+    return out;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Is this PID a live trainer process?
@@ -29,24 +73,159 @@ function isTrainerAlive(pid: number | null): boolean {
     if (e?.code !== 'EPERM') return false;
   }
 
+  const cmdline = processCommandLine(pid);
+
+  // Could not determine it. Resolve conservatively: a false "dead" hands the
+  // GPU to a second job and wrecks both runs, while a false "alive" only stalls
+  // the queue, which is visible and recoverable.
+  if (cmdline === null) return true;
+
+  // Trainers are launched as `python run_ui.py` (pythonw.exe on Windows, so
+  // match on the script rather than the executable name).
+  return cmdline.includes('run_ui.py');
+}
+
+/**
+ * How often to sweep for orphaned DataLoader workers. The queue ticks every
+ * second and this shells out to powershell, so it must not run every tick.
+ */
+const ORPHAN_SWEEP_INTERVAL_MS = 60000;
+let lastOrphanSweepAt = 0;
+
+/**
+ * Kill DataLoader workers whose trainer is gone.
+ *
+ * A trainer runs as `pythonw.exe run_ui.py` and its torch DataLoader workers are
+ * `pythonw.exe -c "...spawn_main(parent_pid=N)" --multiprocessing-fork` children
+ * of it. `taskkill /T` on the recorded pid does take the whole tree -- verified
+ * -- but that only ever runs for a *hung* job: the stop route's force-kill
+ * backstop gives up the moment the pid dies, so a job that stops correctly is
+ * cleaned up by Python's own multiprocessing teardown. When that teardown does
+ * not complete, the workers are left with nothing to collect them and sit there
+ * indefinitely holding RAM. Killing only the inner pid without /T reproduces it
+ * exactly.
+ *
+ * Safety: only a worker whose *parent no longer exists* is touched. A live
+ * trainer's workers always have a live parent, so this cannot reach a running
+ * job. A recycled parent PID reads as alive and the worker is skipped, which is
+ * the conservative direction -- it just survives to the next sweep. Scoped to
+ * pythonw.exe because that is what the detached trainer is launched as; other
+ * python multiprocessing apps on this box (ComfyUI, interactive scripts) run
+ * python.exe and are never candidates.
+ */
+function reapOrphanedDataloaderWorkers(): void {
+  if (process.platform !== 'win32') return;
+
+  let listing: string;
   try {
-    // /proc/<pid>/cmdline is NUL-separated
-    return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('run_ui.py');
+    listing = execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | ` +
+          `Where-Object { $_.CommandLine -like '*--multiprocessing-fork*' } | ` +
+          `ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }`,
+      ],
+      { encoding: 'utf8', timeout: 15000, windowsHide: true },
+    );
   } catch {
-    // No /proc (e.g. native Windows) — fall back to the liveness result above.
-    return true;
+    // Could not enumerate. Nothing is wrong enough to act on blindly.
+    return;
   }
+
+  for (const line of listing.split(/\r?\n/)) {
+    const [pidText, parentText] = line.trim().split(/\s+/);
+    const pid = Number(pidText);
+    const parentPid = Number(parentText);
+    if (!Number.isInteger(pid) || !Number.isInteger(parentPid) || pid <= 0) continue;
+
+    try {
+      process.kill(parentPid, 0);
+      continue; // parent still there (or a recycled pid) -- leave it alone
+    } catch (e: any) {
+      if (e?.code === 'EPERM') continue; // exists, not ours to signal
+    }
+
+    try {
+      execFileSync('taskkill.exe', ['/PID', String(pid), '/F'], {
+        stdio: 'ignore',
+        timeout: 10000,
+        windowsHide: true,
+      });
+      console.log(`Reaped orphaned dataloader worker ${pid} (parent ${parentPid} is gone)`);
+    } catch {
+      // already exited between listing and kill
+    }
+  }
+}
+
+/**
+ * How long a row may sit at 'running' with no pid before we call it dead.
+ *
+ * A launch is not atomic: startJob flips the row to 'running' first and can only
+ * write the pid once the Windows relay has reported it back, which is well over
+ * one worker tick. In that window the row looks exactly like a crashed job --
+ * 'running', no live pid -- and reconciling it there marks a perfectly healthy
+ * trainer "Stopped (trainer process gone)" and frees its GPU for the next job.
+ * Wait out the launch instead; a genuinely dead job is still reconciled, just
+ * a minute later, and nothing depends on that being instant.
+ */
+const LAUNCH_GRACE_MS = 90000;
+
+function isLaunching(job: Job): boolean {
+  if (job.pid != null) return false;
+  return Date.now() - new Date(job.updated_at).getTime() < LAUNCH_GRACE_MS;
 }
 
 /** Returns a job whose trainer process is still alive on these GPUs, if any. */
 async function findLiveTrainerOnGpu(gpuIds: string): Promise<Job | null> {
+  // Only consider jobs in active states. Stopped/completed jobs retain their
+  // last pid in the DB but that process is long gone; checking them causes false
+  // positives when an unrelated system process recycles the old pid — the UNKNOWN
+  // command-line case returns true conservatively and deadlocks the queue forever.
   const candidates: Job[] = await prisma.job.findMany({
-    where: { gpu_ids: gpuIds, pid: { not: null } },
+    where: { gpu_ids: gpuIds, pid: { not: null }, status: { in: ['running', 'stopping'] } },
   });
   return candidates.find(job => isTrainerAlive(job.pid)) ?? null;
 }
 
+/**
+ * Rewrite a GPU's queued jobs to positions 0..n-1, preserving their current
+ * order. Re-queuing below puts a job back with the position it held before it
+ * ran (deliberately — pausing and resuming the queue should resume that job in
+ * its old spot), but that position can collide with whatever a reorder has since
+ * renumbered into the slot. Duplicate positions make the queue unreorderable:
+ * the UI and the reorder API sort the same [queue_position, created_at] pair, so
+ * they agree on the order, but a duplicate still lets a plain up/down swap write
+ * each row its own value back and do nothing. Renumbering keeps relative order
+ * and removes the duplicate.
+ */
+async function renumberQueue(gpuIds: string): Promise<void> {
+  const queued: Job[] = await prisma.job.findMany({
+    where: { status: 'queued', gpu_ids: gpuIds },
+    orderBy: [{ queue_position: 'asc' }, { created_at: 'asc' }],
+  });
+  const writes = queued
+    .map((job, idx) => ({ job, idx }))
+    .filter(({ job, idx }) => job.queue_position !== idx);
+  if (writes.length === 0) return;
+  await prisma.$transaction(
+    writes.map(({ job, idx }) => prisma.job.update({ where: { id: job.id }, data: { queue_position: idx } })),
+  );
+  console.log(`Renumbered ${writes.length} queued job(s) on GPU(s) ${gpuIds}`);
+}
+
 export default async function processQueue() {
+  // Collect any workers left behind by a trainer that is already gone. Cheap to
+  // skip, throttled because the queue ticks every second, and independent of any
+  // queue state -- orphans outlive the job row that produced them.
+  if (Date.now() - lastOrphanSweepAt >= ORPHAN_SWEEP_INTERVAL_MS) {
+    lastOrphanSweepAt = Date.now();
+    reapOrphanedDataloaderWorkers();
+  }
+
   const queues: Queue[] = await prisma.queue.findMany({
     orderBy: {
       id: 'asc',
@@ -95,19 +274,46 @@ export default async function processQueue() {
           },
         });
       }
+
+      // The row is 'queued' but still carries its pre-run position, which may
+      // now duplicate another job's. Heal it in the same tick. Safe here: this
+      // whole block only runs while the queue is stopped, so nothing is being
+      // picked, and the renumber preserves order so the resumed job keeps its
+      // spot. Worst case a UI poll lands between the two writes and shows the
+      // stale position for one second.
+      if (stoppedRequeueJobs.length > 0) {
+        await renumberQueue(queue.gpu_ids);
+      }
     }
     if (queue.is_running) {
-      // first see if one is already running, status of running or stopping
-      const runningJob: Job | null = await prisma.job.findFirst({
+      // See if one is already running, status of running or stopping.
+      //
+      // A 'running' row is not proof a trainer exists. If the process is killed,
+      // OOMs, or the box loses power, nothing ever clears the row and this check
+      // would skip the queue forever — a permanent deadlock that looks like "the
+      // queue just stopped working". So verify the process before trusting it,
+      // and reconcile any row whose trainer is gone.
+      const claimedJobs: Job[] = await prisma.job.findMany({
         where: {
           status: { in: ['running', 'stopping'] },
           gpu_ids: queue.gpu_ids,
         },
       });
 
-      if (runningJob) {
-        // already running, nothing to do
+      const liveClaimedJob = claimedJobs.find(job => isTrainerAlive(job.pid) || isLaunching(job));
+      if (liveClaimedJob) {
+        // genuinely running (or still starting up), nothing to do
         continue; // skip to next queue
+      }
+
+      for (const stale of claimedJobs) {
+        console.log(
+          `Reconciling stale '${stale.status}' job ${stale.name} (pid ${stale.pid}): no trainer process alive.`,
+        );
+        await prisma.job.update({
+          where: { id: stale.id },
+          data: { status: 'stopped', pid: null, info: 'Stopped (trainer process gone)' },
+        });
       }
 
       // Status said the GPU is free. Confirm no trainer is actually still alive on
@@ -122,14 +328,16 @@ export default async function processQueue() {
       }
 
       // find the next job in the queue
+      // Tie-break on created_at, matching the reorder API and the UI's
+      // compareQueueOrder. With queue_position alone, two rows sharing a position
+      // are ordered arbitrarily by SQLite, so the job the user sees at the top of
+      // the queue is not necessarily the one that gets picked.
       const nextJob: Job | null = await prisma.job.findFirst({
         where: {
           status: 'queued',
           gpu_ids: queue.gpu_ids,
         },
-        orderBy: {
-          queue_position: 'asc',
-        },
+        orderBy: [{ queue_position: 'asc' }, { created_at: 'asc' }],
       });
       if (nextJob) {
         console.log(`Starting job ${nextJob.id} on GPU(s) ${nextJob.gpu_ids}`);

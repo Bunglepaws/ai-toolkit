@@ -475,11 +475,11 @@ class TrainVAEProcess(BaseTrainProcess):
 
         step_num = ''
         if step is not None:
-            # zeropad 9 digits
-            step_num = f"_{str(step).zfill(9)}"
+            # zeropad 5 digits
+            step_num = f"_{str(step).zfill(5)}"
         elif hasattr(self, 'save_config') and self.save_config.save_with_step_num:
             # if step is None, use current step
-            step_num = f"_{str(self.step_num).zfill(9)}"
+            step_num = f"_{str(self.step_num).zfill(5)}"
 
         self.update_training_metadata()
         filename = f'{self.job.name}{step_num}_diffusers'

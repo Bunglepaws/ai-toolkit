@@ -4,65 +4,18 @@ import path from 'path';
 import fs from 'fs';
 import { getTrainingFolder } from '@/server/settings';
 
-import sqlite3 from 'sqlite3';
-
 const prisma = new PrismaClient();
 
-function openDb(filename: string) {
-  const db = new sqlite3.Database(filename);
-  db.configure('busyTimeout', 5_000);
-  return db;
-}
-
-function getOne<T = any>(db: sqlite3.Database, sql: string, params: any[] = []) {
-  return new Promise<T | null>((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) reject(err);
-      else resolve((row as T) ?? null);
-    });
-  });
-}
-
-function closeDb(db: sqlite3.Database) {
-  return new Promise<void>((resolve, reject) => {
-    db.close((err) => (err ? reject(err) : resolve()));
-  });
-}
-
 /**
- * Returns true if at least one training step has been recorded in the current
- * session (i.e. since the most-recent training_sessions.start_time).
- * Falls back to false if the DB or table does not exist yet.
+ * A checkpoint already exists for the job's current step — either nothing has
+ * trained yet (step 0) or a periodic save already landed on this exact step,
+ * so an on-demand save would just write an identical duplicate.
  */
-async function hasStepsThisSession(logPath: string): Promise<boolean> {
-  if (!fs.existsSync(logPath)) return false;
-
-  const db = openDb(logPath);
-  try {
-    // Check that the training_sessions table exists (forward-only feature).
-    const tbl = await getOne<{ name: string }>(
-      db,
-      `SELECT name FROM sqlite_master WHERE type='table' AND name='training_sessions'`,
-    );
-    if (!tbl) return false;
-
-    const session = await getOne<{ start_time: number }>(
-      db,
-      `SELECT start_time FROM training_sessions ORDER BY start_time DESC LIMIT 1`,
-    );
-    if (!session) return false;
-
-    const row = await getOne<{ n: number }>(
-      db,
-      `SELECT COUNT(*) AS n FROM steps WHERE wall_time >= ?`,
-      [session.start_time],
-    );
-    return (row?.n ?? 0) > 0;
-  } catch {
-    return false;
-  } finally {
-    await closeDb(db);
-  }
+async function checkpointAlreadyExists(jobName: string, step: number): Promise<boolean> {
+  if (!step || step <= 0) return true;
+  const trainingFolder = await getTrainingFolder();
+  const filename = `${jobName}_${String(step).padStart(5, '0')}.safetensors`;
+  return fs.existsSync(path.join(trainingFolder, jobName, filename));
 }
 
 export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
@@ -76,23 +29,25 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     return NextResponse.json({ error: 'Job not found' }, { status: 404 });
   }
 
-  const trainingFolder = await getTrainingFolder();
-  const logPath = path.join(trainingFolder, job.name, 'loss_log.db');
-  const stepsMade = await hasStepsThisSession(logPath);
+  const alreadySaved = await checkpointAlreadyExists(job.name, job.step);
 
-  if (stepsMade) {
-    // Set both flags — end_step_hook runs maybe_save() (save_now) before
-    // maybe_stop() (stop), so the Python trainer saves first then stops cleanly.
+  if (!alreadySaved) {
+    // NOTE: deliberately does NOT set `stop`. The trainer's stop-watcher thread
+    // treats `stop` as "raise SIGINT now" and would kill the training step before
+    // the checkpoint was ever written. stop_after_save is only read by
+    // maybe_stop(), and only once no save is still pending, so the save always
+    // lands first and the stop happens cleanly straight after it.
     await prisma.job.update({
       where: { id: jobID },
       data: {
         save_now: true,
-        stop: true,
+        stop_after_save: true,
         info: 'Saving snapshot and pausing...',
       },
     });
   } else {
-    // No progress this session — nothing new to save.  Just stop.
+    // Already have a checkpoint for this exact step — nothing new to save, so
+    // this is a plain stop and the watcher may interrupt immediately.
     await prisma.job.update({
       where: { id: jobID },
       data: {

@@ -3,6 +3,89 @@ import { ConfigDoc } from '@/types';
 import { IoFlaskSharp } from 'react-icons/io5';
 
 const docs: { [key: string]: ConfigDoc } = {
+  'voice_clone.enabled': {
+    title: 'Clone Voice',
+    description: (
+      <>
+        Generates voice training clips with a TTS model before training starts, so the LoRA learns a voice as well as a
+        look. It runs once: the clips are written into a dataset folder and reused on every resume. Needs the OmniVoice
+        model path set in Settings, and the target dataset must have <b>Do Audio</b> and <b>Cache Latents to Disk</b>
+        enabled.
+      </>
+    ),
+  },
+  'voice_clone.mode': {
+    title: 'Source',
+    description: (
+      <>
+        <b>Clone</b> copies a real speaker from a 3-25 second recording. <b>Design</b> invents a voice from a
+        description: it generates one seed clip first and clones the rest from it, because two calls with the same
+        description are not guaranteed to give the same voice - without that step a dataset can end up being several
+        different speakers averaged together.
+      </>
+    ),
+  },
+  'voice_clone.reference_path': {
+    title: 'Reference recording',
+    description: (
+      <>
+        Audio or video, 3-25 seconds. It only conditions the TTS - it is never trained on, and does not count toward the
+        voice length.
+      </>
+    ),
+  },
+  'voice_clone.instruct': {
+    title: 'Voice description',
+    description: (
+      <>
+        Comma separated attributes, one per category: gender (male, female), age (child, teenager, young adult,
+        middle-aged, elderly), pitch (very low to very high), style (whisper), and an accent such as american or
+        british. Omit anything you do not care about.
+      </>
+    ),
+  },
+  'voice_clone.target_dataset': {
+    title: 'Write clips into',
+    description: (
+      <>
+        A dataset folder for the generated clips. Keeping them separate from your images lets the voice be retired
+        independently once it converges. Selecting it here <b>adds it to Datasets below automatically</b>, with Do Audio
+        and Cache Latents to Disk enabled - generating clips into a folder no dataset references would otherwise train
+        nothing, silently.
+      </>
+    ),
+  },
+  'voice_clone.target_seconds': {
+    title: 'Voice length',
+    description: (
+      <>
+        Total generated audio, cut into 5.167 second clips (the longest length H3 accepts), so 60 seconds gives 12
+        clips. Around 45-50 seconds has been enough in practice and two minutes is a comfortable ceiling. Generation is
+        fast, so raising this costs training steps rather than wall time.
+      </>
+    ),
+  },
+  'voice_clone.voice_description': {
+    title: 'Caption the voice',
+    description: (
+      <>
+        Describes the voice, not a picture - &quot;a man speaking calmly, low pitch&quot;. It leads every generated
+        caption, followed by the words actually spoken.
+      </>
+    ),
+  },
+  'voice_clone.dialogue': {
+    title: 'Dialogue',
+    description: (
+      <>
+        One utterance per line, roughly 13-16 words each so it fills a 5 second clip without sounding rushed or slowed.
+        Lines are used in order and cycled if there are fewer than the clip count. The bracket tags are the only
+        non-verbal sounds the model knows - anything else is spoken aloud as a literal word. Tags are stripped from the
+        caption and replaced with plain language.
+      </>
+    ),
+  },
+
   'config.name': {
     title: 'Training Name',
     description: (
@@ -39,6 +122,31 @@ const docs: { [key: string]: ConfigDoc } = {
         Trigger words will not automatically be added to your test prompts, so you will need to either add your trigger
         word manually or use the
         <code>{'[trigger]'}</code> placeholder in your test prompts as well.
+      </>
+    ),
+  },
+  'datasets.trigger_word': {
+    title: 'Dataset Trigger Word',
+    description: (
+      <>
+        Optional: Overrides the job's global Trigger Word for just this dataset. Useful when a job trains multiple
+        datasets that each need their own trigger word (e.g. training several characters together, one per dataset).
+        <br />
+        <br />
+        If this is set, it is used for this dataset instead of the global trigger word — the global one is ignored
+        for these files. If this is left blank, this dataset falls back to using the job's global Trigger Word (if
+        one is set). Leave this blank on every dataset to just use the global trigger word everywhere, as normal.
+        <br />
+        <br />
+        Works the same way as the global trigger word otherwise: added to the beginning of captions that don't
+        already contain it, or substituted in wherever you place the <code>{'[trigger]'}</code> placeholder.
+        <br />
+        <br />
+        <strong>This replaces the global trigger word for this dataset — it does not combine with it.</strong> If
+        your global trigger word is <code>p3n15</code> and you want an "uncut" dataset to trigger on{' '}
+        <code>uncut p3n15</code> and a "cut" dataset on <code>cut p3n15</code>, you need to type the full phrase into
+        each dataset's field (<code>uncut p3n15</code> and <code>cut p3n15</code>) — just entering{' '}
+        <code>uncut</code> here will drop <code>p3n15</code> from that dataset's captions entirely.
       </>
     ),
   },
@@ -200,6 +308,34 @@ const docs: { [key: string]: ConfigDoc } = {
         <br />
         <br />
         <em>Note: Cache Text Embeddings is automatically enabled when this option is checked.</em>
+      </>
+    ),
+  },
+  'sample.minimax_h3_turbo_lora': {
+    title: 'Turbo LoRA During Sampling',
+    description: (
+      <>
+        Applies a step-distilled (&quot;turbo&quot;) LoRA to the transformer while training previews are generated, then
+        removes it before training resumes. The LoRA never touches the training forward pass, so your own LoRA still
+        trains against the untouched base model — it only makes previews cheap.
+        <br />
+        <br />
+        Turbo LoRAs are built for a <strong>specific checkpoint partition</strong> — use an fl2va turbo file on the
+        fl2va arch, a ref2va turbo file on the ref2va arch (both default to the pruned partition of their release).
+        Several formats load: the ComfyUI repacks, the diffusers-keyed <code>fl2v_turbo_*</code> releases (separate
+        q/k/v projections, fused to match our single <code>qkv_proj</code>), and rank-resized files whose scale is
+        baked directly into the weights rather than expressed as a normal alpha. Anything in the file that does not
+        fit the loaded transformer is skipped and reported in the log rather than silently half-applied.
+        <br />
+        <br />
+        Start at strength <strong>1.0</strong> and drop <strong>Sample Steps</strong> to 4–8 — the speedup comes from
+        the step count, not the LoRA. Keep guidance scale at 1; MiniMax-H3 is guidance-distilled either way.
+        <br />
+        <br />
+        <em>
+          Note: AdaLN adapters in these files are skipped. The AdaLN projection runs in float32 outside its linear
+          layer, so an adapter there has no effect — the released pruned files omit them for the same reason.
+        </em>
       </>
     ),
   },
@@ -407,6 +543,32 @@ const docs: { [key: string]: ConfigDoc } = {
         Forces torch.compile to capture the entire model as a single graph with no graph breaks. This is a stricter,
         potentially faster compile mode, but it may fail with quantized or layer-offloaded models, which often require
         graph breaks to work correctly.
+      </>
+    ),
+  },
+  'train.guidance_loss_target': {
+    title: 'Guidance Loss Target',
+    description: (
+      <>
+        For contrastive guidance loss, this is the target CGF to amplify predictions to.
+      </>
+    ),
+  },
+  'datasets.caption_dropout_rate': {
+    title: 'Caption Dropout Rate',
+    description: (
+      <>
+        Caption dropout rate is the probability that the caption for an image will be dropped (replaced with a blank
+        caption) for any given training step. For example, a value of 0.05 will drop the caption around 5% of the time.
+        Dropping captions helps the model learn the concept being trained without relying entirely on the caption,
+        and helps preserve the model&apos;s ability to generate without a prompt. If a trigger word is set, the trigger
+        word is still used when the caption is dropped, so the model still associates the dropped samples with your
+        trigger word. Regularization images, or images without a trigger word, drop to a fully blank caption.
+        <br />
+        <br />
+        Caption dropout also works when caching text embeddings. An additional embedding for the dropout caption
+        (blank, or the trigger word alone) is cached to disk alongside the normal one, and it is randomly swapped in
+        at train time at this rate.
       </>
     ),
   },

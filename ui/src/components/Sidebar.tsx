@@ -8,14 +8,13 @@ import { FaXTwitter, FaDiscord, FaYoutube } from 'react-icons/fa6';
 import { createGlobalState } from 'react-global-hooks';
 import ThemeToggle from './ThemeToggle';
 import ThemeLogo from './ThemeLogo';
-import useSettings from '@/hooks/useSettings';
 import ActiveJobWidget from './ActiveJobWidget';
+import QueueStatusWidget from './QueueStatusWidget';
 import OstrisCloudBalance from './OstrisCloudBalance';
 
 export const mobileSidebarState = createGlobalState<boolean>(false);
 
 const Sidebar = () => {
-  const { settings } = useSettings();
   const [isMobileOpen, setIsMobileOpen] = mobileSidebarState.use();
   const pathname = usePathname();
 
@@ -65,7 +64,7 @@ const Sidebar = () => {
         </button>
       </div>
       <OstrisCloudBalance />
-      <nav className="flex-1">
+      <nav className="flex-shrink-0">
         <ul className="px-2 py-4 space-y-2">
           {navigation.map(item => (
             <li key={item.name}>
@@ -80,11 +79,9 @@ const Sidebar = () => {
           ))}
         </ul>
       </nav>
-      <div className="mt-auto">
-        <ActiveJobWidget />
-        <div className="px-4 py-2 text-[10px] text-gray-600 uppercase tracking-widest border-t border-gray-800/50">
-          v{settings?.VERSION || '0.0.0'}
-        </div>
+      <ActiveJobWidget />
+      <div className="flex-shrink-0">
+        <QueueStatusWidget />
         <a
           href="https://ostris.com/support"
           target="_blank"

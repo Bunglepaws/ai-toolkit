@@ -1,39 +1,154 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Modal } from '@/components/Modal';
 import Link from 'next/link';
 import { TextInput } from '@/components/formInputs';
 import useDatasetList from '@/hooks/useDatasetList';
+import useDatasetStats from '@/hooks/useDatasetStats';
 import { Button } from '@headlessui/react';
-import { FaRegTrashAlt } from 'react-icons/fa';
+import { FaRegTrashAlt, FaSortAmountDown, FaSortAmountUpAlt } from 'react-icons/fa';
 import { openConfirm } from '@/components/ConfirmModal';
 import { TopBar, MainContent } from '@/components/layout';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
 import { apiClient } from '@/utils/api';
 import { useRouter } from 'next/navigation';
+import classNames from 'classnames';
+
+type SortKey = 'name' | 'modified' | 'count';
+
+const SORT_KEYS: SortKey[] = ['name', 'modified', 'count'];
+// Remembered per browser so the page comes back sorted the way it was left.
+const SORT_STORAGE_KEY = 'aitk_datasets_sort';
+
+function formatDateTime(epochMs: number): string {
+  return new Date(epochMs).toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
 
 export default function Datasets() {
   const router = useRouter();
   const { datasets, status, refreshDatasets } = useDatasetList();
+  const { stats, refreshStats } = useDatasetStats(datasets);
   const [newDatasetName, setNewDatasetName] = useState('');
   const [isNewDatasetModalOpen, setIsNewDatasetModalOpen] = useState(false);
+  const [sortKey, setSortKey] = useState<SortKey>('name');
+  const [sortAsc, setSortAsc] = useState(true);
 
-  // Transform datasets array into rows with objects
-  const tableRows = datasets.map(dataset => ({
-    name: dataset,
-    actions: dataset, // Pass full dataset name for actions
-  }));
+  // Restore the last sort. Done after mount rather than in the initial state because
+  // localStorage doesn't exist during server rendering.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SORT_STORAGE_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (SORT_KEYS.includes(saved?.key)) {
+        setSortKey(saved.key);
+        setSortAsc(saved.asc !== false);
+      }
+    } catch {
+      // unreadable/corrupt preference - fall back to the default sort
+    }
+  }, []);
+
+  const applySort = (key: SortKey, asc: boolean) => {
+    setSortKey(key);
+    setSortAsc(asc);
+    try {
+      localStorage.setItem(SORT_STORAGE_KEY, JSON.stringify({ key, asc }));
+    } catch {
+      // private mode / storage disabled - preference just doesn't persist
+    }
+  };
+
+  // Clicking a header sorts by it; clicking it again flips the direction.
+  const toggleSort = (key: SortKey) => {
+    if (key === sortKey) {
+      applySort(key, !sortAsc);
+    } else {
+      // Names read best A-Z; for dates and counts the interesting end is the big one.
+      applySort(key, key === 'name');
+    }
+  };
+
+  const sortHeader = (title: string, key: SortKey, alignRight = false) => (
+    <button
+      type="button"
+      onClick={() => toggleSort(key)}
+      className={classNames(
+        'flex items-center gap-1 uppercase hover:text-gray-200 transition-colors',
+        alignRight ? 'justify-end w-full' : '',
+      )}
+    >
+      <span>{title}</span>
+      {sortKey === key && (sortAsc ? <FaSortAmountUpAlt size={11} /> : <FaSortAmountDown size={11} />)}
+    </button>
+  );
+
+  // Transform datasets array into rows with objects. Stats arrive after the names, so a
+  // row may not have them yet.
+  const tableRows = useMemo(() => {
+    const rows = datasets.map(dataset => ({
+      name: dataset,
+      modified: stats[dataset]?.modified ?? null,
+      count: stats[dataset]?.count ?? null,
+      actions: dataset, // Pass full dataset name for actions
+    }));
+
+    rows.sort((a, b) => {
+      if (sortKey === 'name') {
+        return sortAsc ? a.name.localeCompare(b.name) : b.name.localeCompare(a.name);
+      }
+      const aVal = a[sortKey];
+      const bVal = b[sortKey];
+      // Rows whose stats haven't loaded yet stay at the bottom either way rather than
+      // jumping around as they fill in.
+      if (aVal === null && bVal === null) return a.name.localeCompare(b.name);
+      if (aVal === null) return 1;
+      if (bVal === null) return -1;
+      if (aVal === bVal) return a.name.localeCompare(b.name);
+      return sortAsc ? aVal - bVal : bVal - aVal;
+    });
+
+    return rows;
+  }, [datasets, stats, sortKey, sortAsc]);
 
   const columns: TableColumn[] = [
     {
-      title: 'Dataset Name',
+      title: sortHeader('Dataset Name', 'name'),
       key: 'name',
       render: row => (
         <Link href={`/datasets/${row.name}`} className="text-gray-200 hover:text-gray-100">
           {row.name}
         </Link>
       ),
+    },
+    {
+      title: sortHeader('Modified', 'modified'),
+      key: 'modified',
+      className: 'w-48 whitespace-nowrap',
+      render: row =>
+        row.modified === null ? (
+          <span className="text-gray-600">--</span>
+        ) : (
+          <span className="text-gray-400">{formatDateTime(row.modified)}</span>
+        ),
+    },
+    {
+      title: sortHeader('Files', 'count', true),
+      key: 'count',
+      className: 'w-20 text-right',
+      render: row =>
+        row.count === null ? (
+          <span className="text-gray-600">--</span>
+        ) : (
+          <span className="text-gray-400">{row.count.toLocaleString()}</span>
+        ),
     },
     {
       title: 'Actions',
@@ -133,7 +248,10 @@ export default function Datasets() {
           columns={columns}
           rows={tableRows}
           isLoading={status === 'loading'}
-          onRefresh={refreshDatasets}
+          onRefresh={() => {
+            refreshDatasets();
+            refreshStats();
+          }}
         />
       </MainContent>
 

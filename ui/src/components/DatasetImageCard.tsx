@@ -1,10 +1,10 @@
 import React, { useEffect, useState, ReactNode, KeyboardEvent, useRef } from 'react';
-import { FaTrashAlt, FaExpandAlt } from 'react-icons/fa';
+import { FaTrashAlt, FaExpandAlt, FaPlay } from 'react-icons/fa';
 import { openConfirm } from './ConfirmModal';
 import classNames from 'classnames';
 import { apiClient } from '@/utils/api';
 import AudioPlayer from './AudioPlayer';
-import { isVideo, isAudio } from '@/utils/basic';
+import { isVideo, isAudio, encodeFilePathForUrl } from '@/utils/basic';
 import useCaptionBatch, { setCachedCaption } from '@/hooks/useCaptionBatch';
 
 interface DatasetImageCardProps {
@@ -54,6 +54,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const [pollTick, setPollTick] = useState(0);
   const [isEditing, setIsEditing] = useState<boolean>(false);
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [streamVideo, setStreamVideo] = useState(false);
   const [isVisible, setIsVisible] = useState(false);
   const cardRef = useRef<HTMLDivElement>(null);
   // Persists the blob URL across visibility changes so the image stays shown while
@@ -66,7 +67,6 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
 
   const isItAVideo = isVideo(imageUrl);
   const isItAudio = isAudio(imageUrl);
-  const isItImage = !isItAVideo && !isItAudio;
 
   // Keep the editing ref in sync so the observer callback can read it without deps.
   const isEditingOrHighlighted = isEditing || isHighlighted;
@@ -105,13 +105,16 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
 
   // Drive image loads through fetch + AbortController so scrolling past actually
   // cancels in-flight requests. Debounced 80ms so fast scroll-throughs never
-  // start a request.
+  // start a request. Both images and videos pull the 300x300 thumb (the server
+  // generates it on a miss); ?thumb=1 falls through to the real file only when
+  // a thumb can't be made, so a video/* response means "no thumb available" —
+  // abort before downloading the body and stream a <video> tag instead.
   // We do NOT revoke the blob URL when isVisible goes false — Virtuoso keeps cards
   // mounted during layout shifts (e.g. at the bottom of the list), and revoking on
   // every brief visibility-loss causes the flickering the user sees. The blob is
   // kept alive until imageUrl changes or the component unmounts (see effect below).
   useEffect(() => {
-    if (!isItImage) return;
+    if (isItAudio) return;
     if (!isVisible) return;
     if (blobObjectUrlRef.current) return; // already loaded for this imageUrl
 
@@ -119,13 +122,21 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
     let cancelled = false;
 
     const timer = window.setTimeout(() => {
-      fetch(`/api/img/${encodeURIComponent(imageUrl)}`, { signal: controller.signal })
+      fetch(`/api/img/${encodeFilePathForUrl(imageUrl)}?thumb=1`, { signal: controller.signal })
         .then(r => {
           if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          if ((r.headers.get('content-type') || '').startsWith('video/')) {
+            controller.abort();
+            if (!cancelled) {
+              setStreamVideo(true);
+              setLoaded(true);
+            }
+            return null;
+          }
           return r.blob();
         })
         .then(blob => {
-          if (cancelled) return;
+          if (cancelled || !blob) return;
           const url = URL.createObjectURL(blob);
           blobObjectUrlRef.current = url;
           setBlobUrl(url);
@@ -142,7 +153,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
       controller.abort();
       // Intentionally not revoking blobObjectUrlRef here — see comment above.
     };
-  }, [imageUrl, isItImage, isVisible]);
+  }, [imageUrl, isItAudio, isVisible]);
 
   // Revoke blob URL and reset image state when imageUrl changes or on unmount.
   useEffect(() => {
@@ -152,6 +163,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
         blobObjectUrlRef.current = null;
       }
       setBlobUrl(null);
+      setStreamVideo(false);
       setLoaded(false);
     };
   }, [imageUrl]);
@@ -279,17 +291,21 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
       <div className="relative w-full" style={{ paddingBottom: '100%' }}>
         <div
           className={classNames('absolute inset-0 rounded-t-lg shadow-md bg-gray-900', {
-            'animate-pulse': isItImage && !loaded,
+            'animate-pulse': !isItAudio && !loaded,
           })}
         >
-          {isItAVideo && (
+          {streamVideo && (
             <video
-              src={`/api/img/${encodeURIComponent(imageUrl)}`}
-              className="w-full h-full object-contain"
+              src={`/api/img/${encodeFilePathForUrl(imageUrl)}`}
+              className={classNames('w-full h-full object-contain', {
+                'cursor-zoom-in': !!onImageClick,
+              })}
+              onClick={onImageClick}
               autoPlay={false}
+              preload="metadata"
+              playsInline
               loop
               muted
-              controls
             />
           )}
           {isItAudio && !showAudioPlayer && (
@@ -306,9 +322,9 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
             </div>
           )}
           {isItAudio && showAudioPlayer && (
-            <AudioPlayer src={`/api/img/${encodeURIComponent(imageUrl)}`} title={imageUrl.replace(/^.*[\\/]/, '')} />
+            <AudioPlayer src={`/api/img/${encodeFilePathForUrl(imageUrl)}`} title={imageUrl.replace(/^.*[\\/]/, '')} />
           )}
-          {isItImage && blobUrl && (
+          {!isItAudio && blobUrl && (
             <img
               src={blobUrl}
               alt={alt}
@@ -317,6 +333,11 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
                 'cursor-zoom-in': !!onImageClick,
               })}
             />
+          )}
+          {isItAVideo && loaded && (
+            <div className="absolute bottom-2 left-2 bg-gray-900/70 rounded-full p-2 pointer-events-none">
+              <FaPlay className="w-3 h-3 text-white" />
+            </div>
           )}
           {children && <div className="absolute inset-0 flex items-center justify-center">{children}</div>}
           <div className="absolute top-1 right-1 flex space-x-2 z-10">

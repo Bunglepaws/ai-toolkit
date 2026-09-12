@@ -1,10 +1,10 @@
 import prisma from '../prisma';
 import { Job } from '@prisma/client';
-import { spawn } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
-import { TOOLKIT_ROOT, getTrainingFolder, getHFToken, getGemmaApiKey, getQuantizationCacheDir } from '../paths';
-import { resolvePythonPath } from '../pythonPath';
+import { TOOLKIT_ROOT, getTrainingFolder, getHFToken, getGemmaApiKey, getGemmaApiModelIdSource, getQuantizationCacheDir, getModelsPath, getSamplePreviewEnabled, getOmniVoiceModelPath } from '../paths';
+import { resolveDetachedPythonPath } from '../pythonPath';
 const isWindows = process.platform === 'win32';
 
 const appendJobLog = (logPath: string, message: string) => {
@@ -13,9 +13,187 @@ const appendJobLog = (logPath: string, message: string) => {
   });
 };
 
+// Windows only. Launched as `node -e <this>` so the job ends up outside the
+// worker's process tree: `taskkill /T` (the dev script's `concurrently -k`,
+// or any shutdown that kills the tree) walks parent/child links and would take
+// a direct child down with the UI. This relay exits immediately, orphaning the
+// job, and `detached` keeps the job alive once its parent is gone. Its own
+// stdout/stderr are the job log, so the job inherits them as fds 1 and 2.
+// Python failing to launch at all (broken venv, missing interpreter) happens
+// inside the relay, so the relay -- not the worker -- is what sees that error.
+// It reports it two ways: on stderr, which is the job log, and through the pid
+// file, so the worker can put the real reason in the database.
+const RELAY_ERROR_PREFIX = 'error:';
+const WINDOWS_RELAY_SCRIPT = `
+const { spawn } = require('child_process');
+const fs = require('fs');
+const [pidFile, command, ...args] = process.argv.slice(1);
+const child = spawn(command, args, {
+  detached: true,
+  windowsHide: true,
+  stdio: ['ignore', 1, 2],
+});
+child.once('error', error => {
+  process.stderr.write('Error launching job process: ' + error.message + '\\n');
+  try {
+    fs.writeFileSync(pidFile, '${RELAY_ERROR_PREFIX}' + error.message);
+  } catch (e) {
+    process.stderr.write('Could not write job pid file: ' + e.message + '\\n');
+  }
+  process.exit(1);
+});
+if (child.pid) {
+  fs.writeFileSync(pidFile, String(child.pid));
+  child.unref();
+}
+`;
+
+const RELAY_PID_TIMEOUT_MS = 30000;
+
+type RelayResult = { pid: number | null; error?: string };
+
+// The relay exits as soon as it has launched the job, leaving the real pid in
+// pidPath. Without this we would only ever know the (already dead) relay's pid.
+const readRelayPid = (relay: ChildProcess, pidPath: string): Promise<RelayResult> => {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (value: RelayResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+
+    const timer = setTimeout(
+      () => finish({ pid: null, error: 'Timed out waiting for the job process to start' }),
+      RELAY_PID_TIMEOUT_MS,
+    );
+
+    relay.once('exit', () => {
+      let contents: string;
+      try {
+        contents = fs.readFileSync(pidPath, 'utf8').trim();
+      } catch {
+        finish({ pid: null, error: 'Job process did not report a pid' });
+        return;
+      }
+
+      if (contents.startsWith(RELAY_ERROR_PREFIX)) {
+        finish({ pid: null, error: contents.slice(RELAY_ERROR_PREFIX.length) });
+        return;
+      }
+
+      const pid = Number(contents);
+      finish(
+        Number.isInteger(pid) && pid > 0
+          ? { pid }
+          : { pid: null, error: 'Job process did not report a usable pid' },
+      );
+    });
+
+    relay.once('error', error => finish({ pid: null, error: error.message }));
+  });
+};
+
+const isProcessAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    // EPERM means it exists but belongs to someone else, which still counts.
+    return e?.code === 'EPERM';
+  }
+};
+
+// We cannot read an exit code off a process that is not our child, so pull the
+// last thing it said instead -- for a job that dies on startup (bad venv,
+// missing CUDA libs) that traceback line is the whole diagnosis.
+const LOG_TAIL_BYTES = 4096;
+const LOG_TAIL_MAX_CHARS = 300;
+
+const readLogTail = (logPath: string): string | null => {
+  let fd: number | null = null;
+  try {
+    const size = fs.statSync(logPath).size;
+    const length = Math.min(size, LOG_TAIL_BYTES);
+    if (length === 0) return null;
+
+    const buffer = Buffer.alloc(length);
+    fd = fs.openSync(logPath, 'r');
+    fs.readSync(fd, buffer, 0, length, size - length);
+
+    const lines = buffer.toString('utf8').split(/\r?\n/).filter(line => line.trim() !== '');
+    const lastLine = lines[lines.length - 1];
+    if (!lastLine) return null;
+    return lastLine.length > LOG_TAIL_MAX_CHARS ? `${lastLine.slice(-LOG_TAIL_MAX_CHARS)}` : lastLine;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // nothing useful to do if the log handle will not close
+      }
+    }
+  }
+};
+
+// The job is not our child anymore, so there is no 'exit' event to listen for.
+// Poll instead, so a job that dies without updating its own row (OOM kill,
+// hard crash) still gets marked as an error rather than sitting on 'running'.
+const JOB_POLL_INTERVAL_MS = 2000;
+
+const watchDetachedJob = (pid: number, jobID: string, logPath: string) => {
+  const timer = setInterval(() => {
+    if (isProcessAlive(pid)) return;
+    clearInterval(timer);
+
+    // A stopped or completed job writes its own ending (status row + final
+    // log lines) via its KeyboardInterrupt/done handlers -- stay out of the
+    // way. Only a job that vanished while still marked 'running' died without
+    // getting to say anything; record that. There is no exit code to read off
+    // a process that is not our child, so report the last thing it logged.
+    const tail = readLogTail(logPath);
+    const message = tail
+      ? `Job process exited unexpectedly. Last log line: ${tail}`
+      : 'Job process exited unexpectedly.';
+    void prisma.job
+      .updateMany({
+        where: { id: jobID, status: 'running' },
+        data: { status: 'error', info: message, pid: null },
+      })
+      .then(result => {
+        if (result.count > 0) appendJobLog(logPath, `\n${message}\n`);
+      })
+      .catch(updateError => {
+        console.error('Error updating job after process disappeared:', updateError);
+      });
+  }, JOB_POLL_INTERVAL_MS);
+
+  // Never hold the worker open on account of this poll.
+  if (timer.unref) timer.unref();
+};
+
 const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
   // starts and watches the job asynchronously
+  //
+  // Every exit path MUST settle this promise. The caller awaits it now (so the
+  // queue cannot tick mid-launch and reconcile the starting job away), which
+  // means an early `return` that skips `resolve()` does not just lose a result
+  // -- it wedges the worker's loop forever and the queue silently stops
+  // dispatching. `finally` guarantees it regardless of which path is taken.
   return new Promise<void>(async resolve => {
+    try {
+      await launchJob(job, sampleOnly);
+    } finally {
+      resolve();
+    }
+  });
+};
+
+const launchJob = async (job: Job, sampleOnly: boolean = false) => {
+  {
     const jobID = job.id;
 
     // setup the training
@@ -100,7 +278,7 @@ const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
     // write the config file
     fs.writeFileSync(configPath, JSON.stringify(jobConfig, null, 2));
 
-    const pythonPath = resolvePythonPath();
+    const pythonPath = resolveDetachedPythonPath();
 
     const runFilePath = path.join(TOOLKIT_ROOT, 'run_ui.py');
     if (!fs.existsSync(runFilePath)) {
@@ -121,6 +299,18 @@ const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
       CUDA_VISIBLE_DEVICES: `${job.gpu_ids}`,
       IS_AI_TOOLKIT_UI: '1',
       PYTHONUNBUFFERED: '1', // write Python output immediately so log tail isn't lost on a crash
+      // NOTE: expandable_segments:True was set here to fix CUBLAS_STATUS_INTERNAL_ERROR
+      // crashes, which were allocator fragmentation at ~97% VRAM under qfloat8. It is
+      // NOT set by default any more: on its first live run (wan2.2 i2v, uint4+ARA) the
+      // failure changed to "CUDA driver error: device not ready" in backward, an async
+      // stream fault rather than an allocation failure. expandable_segments uses the
+      // CUDA virtual-memory APIs, which interact badly with the constant host<->device
+      // transfers low_vram does (it swaps whole transformers mid-forward). uint4 also
+      // roughly halves weight memory, so the fragmentation it was solving may no longer
+      // exist. Export PYTORCH_CUDA_ALLOC_CONF before launching to opt back in.
+      ...(process.env.PYTORCH_CUDA_ALLOC_CONF
+        ? { PYTORCH_CUDA_ALLOC_CONF: process.env.PYTORCH_CUDA_ALLOC_CONF }
+        : {}),
     };
 
     if (sampleOnly) {
@@ -141,27 +331,69 @@ const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
       additionalEnv.GEMMA_API_KEY = gemmaApiKey;
     }
 
+    // GEMMA_API_MODEL_ID_SOURCE — fallback checkpoint LTX2Model reads the API
+    // model id from when the model actually being trained/sampled doesn't
+    // carry one itself (LTX-2.5 today). See _extract_gemma_model_id in ltx2.py.
+    const gemmaApiModelIdSource = await getGemmaApiModelIdSource();
+    if (gemmaApiModelIdSource && gemmaApiModelIdSource.trim() !== '') {
+      additionalEnv.GEMMA_API_MODEL_ID_SOURCE = gemmaApiModelIdSource;
+    }
+
     // AITK_QUANTIZATION_CACHE_DIR — only injected when the job opts in via cache_quantized_model
     if (jobConfig?.config?.process?.[0]?.model?.cache_quantized_model) {
       const quantCacheDir = await getQuantizationCacheDir();
       additionalEnv.AITK_QUANTIZATION_CACHE_DIR = quantCacheDir;
     }
 
+    // AITK_SAMPLE_PREVIEW — toolkit/sample_preview.py's on/off switch for the
+    // live tiny-VAE sample preview
+    additionalEnv.AITK_SAMPLE_PREVIEW = (await getSamplePreviewEnabled()) ? '1' : '0';
+
+    // MODELS_PATH - one set in the env always takes precedence (it passes
+    // through via process.env); only fall back to the setting if it is not set
+    if (!process.env.MODELS_PATH || process.env.MODELS_PATH.trim() === '') {
+      const modelsPath = await getModelsPath();
+      if (modelsPath && modelsPath.trim() !== '') {
+        additionalEnv.MODELS_PATH = modelsPath;
+      }
+    }
+
+    // OMNIVOICE_MODEL_PATH - TTS weights for the voice-clone pre-step. Same precedence
+    // rule as MODELS_PATH: an env var already set wins over the stored setting.
+    if (!process.env.OMNIVOICE_MODEL_PATH || process.env.OMNIVOICE_MODEL_PATH.trim() === '') {
+      const omniVoicePath = await getOmniVoiceModelPath();
+      if (omniVoicePath && omniVoicePath.trim() !== '') {
+        additionalEnv.OMNIVOICE_MODEL_PATH = omniVoicePath;
+      }
+    }
+
     // Add the --log argument to the command
     const args = [runFilePath, configPath, '--log', logPath];
+
+    // Where the Windows relay reports the job's real pid back to us.
+    const relayPidPath = path.join(trainingFolder, '.job_pid');
 
     try {
       let subprocess;
 
       if (isWindows) {
-        // Spawn Python directly on Windows so the process can survive parent exit
-        subprocess = spawn(pythonPath, args, {
+        // Launch through the relay (see WINDOWS_RELAY_SCRIPT) so the job is not
+        // a descendant of this worker and survives the UI being shut down or
+        // tree-killed. The relay spawns the job `detached`, which is what keeps
+        // it alive once the relay exits; that in turn means DETACHED_PROCESS,
+        // so pythonPath is pythonw.exe to avoid Windows handing the job a
+        // console window of its own.
+        try {
+          fs.unlinkSync(relayPidPath);
+        } catch {
+          // no stale pid file to clear
+        }
+        subprocess = spawn(process.execPath, ['-e', WINDOWS_RELAY_SCRIPT, relayPidPath, pythonPath, ...args], {
           env: {
             ...process.env,
             ...additionalEnv,
           },
           cwd: TOOLKIT_ROOT,
-          detached: true,
           windowsHide: true,
           stdio: 'ignore', // don't tie stdio to parent; run_ui.py writes its own --log file
         });
@@ -193,25 +425,39 @@ const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
           });
       });
 
-      // Record abnormal termination and repair jobs Python could not update itself.
-      subprocess.once('exit', (code, signal) => {
-        if (code === 0) return;
+      let pid: number | null;
 
-        const result = signal ? `signal ${signal}` : `exit code ${code}`;
-        const message = `Job process terminated with ${result}.`;
-        appendJobLog(logPath, `\n${message}\n`);
-        void prisma.job
-          .updateMany({
-            where: { id: jobID, status: 'running' },
-            data: { status: 'error', info: message, pid: null },
-          })
-          .catch(updateError => {
-            console.error('Error updating job after abnormal process exit:', updateError);
-          });
-      });
+      if (isWindows) {
+        // The relay is gone within a few hundred ms; the pid it leaves behind is
+        // the job's. Poll that pid for liveness since we get no 'exit' event.
+        const relayResult = await readRelayPid(subprocess, relayPidPath);
+        if (relayResult.pid == null) {
+          throw new Error(relayResult.error ?? 'Job process did not report a pid');
+        }
+        pid = relayResult.pid;
+        watchDetachedJob(pid, jobID, logPath);
+      } else {
+        pid = subprocess.pid ?? null;
+
+        // Record abnormal termination and repair jobs Python could not update itself.
+        subprocess.once('exit', (code, signal) => {
+          if (code === 0) return;
+
+          const result = signal ? `signal ${signal}` : `exit code ${code}`;
+          const message = `Job process terminated with ${result}.`;
+          appendJobLog(logPath, `\n${message}\n`);
+          void prisma.job
+            .updateMany({
+              where: { id: jobID, status: 'running' },
+              data: { status: 'error', info: message, pid: null },
+            })
+            .catch(updateError => {
+              console.error('Error updating job after abnormal process exit:', updateError);
+            });
+        });
+      }
 
       // Save the PID to the database and a file for future management (stop/inspect)
-      const pid = subprocess.pid ?? null;
       if (pid != null) {
         await prisma.job.update({
           where: { id: jobID },
@@ -245,9 +491,8 @@ const startAndWatchJob = (job: Job, sampleOnly: boolean = false) => {
       });
       return;
     }
-    // Resolve the promise immediately after starting the process
-    resolve();
-  });
+    // Returns as soon as the process is started; the watcher keeps running.
+  }
 };
 
 export default async function startJob(jobID: string, sampleOnly: boolean = false) {
@@ -265,9 +510,18 @@ export default async function startJob(jobID: string, sampleOnly: boolean = fals
       status: 'running',
       stop: false,
       return_to_queue: false,
+      // Drop the previous run's pid here rather than leaving it to be overwritten
+      // when the new one arrives. Until then it points at a dead (or recycled)
+      // process, and the queue's liveness check cannot tell that apart from a
+      // trainer that just died -- a null pid on a freshly-updated row is what
+      // marks this row as "still launching".
+      pid: null,
       info: sampleOnly ? 'Generating samples...' : 'Starting job...',
     },
   });
-  // start and watch the job asynchronously so the cron can continue
-  startAndWatchJob(job, sampleOnly);
+  // Hold the queue until the pid is recorded. The row is already 'running' with
+  // the previous run's (dead) pid, so letting the cron tick again mid-launch is
+  // what let it reconcile a starting job away as "trainer process gone" and hand
+  // its GPU to the next one. Nothing else needs the tick back sooner.
+  await startAndWatchJob(job, sampleOnly);
 }

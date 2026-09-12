@@ -1,4 +1,4 @@
-# ── SETTINGS ── edit these, then just hit Run in PowerShell ISE ───────────────
+﻿# ── SETTINGS ── edit these, then just hit Run in PowerShell ISE ───────────────
 
 #$folder            = "D:\Data\iCloudDrive\Comfy\260712"
 #$folder            = "D:\Data\iCloudDrive\Comfy\camera_lab"
@@ -63,26 +63,25 @@ $recursive         = $true # also process files in subfolders
 
 
 
-# WSL distro to use (must have the ai-toolkit venv with Pillow installed)
-$wslDistro = "Ubuntu-22.04"
-$pythonExe = "/mnt/c/Data/git/AIToolkitWSL/ai-toolkit/venv/bin/python3"
+# Native Windows interpreter. This used to shell into WSL
+# (`wsl -d Ubuntu-22.04 -- /mnt/c/.../venv/bin/python3`); that distro and its
+# venv are gone, so the script failed outright. Nothing here needs Linux.
+$pythonExe = Join-Path $PSScriptRoot "..\.venv\Scripts\python.exe"
+if (-not (Test-Path $pythonExe)) {
+    throw "Python not found at $pythonExe - expected the uv-managed .venv at the repo root."
+}
 
 # ── CONVERT PATH TO WSL FORMAT ────────────────────────────────────────────────
 
 $wslOverwrite = if ($overwriteMetadata) { "1" } else { "0" }
 $wslVideos    = if ($includeVideos)     { "1" } else { "0" }
 $wslRecursive = if ($recursive)         { "1" } else { "0" }
-$wslFolder = $folder -replace '\\', '/'
-if ($wslFolder -match '^([A-Za-z]):(.*)') {
-    $drive = $Matches[1].ToLower()
-    $rest  = $Matches[2]
-    $wslFolder = "/mnt/$drive$rest"
-}
+# The Windows path goes through verbatim - no /mnt/ translation needed.
+$wslFolder = $folder
 
-# wsl.exe joins all trailing args into one string and runs it via `bash -c`,
-# so shell metacharacters in the path (e.g. "&") must be single-quoted here
-# or they get interpreted as shell syntax instead of passed through literally.
-$wslFolderQuoted = "'" + ($wslFolder -replace "'", "'\''") + "'"
+# PowerShell passes a real argv to a native exe, so a path containing "&" or
+# a space needs none of the single-quoting `wsl -- ` (which used bash -c) did.
+$wslFolderQuoted = $folder
 
 # ── PYTHON SCRIPT (piped to python via stdin) ─────────────────────────────────
 
@@ -741,13 +740,12 @@ if __name__ == "__main__":
 # ── RUN ───────────────────────────────────────────────────────────────────────
 
 Write-Host "Folder    : $folder"
-Write-Host "WSL       : $wslDistro"
+Write-Host "Python    : $pythonExe"
 Write-Host "Overwrite : $overwriteMetadata"
 Write-Host "Videos    : $includeVideos"
 Write-Host "Recursive : $recursive"
 Write-Host ""
 
-# Pipe the Python script directly to Python's stdin ("-" = read from stdin).
-# This avoids writing a temp file via the UNC share, which fails when WSL
-# hasn't been started yet (\\wsl.localhost isn't mounted until first wsl call).
-$pythonScript | wsl -d $wslDistro -- $pythonExe - $wslFolderQuoted $wslOverwrite $wslVideos $wslRecursive
+# Pipe the Python script straight to the interpreter's stdin ("-" = read from
+# stdin), so there is no temp file to write or clean up.
+$pythonScript | & $pythonExe - $wslFolderQuoted $wslOverwrite $wslVideos $wslRecursive

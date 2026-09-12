@@ -2,10 +2,71 @@ import torch
 import torch.nn.functional as F
 
 
+def encode_first_frame_condition(
+    first_frame,
+    num_frames,
+    target_height,
+    target_width,
+    batch_size,
+    vae,
+    device,
+    dtype,
+):
+    """VAE-encode [first_frame, zeros x (num_frames-1)] and normalize the result.
+
+    Split out of add_first_frame_conditioning so the exact same tensor can be
+    computed once at latent-caching time, while the VAE is still on the GPU, and
+    then reused every training step. This is the only part of the v2.1
+    conditioning path that needs a VAE forward pass.
+    """
+    if len(first_frame.shape) == 3:
+        # we have a single image
+        first_frame = first_frame.unsqueeze(0)
+
+    # if it doesnt match the batch size, we need to expand it
+    if first_frame.shape[0] != batch_size:
+        first_frame = first_frame.expand(batch_size, -1, -1, -1)
+
+    # resize first frame to match the latent model input
+    first_frame = F.interpolate(
+        first_frame,
+        size=(target_height, target_width),
+        mode='bilinear',
+        align_corners=False
+    )
+
+    # Add temporal dimension to first frame
+    first_frame = first_frame.unsqueeze(2)
+
+    # Create video condition with first frame and zeros for remaining frames
+    zero_frame = torch.zeros_like(first_frame)
+    video_condition = torch.cat([
+        first_frame,
+        *[zero_frame for _ in range(num_frames - 1)]
+    ], dim=2)
+
+    # Encode with VAE
+    latent_condition = vae.encode(
+        video_condition.to(device, dtype)
+    ).latent_dist.sample()
+    latent_condition = latent_condition.to(device, dtype)
+
+    latents_mean = (
+        torch.tensor(vae.config.latents_mean)
+        .view(1, vae.config.z_dim, 1, 1, 1)
+        .to(device, dtype)
+    )
+    latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(1, vae.config.z_dim, 1, 1, 1).to(
+        device, dtype
+    )
+    return (latent_condition - latents_mean) * latents_std
+
+
 def add_first_frame_conditioning(
     latent_model_input,
-    first_frame,
-    vae
+    first_frame=None,
+    vae=None,
+    latent_condition=None,
 ):
     """
     Adds first frame conditioning to a video diffusion model input.
@@ -30,55 +91,32 @@ def add_first_frame_conditioning(
     # So to get n: n = (num_latent_frames-1)*4 + 1
     num_frames = (num_latent_frames - 1) * 4 + 1
     
-    if len(first_frame.shape) == 3:
-        # we have a single image
-        first_frame = first_frame.unsqueeze(0)
-    
-    # if it doesnt match the batch size, we need to expand it
-    if first_frame.shape[0] != latent_model_input.shape[0]:
-        first_frame = first_frame.expand(latent_model_input.shape[0], -1, -1, -1)
-        
-    # resize first frame to match the latent model input
-    vae_scale_factor = vae.config.scale_factor_spatial
-    first_frame = F.interpolate(
-        first_frame,
-        size=(latent_model_input.shape[3] * vae_scale_factor, latent_model_input.shape[4] * vae_scale_factor),
-        mode='bilinear',
-        align_corners=False
-    )
-
-    # Add temporal dimension to first frame
-    first_frame = first_frame.unsqueeze(2)
-
-    # Create video condition with first frame and zeros for remaining frames
-    zero_frame = torch.zeros_like(first_frame)
-    video_condition = torch.cat([
-        first_frame,
-        *[zero_frame for _ in range(num_frames - 1)]
-    ], dim=2)
-
-    # Prepare for VAE encoding (bs, channels, num_frames, height, width)
-    # video_condition = video_condition.permute(0, 2, 1, 3, 4)
-
-    # Encode with VAE
-    latent_condition = vae.encode(
-        video_condition.to(device, dtype)
-    ).latent_dist.sample()
-    latent_condition = latent_condition.to(device, dtype)
-    
-    latents_mean = (
-        torch.tensor(vae.config.latents_mean)
-        .view(1, vae.config.z_dim, 1, 1, 1)
-        .to(device, dtype)
-    )
-    latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(1, vae.config.z_dim, 1, 1, 1).to(
-        device, dtype
-    )
-    latent_condition = (latent_condition - latents_mean) * latents_std
-    
+    if latent_condition is None:
+        vae_scale_factor = vae.config.scale_factor_spatial
+        latent_condition = encode_first_frame_condition(
+            first_frame=first_frame,
+            num_frames=num_frames,
+            target_height=latent_model_input.shape[3] * vae_scale_factor,
+            target_width=latent_model_input.shape[4] * vae_scale_factor,
+            batch_size=latent_model_input.shape[0],
+            vae=vae,
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        # Precomputed during latent caching, while the VAE was still on the GPU.
+        # Reusing it keeps the VAE out of the training step entirely: everything
+        # below only reads vae.config / vae.temperal_downsample, which is fine
+        # with the VAE parked on CPU.
+        latent_condition = latent_condition.to(device, dtype)
+        if latent_condition.ndim == 4:
+            latent_condition = latent_condition.unsqueeze(0)
+        if latent_condition.shape[0] != latent_model_input.shape[0]:
+            latent_condition = latent_condition.expand(
+                latent_model_input.shape[0], -1, -1, -1, -1)
 
     # Create mask: 1 for conditioning frames, 0 for frames to generate
-    batch_size = first_frame.shape[0]
+    batch_size = latent_model_input.shape[0]
     latent_height = latent_condition.shape[3]
     latent_width = latent_condition.shape[4]
 

@@ -41,6 +41,8 @@ from torchvision.transforms import functional as TF
 from toolkit.accelerator import get_accelerator, unwrap_model
 from typing import TYPE_CHECKING
 from toolkit.print import print_acc
+from toolkit.sample_preview import SamplePreviewWriter
+from toolkit.ui_utils import SampleSkippedException
 from toolkit.basic import flush
 
 if TYPE_CHECKING:
@@ -98,6 +100,15 @@ UNET_IN_CHANNELS = 4  # Stable Diffusion の in_channels は 4 で固定。XLも
 class BaseModel:
     # override these in child classes
     arch = None
+    # rename LoRA keys transformer. <-> diffusion_model. (the ComfyUI-standard
+    # prefix) on save/load
+    lora_keys_use_comfy_prefix = False
+
+    # Set for the duration of one sample by the loop in generate_images. Models
+    # whose sampler can report intermediate progress call it as (step, total);
+    # everything else ignores it. Class-level default so `getattr` is safe and a
+    # callback from a previous run can never leak into the next one.
+    sample_step_callback = None
 
     def __init__(
             self,
@@ -166,6 +177,9 @@ class BaseModel:
         self._after_sample_img_hooks = []
         self._status_update_hooks = []
         self._maybe_stop_hooks = []
+        # skip: abandon only the clip currently rendering, not the whole batch
+        # -- see add_maybe_skip_hook / maybe_skip_sample below
+        self._maybe_skip_hooks = []
         self.is_transformer = False
 
         self.sample_prompts_cache = None
@@ -179,12 +193,26 @@ class BaseModel:
         
         # set true for models that encode control image into text embeddings
         self.encode_control_in_text_embeddings = False
+        # control files may be VIDEOS (cached like dataset items, exposed on
+        # the batch as control_video_latents_list); see minimax_h3 ref2va
+        self.supports_video_control_images = False
+        # D-OPSD: cache per-item teacher text embeds (item's own media as reference 1)
+        self.dopsd_self_ref = False
+        # weight of the normal-target loss added alongside the D-OPSD teacher loss
+        self.dopsd_bleed_strength = 1.0
+        # forces cache_tensors_to_disk on latent-caching datasets (BaseSDTrainProcess)
+        self.require_pixel_tensor_cache = False
         # control images will come in as a list for encoding some things if true
         self.has_multiple_control_images = False
         # do not resize control images
         self.use_raw_control_images = False
         # defines if the model supports model paths. Only some will
         self.supports_model_paths = False
+        # standalone audio files (.wav/.mp3/...) in a video dataset become
+        # audio-only "voice" items: real audio latents against a zeros video
+        # placeholder, with the video loss zeroed. See get_audio_grid and
+        # make_audio_only_placeholder_latent below.
+        self.supports_audio_only_items = False
         
         # use new lokr format (default false for old models for backwards compatibility)
         self.use_old_lokr_format = True
@@ -198,6 +226,9 @@ class BaseModel:
         
         # if a mask is passed, do the loss with the mask. May be set false for models that use a mask for other reasons.
         self.do_masked_loss = True
+        
+        # if the model outputs an x0 prediction (clean latent)
+        self.x0_pred = False
 
     # properties for old arch for backwards compatibility
     @property
@@ -285,20 +316,31 @@ class BaseModel:
         except:
             # if we have a custom vae, it might not have this
             divisibility = 8
-        
+
         # flux packs this again,
         if self.is_flux:
             divisibility = divisibility * 2
         return divisibility
 
-    def reload_text_encoder(self):
-        """Reload text encoder from disk when it was unloaded by a previous training job.
 
-        Override in model subclasses that support reloading the TE independently
-        of the transformer (e.g. LTX2Model with local Gemma). Default is a no-op
-        for models that either don't unload their TE or use an API for encoding.
+    def prepare_sample_prompt_context(self, gen_config):
+        """Optional hook called right before a sample prompt is encoded, with
+        the sample's GenerateImageConfig, for models whose control conditioning
+        in the text embeds depends on sample settings (e.g. a video reference's
+        length capped at the sample's frame count)."""
+        return None
+
+    def get_frame_count_snapper(self):
+        """Optional hook for video models whose VAE accepts frame counts on a
+        grid other than the default ``temporal_compression * n + 1``.
+
+        Return a MODULE-LEVEL function ``(num_frames: int) -> int`` that snaps
+        an arbitrary frame count DOWN to the nearest count the video VAE can
+        encode (it must be picklable by reference — file items travel into
+        dataloader workers, so no lambdas or bound methods). Returning None
+        keeps the default auto_frame_count behavior.
         """
-        pass
+        return None
 
     # these must be implemented in child classes
     def load_model(self):
@@ -412,6 +454,17 @@ class BaseModel:
         for hook in self._maybe_stop_hooks:
             hook()
 
+    def add_maybe_skip_hook(self, func):
+        self._maybe_skip_hooks.append(func)
+
+    def maybe_skip_sample(self):
+        """Called every denoise step from the sample loop's step callback.
+        A hook raises SampleSkippedException to abandon the clip currently
+        rendering; generate_images catches it around the single-image call
+        and moves on to the next prompt."""
+        for hook in self._maybe_skip_hooks:
+            hook()
+
     @torch.no_grad()
     def generate_images(
             self,
@@ -484,9 +537,55 @@ class BaseModel:
                 if network is not None:
                     assert network.is_active
 
-                for i in tqdm(range(len(image_configs)), desc=f"Generating Samples", leave=True, position=0):
+                # One bar unit per denoise step (plus one for the decode) rather
+                # than per sample. A sample can be a 124-frame video that takes
+                # a quarter of an hour, and a bar that sits at 0/4 that whole time
+                # is indistinguishable from a hung job -- which is exactly how it
+                # has been read. Models opt in by calling self.sample_step_callback
+                # (see minimax_h3); for any that don't, the bar still steps once
+                # per finished sample because the boundary update below is
+                # unconditional.
+                sample_units = [
+                    max(1, int(getattr(c, 'num_inference_steps', 1) or 1)) + 1
+                    for c in image_configs
+                ]
+                progress = tqdm(
+                    total=sum(sample_units), desc="Generating Samples", leave=True, position=0
+                )
+
+                # samples land in <job folder>/samples; the preview belongs beside
+                # them, in the job folder itself, not mixed in with real outputs
+                preview_folder = None
+                if image_configs and image_configs[0].output_folder:
+                    preview_folder = os.path.dirname(image_configs[0].output_folder)
+                previewer = SamplePreviewWriter(
+                    getattr(self, 'arch', None), preview_folder, print_fn=print_acc
+                )
+
+                for i in range(len(image_configs)):
                     self.maybe_stop()
                     gen_config = image_configs[i]
+
+                    units_done = sum(sample_units[:i])
+
+                    def _sample_step_callback(step, total, latents_fn=None, _i=i, _base=units_done):
+                        # Checked every denoise step (not just once per image like
+                        # maybe_stop above) so a skip lands within one step of being
+                        # requested, not after the clip currently rendering finishes.
+                        self.maybe_skip_sample()
+
+                        # Never let a model's own count push the bar past this
+                        # sample's share: the boundary update owns that.
+                        share = sample_units[_i]
+                        target = _base + min(int(step), share)
+                        if target > progress.n:
+                            progress.update(target - progress.n)
+                        progress.set_postfix_str(f"sample {_i + 1}/{len(image_configs)} step {step}/{total}")
+
+                        if previewer.enabled and latents_fn is not None:
+                            previewer.write(latents_fn(), _i, len(image_configs), step, total)
+
+                    self.sample_step_callback = _sample_step_callback
 
                     extra = {}
                     validation_image = None
@@ -581,6 +680,19 @@ class BaseModel:
                         conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
                         unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
                     else:
+                        # Live encoding needs a real text encoder. If it was already
+                        # unloaded there is nothing to fall back to, so say why instead
+                        # of letting the model's encoder trip over the stub with a
+                        # bare "'FakeTextEncoder' object has no attribute 'model'".
+                        from toolkit.unloader import FakeTextEncoder
+                        _te = getattr(self, 'text_encoder', None)
+                        _te_list = _te if isinstance(_te, list) else [_te]
+                        if any(isinstance(t, FakeTextEncoder) for t in _te_list):
+                            raise RuntimeError(
+                                f"Cannot encode sample prompt {i}: the text encoder has been "
+                                "unloaded (cache_text_embeddings) and this prompt has no cached "
+                                "embeds. Restart the job to re-cache the sample prompts."
+                            )
                         ctrl_img = None
                         has_control_images = False
                         if gen_config.ctrl_img is not None or gen_config.ctrl_img_1 is not None or gen_config.ctrl_img_2 is not None or gen_config.ctrl_img_3 is not None:
@@ -589,7 +701,11 @@ class BaseModel:
                         if has_control_images and self.encode_control_in_text_embeddings:
                             ctrl_img_list = []
                     
-                            if gen_config.ctrl_img is not None:
+                            if gen_config.ctrl_img is not None and os.path.splitext(str(gen_config.ctrl_img))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
+                                # control VIDEO: pass the path through; models with
+                                # supports_video_control_images handle it in get_prompt_embeds
+                                ctrl_img_list.append(str(gen_config.ctrl_img))
+                            elif gen_config.ctrl_img is not None:
                                 ctrl_img = Image.open(gen_config.ctrl_img).convert("RGB")
                                 # convert to 0 to 1 tensor
                                 ctrl_img = (
@@ -599,7 +715,11 @@ class BaseModel:
                                 )
                                 ctrl_img_list.append(ctrl_img)
                             
-                            if gen_config.ctrl_img_1 is not None:
+                            if gen_config.ctrl_img_1 is not None and os.path.splitext(str(gen_config.ctrl_img_1))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
+                                # control VIDEO: pass the path through; models with
+                                # supports_video_control_images handle it in get_prompt_embeds
+                                ctrl_img_list.append(str(gen_config.ctrl_img_1))
+                            elif gen_config.ctrl_img_1 is not None:
                                 ctrl_img_1 = Image.open(gen_config.ctrl_img_1).convert("RGB")
                                 # convert to 0 to 1 tensor
                                 ctrl_img_1 = (
@@ -608,7 +728,11 @@ class BaseModel:
                                     .to(self.device_torch, dtype=self.torch_dtype)
                                 )
                                 ctrl_img_list.append(ctrl_img_1)
-                            if gen_config.ctrl_img_2 is not None:
+                            if gen_config.ctrl_img_2 is not None and os.path.splitext(str(gen_config.ctrl_img_2))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
+                                # control VIDEO: pass the path through; models with
+                                # supports_video_control_images handle it in get_prompt_embeds
+                                ctrl_img_list.append(str(gen_config.ctrl_img_2))
+                            elif gen_config.ctrl_img_2 is not None:
                                 ctrl_img_2 = Image.open(gen_config.ctrl_img_2).convert("RGB")
                                 # convert to 0 to 1 tensor
                                 ctrl_img_2 = (
@@ -617,7 +741,11 @@ class BaseModel:
                                     .to(self.device_torch, dtype=self.torch_dtype)
                                 )
                                 ctrl_img_list.append(ctrl_img_2)
-                            if gen_config.ctrl_img_3 is not None:
+                            if gen_config.ctrl_img_3 is not None and os.path.splitext(str(gen_config.ctrl_img_3))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
+                                # control VIDEO: pass the path through; models with
+                                # supports_video_control_images handle it in get_prompt_embeds
+                                ctrl_img_list.append(str(gen_config.ctrl_img_3))
+                            elif gen_config.ctrl_img_3 is not None:
                                 ctrl_img_3 = Image.open(gen_config.ctrl_img_3).convert("RGB")
                                 # convert to 0 to 1 tensor
                                 ctrl_img_3 = (
@@ -632,6 +760,7 @@ class BaseModel:
                             else:
                                 ctrl_img = ctrl_img_list[0] if len(ctrl_img_list) > 0 else None
                         # encode the prompt ourselves so we can do fun stuff with embeddings
+                        self.prepare_sample_prompt_context(gen_config)
                         if isinstance(self.adapter, CustomAdapter):
                             self.adapter.is_unconditional_run = False
                         conditional_embeds = self.encode_prompt(
@@ -718,19 +847,39 @@ class BaseModel:
                     unconditional_embeds = unconditional_embeds.to(
                         self.device_torch, dtype=self.unet.dtype)
 
-                    img = self.generate_single_image(
-                        pipeline,
-                        gen_config,
-                        conditional_embeds,
-                        unconditional_embeds,
-                        generator,
-                        extra,
-                    )
+                    try:
+                        img = self.generate_single_image(
+                            pipeline,
+                            gen_config,
+                            conditional_embeds,
+                            unconditional_embeds,
+                            generator,
+                            extra,
+                        )
+                    except SampleSkippedException:
+                        # abandon only this clip -- nothing to save or log -- and
+                        # move on to the next prompt in the batch. The bar still
+                        # squares up below so it does not read as stuck.
+                        self.print_and_status_update(
+                            f"Sample {i + 1}/{len(image_configs)} skipped by user"
+                        )
+                        flush()
+                    else:
+                        gen_config.save_image_atomic(img, i)
+                        gen_config.log_image(img, i)
+                        self._after_sample_image(i, len(image_configs))
+                        flush()
 
-                    gen_config.save_image(img, i)
-                    gen_config.log_image(img, i)
-                    self._after_sample_image(i, len(image_configs))
-                    flush()
+                    # Square the bar up at the sample boundary whatever the model
+                    # did or didn't report, so the total is always honest.
+                    self.sample_step_callback = None
+                    boundary = sum(sample_units[:i + 1])
+                    if boundary > progress.n:
+                        progress.update(boundary - progress.n)
+
+                progress.close()
+                # a leftover clip would read as a live preview next time
+                previewer.cleanup()
 
                 if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                     self.adapter.clear_memory()
@@ -1644,19 +1793,83 @@ class BaseModel:
                 encoder.to(*args, **kwargs)
         else:
             self.text_encoder.to(*args, **kwargs)
-    
+
+    def component_load_kwargs(self, role: str = "transformer", dtype=None):
+        """kwargs for a v2 module's .load()/.aitk_post_load(), derived from
+        model_config: qtype (with the accuracy recovery adapter recombined),
+        offload fraction, devices, low_vram placement. Roles: "transformer",
+        "te", "vae"."""
+        mc = self.model_config
+        qtype, offload = None, 0.0
+        if role == "transformer":
+            if mc.quantize:
+                qtype = mc.qtype
+                if mc.accuracy_recovery_adapter and "|" not in (qtype or ""):
+                    qtype = f"{qtype}|{mc.accuracy_recovery_adapter}"
+            if mc.layer_offloading:
+                offload = mc.layer_offloading_transformer_percent
+        elif role == "te":
+            if mc.quantize_te:
+                qtype = mc.qtype_te
+            if mc.layer_offloading:
+                offload = mc.layer_offloading_text_encoder_percent
+        if dtype is None:
+            dtype = self.vae_torch_dtype if role == "vae" else self.torch_dtype
+        device = self.te_device_torch if role == "te" else self.device_torch
+        if mc.low_vram and role in ("transformer", "te"):
+            device = "cpu"
+        elif role == "vae":
+            device = self.vae_device_torch
+        return dict(
+            qtype=qtype,
+            offload=offload,
+            dtype=dtype,
+            device=device,
+            quantize_device=self.device_torch,
+            base_model=self,
+            use_comfy_weights=mc.model_kwargs.get("use_comfy_weights", True),
+        )
+
     def convert_lora_weights_before_save(self, state_dict):
         # can be overridden in child classes to convert weights before saving
+        if self.lora_keys_use_comfy_prefix:
+            return {
+                k.replace("transformer.", "diffusion_model."): v
+                for k, v in state_dict.items()
+            }
         return state_dict
-    
+
     def convert_lora_weights_before_load(self, state_dict):
         # can be overridden in child classes to convert weights before loading
+        if self.lora_keys_use_comfy_prefix:
+            return {
+                k.replace("diffusion_model.", "transformer."): v
+                for k, v in state_dict.items()
+            }
         return state_dict
     
     def condition_noisy_latents(self, latents: torch.Tensor, batch:'DataLoaderBatchDTO'):
         # can be overridden in child classes to condition latents before noise prediction
         return latents
     
+    @classmethod
+    def get_audio_grid(cls):
+        # override in models with supports_audio_only_items. Returns a
+        # toolkit.audio.grid.AudioGrid describing the legal durations a standalone
+        # audio file may train at, built from the model's own packing constants so
+        # they stay the single source of truth.
+        return None
+
+    def make_audio_only_placeholder_latent(self, num_frames: int, height: int, width: int):
+        # override in models with supports_audio_only_items. Returns the video latent a
+        # voice item trains against -- zeros, which is the dataset mean in normalized
+        # latent space. It is never a stand-in for missing footage: its only jobs are to
+        # size the packed sequence (the latent frame count drives the audio row count)
+        # and to give the audio rows something to attend across. The video loss for
+        # these items is zeroed via the per-item loss_multiplier.
+        # height/width are in PIXELS; the model converts to its own latent geometry.
+        return None
+
     def get_transformer_block_names(self) -> Optional[List[str]]:
         # override in child classes to get transformer block names for lora targeting
         return None

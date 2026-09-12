@@ -1,10 +1,11 @@
 import Link from 'next/link';
+import { useEffect, useRef, useState } from 'react';
 import { Eye, Trash2, Pen, Play, Pause, Cog, X, Copy, Save, OctagonX, Camera, ArrowLeft, History, Image } from 'lucide-react';
+import { LuLoader } from 'react-icons/lu';
 import { Button } from '@headlessui/react';
 import { openConfirm } from '@/components/ConfirmModal';
-import { openSaveSnapshotModal } from '@/components/SaveSnapshotModal';
+import { openSaveStopJobModal } from '@/components/SaveStopJobModal';
 import { openResumeFromCheckpointModal } from '@/components/ResumeFromCheckpointModal';
-import { openStopJobModal } from '@/components/StopJobModal';
 import { Job } from '@prisma/client';
 import {
   startJob,
@@ -12,7 +13,7 @@ import {
   deleteJob,
   getAvaliableJobActions,
   markJobAsStopped,
-  saveJob,
+  saveJobNow,
   sampleJob,
   stopSampleJob,
   sampleJobNow,
@@ -20,7 +21,6 @@ import {
 import { startQueue } from '@/utils/queue';
 import { Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
 import { openCaptionDatasetModal } from '@/components/CaptionDatasetModal';
-import { useState } from 'react';
 
 interface JobActionBarProps {
   job: Job;
@@ -37,6 +37,12 @@ interface JobActionBarProps {
   menuAnchor?: 'bottom' | 'top end';
 }
 
+type PendingAction = 'start' | 'remove' | 'stop' | 'delete' | 'save' | 'sample' | 'markStopped';
+
+// If the job never reports a state change (e.g. the request silently failed
+// server-side), unlock the bar after this long so it can't stay stuck.
+const PENDING_TIMEOUT_MS = 30_000;
+
 export default function JobActionBar({
   job,
   onRefresh,
@@ -49,103 +55,179 @@ export default function JobActionBar({
   hasSamples = false,
   menuAnchor = 'bottom',
 }: JobActionBarProps) {
-  const [isProcessing, setIsProcessing] = useState(false);
-  const { canStart, canStop, canDelete, canEdit, canEditSample, canRemoveFromQueue, canSave, canSample, isBusy } = getAvaliableJobActions(
-    job,
-    isAnyJobRunning,
-    hasSamples,
-  );
+  const {
+    canStart,
+    canStop,
+    canDelete,
+    canEdit,
+    canEditSample,
+    canRemoveFromQueue,
+    canSave,
+    canSample,
+    isBusy: isJobBusy, // job reports itself saving/sampling server-side, distinct from the local pending-action lock below
+  } = getAvaliableJobActions(job, isAnyJobRunning, hasSamples);
 
   if (!afterDelete) afterDelete = onRefresh;
 
-  const handleAction = async (action: () => Promise<void>) => {
-    if (isProcessing) return;
-    setIsProcessing(true);
+  // The action currently in flight. While set, every other action is disabled
+  // and the pending one shows a spinner. It is cleared once the job comes back
+  // in a different state (status / stop flag), on error, or after a timeout.
+  const [pending, setPending] = useState<PendingAction | null>(null);
+  // Job state key captured when the pending action was fired. null means the
+  // action does not change job state and clears as soon as the request resolves.
+  const pendingStateKeyRef = useRef<string | null>(null);
+  const jobStateKey = `${job.status}|${job.stop ? 1 : 0}`;
+
+  const clearPending = () => {
+    pendingStateKeyRef.current = null;
+    setPending(null);
+  };
+
+  useEffect(() => {
+    if (pending && pendingStateKeyRef.current !== null && pendingStateKeyRef.current !== jobStateKey) {
+      clearPending();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobStateKey, pending]);
+
+  useEffect(() => {
+    if (!pending) return;
+    const timer = setTimeout(clearPending, PENDING_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending]);
+
+  const runAction = async (action: PendingAction, fn: () => Promise<void>, waitForJobUpdate = true) => {
+    if (pending) return;
+    pendingStateKeyRef.current = waitForJobUpdate ? jobStateKey : null;
+    setPending(action);
     try {
-      await action();
+      await fn();
+      if (!waitForJobUpdate) clearPending();
     } catch (e) {
-      console.error('Error performing job action:', e);
-    } finally {
-      setIsProcessing(false);
-      if (onRefresh) onRefresh();
+      console.error(`Error running job action "${action}":`, e);
+      clearPending();
     }
   };
 
-  const disabled = isProcessing || isBusy;
+  const isBusy = pending !== null || isJobBusy;
+  // Mark as Stopped is the recovery action for a job whose row says 'running'
+  // but whose trainer is gone, so it must NOT be gated on isJobBusy. That is
+  // save_now/sample still set on a running row -- exactly the state a job hung
+  // mid-save or mid-sample is left in, which is when this is needed most. Same
+  // reasoning as canStop in getAvaliableJobActions, which deliberately ignores
+  // isBusy so a stuck job can still be killed. Only the local in-flight lock
+  // applies here, to stop a double click firing two requests.
+  const isMarkStoppedBusy = pending !== null;
   const iconSizeClass = 'w-5 h-5 sm:w-6 sm:h-6';
+  const actionButtonClass = 'ml-1 sm:ml-2 opacity-100 disabled:opacity-40 disabled:cursor-not-allowed';
+  const menuItemClass = 'px-4 py-1 rounded flex items-center gap-2';
+  const menuItemEnabledClass = `${menuItemClass} cursor-pointer hover:bg-gray-800`;
+  const menuItemDisabledClass = `${menuItemClass} opacity-40 cursor-not-allowed`;
+  const spinner = <LuLoader className={`${iconSizeClass} animate-spin`} />;
+  const menuSpinner = <LuLoader className="w-4 h-4 animate-spin" />;
+  const menuPending = pending === 'save' || pending === 'sample' || pending === 'markStopped';
 
   return (
     <div className={`flex items-center flex-shrink-0 ${className ?? ''}`}>
       {canStart && (
         <Button
-          onClick={() => handleAction(async () => {
-            await startJob(job.id);
-            if (autoStartQueue) {
-              await startQueue(job.gpu_ids);
-            }
-          })}
-          disabled={disabled}
-          className={`ml-1 sm:ml-2 opacity-100 disabled:opacity-30 disabled:cursor-not-allowed`}
+          disabled={isBusy}
+          onClick={() => {
+            if (!canStart) return;
+            runAction('start', async () => {
+              await startJob(job.id);
+              // start the queue as well
+              if (autoStartQueue) {
+                await startQueue(job.gpu_ids);
+              }
+              if (onRefresh) onRefresh();
+            });
+          }}
+          className={actionButtonClass}
           title="Start Job"
         >
-          <Play className={iconSizeClass} />
+          {pending === 'start' ? spinner : <Play className={iconSizeClass} />}
         </Button>
       )}
       {canRemoveFromQueue && (
         <Button
-          onClick={() => handleAction(() => markJobAsStopped(job.id))}
-          disabled={disabled}
-          className={`ml-1 sm:ml-2 opacity-100 disabled:opacity-30 disabled:cursor-not-allowed`}
+          disabled={isBusy}
+          onClick={() => {
+            if (!canRemoveFromQueue) return;
+            runAction('remove', async () => {
+              await markJobAsStopped(job.id);
+              if (onRefresh) onRefresh();
+            });
+          }}
+          className={actionButtonClass}
           title="Remove from Queue"
         >
-          <X className={iconSizeClass} />
+          {pending === 'remove' ? spinner : <X className={iconSizeClass} />}
         </Button>
       )}
       {canSave && (
         <Button
           onClick={() => {
-            if (disabled) return;
-            openSaveSnapshotModal({
-              job,
-              onRefresh,
-            });
+            if (isBusy) return;
+            openSaveStopJobModal({ job, onRefresh });
           }}
-          disabled={disabled}
-          className={`ml-1 sm:ml-2 opacity-100 disabled:opacity-30 disabled:cursor-not-allowed`}
-          title="Save Snapshot"
+          disabled={isBusy}
+          className={actionButtonClass}
+          title="Save Snapshot / Stop Job"
         >
           <Save className={iconSizeClass} />
         </Button>
       )}
       {canSample && !hideSample && (
         <Button
-          onClick={() => handleAction(() => sampleJob(job.id))}
-          disabled={disabled}
-          className={`ml-1 sm:ml-2 opacity-100 disabled:opacity-30 disabled:cursor-not-allowed`}
+          onClick={() => {
+            if (isBusy) return;
+            runAction(
+              'sample',
+              async () => {
+                await sampleJob(job.id);
+                if (onRefresh) onRefresh();
+              },
+              false,
+            );
+          }}
+          disabled={isBusy}
+          className={actionButtonClass}
           title="Generate Samples Now"
         >
-          <Camera className={iconSizeClass} />
+          {pending === 'sample' ? spinner : <Camera className={iconSizeClass} />}
         </Button>
       )}
       {job.sample && job.status === 'running' && (
         <Button
-          onClick={() => handleAction(() => stopSampleJob(job.id))}
-          disabled={isProcessing}
-          className={`ml-1 sm:ml-2 opacity-100 disabled:opacity-30 disabled:cursor-not-allowed text-yellow-400`}
+          onClick={() => {
+            if (isBusy) return;
+            runAction(
+              'sample',
+              async () => {
+                await stopSampleJob(job.id);
+                if (onRefresh) onRefresh();
+              },
+              false,
+            );
+          }}
+          disabled={isBusy}
+          className={`${actionButtonClass} text-yellow-400`}
           title="Stop sampling and return to training"
         >
-          <ArrowLeft className={iconSizeClass} />
+          {pending === 'sample' ? spinner : <ArrowLeft className={iconSizeClass} />}
         </Button>
       )}
       {canStop && (
         <Button
+          disabled={isBusy}
           onClick={() => {
-            if (!canStop) return;
-            openStopJobModal({ job, onRefresh: onRefresh });
+            if (!canStop || isBusy) return;
+            openSaveStopJobModal({ job, onRefresh });
           }}
-          disabled={isProcessing}
-          className={`ml-1 sm:ml-2 opacity-100 disabled:opacity-30 disabled:cursor-not-allowed`}
-          title="Stop Job"
+          className={actionButtonClass}
+          title="Save Snapshot / Stop Job"
         >
           <Pause className={iconSizeClass} />
         </Button>
@@ -182,7 +264,9 @@ export default function JobActionBar({
         </Link>
       )}
       <Button
+        disabled={isBusy}
         onClick={() => {
+          if (isBusy) return;
           let message = `Are you sure you want to delete the job "${job.name}"? This will also permanently remove it from your disk.`;
           if (job.status === 'running') {
             message += ' WARNING: The job is currently running. You should stop it first if you can.';
@@ -192,27 +276,29 @@ export default function JobActionBar({
             message: message,
             type: 'warning',
             confirmText: 'Delete',
-            onConfirm: async () => {
-              await handleAction(async () => {
+            onConfirm: () =>
+              runAction('delete', async () => {
                 if (job.status === 'running') {
-                  await stopJob(job.id);
+                  try {
+                    await stopJob(job.id);
+                  } catch (e) {
+                    console.error('Error stopping job before deleting:', e);
+                  }
                 }
                 await deleteJob(job.id);
                 if (afterDelete) afterDelete();
-              });
-            },
+              }),
           });
         }}
-        disabled={disabled}
-        className={`ml-1 sm:ml-2 opacity-100 disabled:opacity-30 disabled:cursor-not-allowed`}
+        className={actionButtonClass}
         title="Delete Job"
       >
-        <Trash2 className={iconSizeClass} />
+        {pending === 'delete' ? spinner : <Trash2 className={iconSizeClass} />}
       </Button>
       <div className="border-r border-1 border-gray-700 ml-1 sm:ml-2 inline"></div>
       <Menu>
         <MenuButton className={'ml-1 sm:ml-2'} title="More Actions">
-          <Cog className={iconSizeClass} />
+          {menuPending ? spinner : <Cog className={iconSizeClass} />}
         </MenuButton>
         <MenuItems
           anchor={{ to: menuAnchor, gap: 16 }}
@@ -230,29 +316,45 @@ export default function JobActionBar({
             </MenuItem>
           )}
           {job.job_type === 'train' && canStop && (
-            <MenuItem>
+            <MenuItem disabled={isBusy}>
               <div
-                className="cursor-pointer px-4 py-1 hover:bg-gray-800 rounded flex items-center gap-2"
-                onClick={async () => {
-                  await saveJob(job.id);
-                  if (onRefresh) onRefresh();
+                className={isBusy ? menuItemDisabledClass : menuItemEnabledClass}
+                onClick={() => {
+                  if (isBusy) return;
+                  // does not change job state, so release as soon as the request resolves
+                  runAction(
+                    'save',
+                    async () => {
+                      await saveJobNow(job.id);
+                      if (onRefresh) onRefresh();
+                    },
+                    false,
+                  );
                 }}
               >
-                <Save className="w-4 h-4" />
+                {pending === 'save' ? menuSpinner : <Save className="w-4 h-4" />}
                 Save Next Step
               </div>
             </MenuItem>
           )}
           {job.job_type === 'train' && canStop && (
-            <MenuItem>
+            <MenuItem disabled={isBusy}>
               <div
-                className="cursor-pointer px-4 py-1 hover:bg-gray-800 rounded flex items-center gap-2"
-                onClick={async () => {
-                  await sampleJobNow(job.id);
-                  if (onRefresh) onRefresh();
+                className={isBusy ? menuItemDisabledClass : menuItemEnabledClass}
+                onClick={() => {
+                  if (isBusy) return;
+                  // does not change job state, so release as soon as the request resolves
+                  runAction(
+                    'sample',
+                    async () => {
+                      await sampleJobNow(job.id);
+                      if (onRefresh) onRefresh();
+                    },
+                    false,
+                  );
                 }}
               >
-                <Image className="w-4 h-4" />
+                {pending === 'sample' ? menuSpinner : <Image className="w-4 h-4" />}
                 Sample Next Step
               </div>
             </MenuItem>
@@ -268,23 +370,26 @@ export default function JobActionBar({
               </div>
             </MenuItem>
           )}
-          <MenuItem>
+          <MenuItem disabled={isMarkStoppedBusy}>
             <div
-              className="cursor-pointer px-4 py-1 hover:bg-gray-800 rounded flex items-center gap-2"
+              className={isMarkStoppedBusy ? menuItemDisabledClass : menuItemEnabledClass}
               onClick={() => {
+                if (isMarkStoppedBusy) return;
                 let message = `Are you sure you want to mark this job as stopped? This will set the job status to 'stopped' if the status is hung. Only do this if you are 100% sure the job is stopped. This will NOT stop the job.`;
                 openConfirm({
                   title: 'Mark Job as Stopped',
                   message: message,
                   type: 'warning',
                   confirmText: 'Mark as Stopped',
-                  onConfirm: async () => {
-                    await handleAction(() => markJobAsStopped(job.id));
-                  },
+                  onConfirm: () =>
+                    runAction('markStopped', async () => {
+                      await markJobAsStopped(job.id);
+                      onRefresh && onRefresh();
+                    }),
                 });
               }}
             >
-              <OctagonX className="w-4 h-4" />
+              {pending === 'markStopped' ? menuSpinner : <OctagonX className="w-4 h-4" />}
               Mark as Stopped
             </div>
           </MenuItem>

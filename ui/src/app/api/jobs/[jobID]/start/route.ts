@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
+import { invalidateCache } from '@/server/apiCache';
 
 export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
   const { jobID } = await params;
@@ -52,6 +53,10 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
       info: 'Job queued',
     },
   });
+
+  // Serve the change immediately: the active-jobs list is cached for 5s, so
+  // without this the client's next poll is still shown the pre-change list.
+  invalidateCache('jobs-active');
 
   // Return the response immediately
   return NextResponse.json(job);

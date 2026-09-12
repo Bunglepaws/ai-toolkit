@@ -63,11 +63,12 @@ from tqdm import tqdm
 
 from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, NetworkConfig, TrainConfig, ModelConfig, \
     GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
-    DecoratorConfig
+    DecoratorConfig, VoiceCloneConfig
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model
-from toolkit.print import print_acc
+from toolkit.print import print_acc, print_timing
+from toolkit import embed_disk_cache
 from accelerate import Accelerator
 import transformers
 import diffusers
@@ -110,6 +111,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.network_config = None
         self.train_config = TrainConfig(**self.get_conf('train', {}))
+        # optional TTS-generated voice clips; see hook_before_model_load
+        self.voice_clone_config = VoiceCloneConfig(**self.get_conf('voice_clone', {}))
         model_config = self.get_conf('model', {})
         self.modules_being_trained: List[torch.nn.Module] = []
 
@@ -133,6 +136,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.data_loader: Union[DataLoader, None] = None
         self.data_loader_reg: Union[DataLoader, None] = None
         self.trigger_word = self.get_conf('trigger_word', None)
+        # Voice captions lead with the trigger, same as image captions. Inherit the job's
+        # rather than asking for it twice -- mirrors the per-dataset inheritance below.
+        if not self.voice_clone_config.trigger_word and self.trigger_word is not None:
+            self.voice_clone_config.trigger_word = self.trigger_word
 
         self.guidance_config: Union[GuidanceConfig, None] = None
         guidance_config_raw = self.get_conf('guidance', None)
@@ -153,6 +160,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.train_config.cache_text_embeddings:
             for raw_dataset in raw_datasets:
                 raw_dataset['cache_text_embeddings'] = True
+
+        # pass diff output preservation to the datasets so the data loader can build
+        # and cache the DOP caption (dataset trigger word replaced with the class)
+        if self.train_config.diff_output_preservation and raw_datasets is not None:
+            for raw_dataset in raw_datasets:
+                raw_dataset['diff_output_preservation'] = True
+                raw_dataset['diff_output_preservation_class'] = self.train_config.diff_output_preservation_class
         
         if raw_datasets is not None and len(raw_datasets) > 0:
             for raw_dataset in raw_datasets:
@@ -593,11 +607,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         step_num = ''
         if step is not None:
             self.last_save_step = step
-            # zeropad 9 digits
-            step_num = f"_{str(step).zfill(9)}"
+            # zeropad 5 digits
+            step_num = f"_{str(step).zfill(5)}"
         elif self.save_config.save_with_step_num:
             # if step is None, use current step
-            step_num = f"_{str(self.step_num).zfill(9)}"
+            step_num = f"_{str(self.step_num).zfill(5)}"
 
         self.update_training_metadata()
         filename = f'{self.job.name}{step_num}.safetensors'
@@ -803,7 +817,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 try:
                     if os.path.exists(optimizer_path):
                         # Archive the existing optimizer.pt (which belongs to the previous save)
-                        archive_name = f"optimizer_{previous_save_step:09d}.pt"
+                        archive_name = f"optimizer_{previous_save_step:05d}.pt"
                         archive_path = os.path.join(self.save_root, archive_name)
 
                         # Archive the existing optimizer if not already archived
@@ -835,8 +849,35 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
     # Called before the model is loaded
     def hook_before_model_load(self):
-        # override in subclass
-        pass
+        self.generate_voice_clips_if_needed()
+
+    def generate_voice_clips_if_needed(self):
+        """Generate TTS voice clips into a dataset folder, before anything else loads.
+
+        Deliberately the FIRST thing in run(): a bad reference path or a missing package
+        fails in seconds rather than after the diffusion model quantizes, the TTS model is
+        released before that model touches the GPU (no VRAM overlap), and the clips land
+        on disk before the dataloader scans the folder, so they are picked up as ordinary
+        voice items with no special-casing.
+
+        A no-op on every run after the first -- see toolkit/voice_clone/manifest.py.
+        """
+        cfg = getattr(self, 'voice_clone_config', None)
+        if cfg is None or not cfg.enabled:
+            return
+        from toolkit.util.get_model import get_model_class
+        from toolkit.voice_clone import ensure_voice_clips
+
+        # The grid comes from the model class, not an instance -- nothing is loaded yet,
+        # and get_audio_grid only reads packing constants.
+        ModelClass = get_model_class(self.model_config)
+        grid = ModelClass.get_audio_grid()
+        if grid is None:
+            raise ValueError(
+                f"voice_clone is enabled but {self.model_config.arch} does not support "
+                f"audio-only training items."
+            )
+        ensure_voice_clips(cfg, grid, print_fn=print_acc)
 
     def hook_after_model_load(self):
         # override in subclass
@@ -916,6 +957,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 use_feedback=self.train_config.ema_config.use_feedback,
                 param_multiplier=self.train_config.ema_config.param_multiplier,
             )
+            # expose to the model: models that run an EMA-teacher forward during training
+            # (e.g. wan21_pixel self_flow) read it from here
+            self.sd.ema = self.ema
 
     def before_dataset_load(self):
         pass
@@ -952,6 +996,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # Filter out non-existent paths and sort by creation time
             if paths:
                 paths = [p for p in paths if os.path.exists(p)]
+                # The third pattern above has no extension, to match directory-style
+                # checkpoints (some models save as a folder of shards). As a side
+                # effect it also matches any stray file with the same prefix and a
+                # different extension - e.g. ComfyUI's "<name>.safetensors.rgthree-info.json"
+                # metadata sidecar. For an unnumbered save (e.g. "_merged.safetensors")
+                # the step-number regex below returns -1 for both the real checkpoint
+                # and its sidecar, and the tie then breaks on ctime - the sidecar is
+                # written after ComfyUI scans the checkpoint, so it's newer and wins,
+                # handing the "latest checkpoint" a JSON metadata file. Restrict to
+                # actual checkpoint candidates: directories, or known model extensions.
+                paths = [
+                    p for p in paths
+                    if os.path.isdir(p) or p.endswith('.safetensors') or p.endswith('.pt')
+                ]
                 # remove false positives
                 if '_LoRA' not in name:
                     paths = [p for p in paths if '_LoRA' not in p]
@@ -1258,34 +1316,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     latents = self.sd.encode_images(imgs)
                     batch.latents = latents
 
-                if self.train_config.standardize_latents:
-                    if self.sd.is_xl or self.sd.is_vega or self.sd.is_ssd:
-                        target_mean_list = [-0.1075, 0.0231, -0.0135, 0.2164]
-                        target_std_list = [0.8979, 0.7505, 0.9150, 0.7451]
-                    else:
-                        target_mean_list = [0.2949, -0.3188, 0.0807, 0.1929]
-                        target_std_list = [0.8560, 0.9629, 0.7778, 0.6719]
-
-                    latents_channel_mean = latents.mean(dim=(2, 3), keepdim=True)
-                    latents_channel_std = latents.std(dim=(2, 3), keepdim=True)
-                    latents = (latents - latents_channel_mean) / latents_channel_std
-                    target_mean = torch.tensor(target_mean_list, device=self.device_torch, dtype=dtype)
-                    target_std = torch.tensor(target_std_list, device=self.device_torch, dtype=dtype)
-                    # expand them to match dim
-                    target_mean = target_mean.unsqueeze(0).unsqueeze(2).unsqueeze(3)
-                    target_std = target_std.unsqueeze(0).unsqueeze(2).unsqueeze(3)
-
-                    latents = latents * target_std + target_mean
-                    batch.latents = latents
-
-                    # show_latents(latents, self.sd.vae, 'latents')
-
-
                 if batch.unconditional_tensor is not None and batch.unconditional_latents is None:
                     unconditional_imgs = batch.unconditional_tensor
                     unconditional_imgs = unconditional_imgs.to(self.device_torch, dtype=dtype)
                     unconditional_latents = self.sd.encode_images(unconditional_imgs)
-                    batch.unconditional_latents = unconditional_latents * self.train_config.latent_multiplier
+                    batch.unconditional_latents = unconditional_latents
 
                 unaugmented_latents = None
                 if self.train_config.loss_target == 'differential_noise':
@@ -1503,7 +1538,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.train_config.random_noise_shift > 0.0:
                     # get random noise -1 to 1
                     noise_shift = torch.randn(
-                        batch_size, latents.shape[1], 1, 1,
+                        s,
                         device=noise.device,
                         dtype=noise.dtype
                     ) * self.train_config.random_noise_shift
@@ -1516,15 +1551,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     noise = noise * noise_multiplier
             with self.timer('make_noisy_latents'):
 
-                latent_multiplier = self.train_config.latent_multiplier
-
                 # handle adaptive scaling mased on std
                 if self.train_config.adaptive_scaling_factor:
                     std = latents.std(dim=(2, 3), keepdim=True)
-                    normalizer = 1 / (std + 1e-6)
-                    latent_multiplier = normalizer
-
-                latents = latents * latent_multiplier
+                    latents = latents * (1 / (std + 1e-6))
 
                 if self.train_config.do_blank_stabilization:
                     # zero out latents with blank prompts
@@ -1538,10 +1568,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # normalize latents to a mean of 0 and an std of 1
                 # mean_zero_latents = latents - latents.mean()
                 # latents = mean_zero_latents / mean_zero_latents.std()
-
-                if batch.unconditional_latents is not None:
-                    batch.unconditional_latents = batch.unconditional_latents * self.train_config.latent_multiplier
-
 
                 noisy_latents = self.sd.add_noise(latents, noise, timesteps)
 
@@ -1721,48 +1747,124 @@ class BaseSDTrainProcess(BaseTrainProcess):
             return
         if not self.accelerator.is_main_process:
             return
+        is_audio_model = getattr(self.sd, 'is_audio_model', False)
+
         validation_items = []
         for item in val_config.validation_items:
-            if not item.image_path:
-                print_acc("Skipping validation item with no image")
-                continue
-            if not os.path.exists(item.image_path):
-                print_acc(f"Skipping validation item, image not found: {item.image_path}")
-                continue
+            if is_audio_model:
+                if not item.audio_path:
+                    print_acc("Skipping validation item with no audio")
+                    continue
+                if not os.path.exists(item.audio_path):
+                    print_acc(f"Skipping validation item, audio not found: {item.audio_path}")
+                    continue
+                if item.caption_path and not os.path.exists(item.caption_path):
+                    print_acc(f"Skipping validation item, caption not found: {item.caption_path}")
+                    continue
+            else:
+                if not item.image_path:
+                    print_acc("Skipping validation item with no image")
+                    continue
+                if not os.path.exists(item.image_path):
+                    print_acc(f"Skipping validation item, image not found: {item.image_path}")
+                    continue
             validation_items.append(item)
         if len(validation_items) == 0:
             print_acc("Validation config has no valid validation_items, skipping validation")
             return
-        print_acc(f"Caching validation latents and embeddings for {len(validation_items)} images")
         device = self.device_torch
         dtype = get_torch_dtype(self.train_config.dtype)
         resolution = val_config.resolution
 
-        divisibility = self.sd.get_bucket_divisibility()
-
-        image_list = []
         prompt_list = []
         for item in validation_items:
-            img = Image.open(item.image_path)
-            img = ImageOps.exif_transpose(img).convert('RGB')
-            # deterministic resize that keeps the aspect ratio, matches the pixel budget
-            # of the resolution and the bucket divisibility of the model
-            bucket = get_bucket_for_image_size(
-                img.width, img.height,
+            if is_audio_model:
+                # the prompt is the full tagged <CAPTION>/<LYRICS>/... string, read
+                # from caption_path if provided, otherwise the prompt field itself
+                if item.caption_path:
+                    with open(item.caption_path, 'r', encoding='utf-8') as f:
+                        prompt_list.append(f.read())
+                else:
+                    prompt_list.append(item.prompt)
+            else:
+                prompt = item.prompt
+                if self.trigger_word is not None:
+                    prompt = self.sd.inject_trigger_into_prompt(
+                        prompt,
+                        trigger=self.trigger_word,
+                        add_if_not_present=False,
+                    )
+                prompt_list.append(prompt)
+
+        if is_audio_model:
+            print_acc(f"Caching validation latents and embeddings for {len(validation_items)} audio files")
+            import torchaudio
+            from toolkit.dataloader_mixins import waveform_to_stereo
+            sample_rate = getattr(self.sd, 'sample_rate', 48000)
+
+            audio_list = []
+            for item in validation_items:
+                waveform, orig_sample_rate = torchaudio.load(item.audio_path)
+                waveform = waveform_to_stereo(waveform)
+                if orig_sample_rate != sample_rate:
+                    waveform = torchaudio.functional.resample(waveform, orig_sample_rate, sample_rate)
+                audio_list.append(waveform)
+
+            item_key = [
+                {'audio': embed_disk_cache.file_stamp(item.audio_path), 'prompt': prompt}
+                for item, prompt in zip(validation_items, prompt_list)
+            ]
+            cache_key = embed_disk_cache.build_key_material(
+                self.sd.model_config,
+                kind='validation_audio',
+                items=item_key,
+                sample_rate=sample_rate,
+                dtype=str(dtype),
+            )
+        else:
+            divisibility = self.sd.get_bucket_divisibility()
+
+            image_list = []
+            for item in validation_items:
+                img = Image.open(item.image_path)
+                img = ImageOps.exif_transpose(img).convert('RGB')
+                # deterministic resize that keeps the aspect ratio, matches the pixel budget
+                # of the resolution and the bucket divisibility of the model
+                bucket = get_bucket_for_image_size(
+                    img.width, img.height,
+                    resolution=resolution,
+                    divisibility=divisibility,
+                )
+                img = img.resize((bucket['width'], bucket['height']), Image.BICUBIC)
+                tensor = transforms.ToTensor()(img) * 2.0 - 1.0
+                image_list.append(tensor)
+
+            # None of this changes between runs, but re-deriving it costs ~24s of
+            # text encoder and VAE round-trips to the GPU. Cache it on disk, keyed on
+            # everything that could change the result.
+            item_key = [
+                {'image': embed_disk_cache.file_stamp(item.image_path), 'prompt': prompt}
+                for item, prompt in zip(validation_items, prompt_list)
+            ]
+            cache_key = embed_disk_cache.build_key_material(
+                self.sd.model_config,
+                kind='validation',
+                items=item_key,
                 resolution=resolution,
                 divisibility=divisibility,
+                dtype=str(dtype),
+                trigger_word=self.trigger_word,
             )
-            img = img.resize((bucket['width'], bucket['height']), Image.BICUBIC)
-            tensor = transforms.ToTensor()(img) * 2.0 - 1.0
-            image_list.append(tensor)
-            prompt = item.prompt
-            if self.trigger_word is not None:
-                prompt = self.sd.inject_trigger_into_prompt(
-                    prompt,
-                    trigger=self.trigger_word,
-                    add_if_not_present=False,
-                )
-            prompt_list.append(prompt)
+
+        cached = embed_disk_cache.load(self.save_root, cache_key)
+        if cached is not None:
+            self._validation_cache = {
+                'latents': cached['latents'],
+                'noise': cached['noise'],
+                'embeds': [embed_disk_cache.prompt_embeds_from_dict(e) for e in cached['embeds']],
+            }
+            print_acc("Loaded validation latents and embeddings from disk cache")
+            return
 
         fork_devices = [device] if device.type == 'cuda' else []
         with torch.no_grad(), torch.random.fork_rng(devices=fork_devices):
@@ -1781,11 +1883,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # seed so the vae latent dist sampling is always identical
             torch.manual_seed(42)
             orig_vae_device = self.sd.vae.device
-            # images can have different aspect ratios so they are encoded one at a time
-            latent_list = [
-                self.sd.encode_images([image], device=device, dtype=dtype).to('cpu', dtype=torch.float32)
-                for image in image_list
-            ]
+            # items can have different lengths/aspect ratios so they are encoded one at a time
+            if is_audio_model:
+                latent_list = [
+                    self.sd.encode_images(waveform.unsqueeze(0), device=device, dtype=dtype).to('cpu', dtype=torch.float32)
+                    for waveform in audio_list
+                ]
+            else:
+                latent_list = [
+                    self.sd.encode_images([image], device=device, dtype=dtype).to('cpu', dtype=torch.float32)
+                    for image in image_list
+                ]
             self.sd.vae.to(orig_vae_device)
 
             # fixed noise per image, seeds start at 42 and increment for each image
@@ -1801,6 +1909,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             'noise': noise_list,
             'embeds': embeds_list,
         }
+        embed_disk_cache.save(self.save_root, cache_key, {
+            'latents': latent_list,
+            'noise': noise_list,
+            'embeds': [embed_disk_cache.prompt_embeds_to_dict(e) for e in embeds_list],
+        })
         flush()
 
     def validate(self):
@@ -1916,59 +2029,46 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 model_config_to_load.refiner_name_or_path = previous_refiner_save
                 self.load_training_state_from_metadata(previous_refiner_save)
 
-        _hot = getattr(BaseSDTrainProcess, '_hot_model', None)
-        BaseSDTrainProcess._hot_model = None
-        _hot_arch = getattr(_hot, 'arch', None) or getattr(type(_hot), 'arch', None)
-        _new_arch = getattr(model_config_to_load, 'arch', None)
-        _used_hot = False
-        if _hot is not None and type(_hot) is ModelClass and _hot_arch == _new_arch:
-            try:
-                self.sd = _hot
-                self.sd.model_config = model_config_to_load
-                # Clear hooks registered by the previous job's trainer. They are bound
-                # methods on a trainer object that no longer exists (its thread_pool was
-                # already shut down), so leaving them would crash the next call into
-                # maybe_stop()/status updates with "cannot schedule new futures after shutdown".
-                self.sd._status_update_hooks = []
-                self.sd._maybe_stop_hooks = []
-                self.sd._after_sample_img_hooks = []
-                self.hook_after_sd_init_before_load()
-                validate_control_paths(self.dataset_configs)
-                # If the previous job unloaded the text encoder (stub or empty from API mode)
-                # but the new job needs a local TE, reload it. Transformer stays in RAM.
-                from toolkit.unloader import FakeTextEncoder
-                te = getattr(self.sd, 'text_encoder', None)
-                new_uses_api = getattr(model_config_to_load, 'gemma_api_key', None) is not None
-                te_is_stub = (
-                    isinstance(te, list) and te and any(isinstance(enc, FakeTextEncoder) for enc in te)
-                ) or (te is not None and not isinstance(te, list) and isinstance(te, FakeTextEncoder))
-                te_missing = isinstance(te, list) and len(te) == 0 and not new_uses_api
-                if te_is_stub or te_missing:
-                    print_acc(" - Model cache hit: reusing transformer, reloading text encoder...")
-                    self.sd.reload_text_encoder()
-                else:
-                    print_acc(" - Model cache hit: reusing loaded model (skipping load+quantize)")
-                _used_hot = True
-            except Exception as hot_err:
-                import traceback
-                print_acc(f" - Model cache: hot load failed ({hot_err}); falling back to full load+quantize")
-                print_acc(traceback.format_exc())
-                self.sd = None
+        self.sd = ModelClass(
+            # todo handle single gpu and multi gpu here
+            # device=self.device,
+            device=self.accelerator.device,
+            model_config=model_config_to_load,
+            dtype=self.train_config.dtype,
+            custom_pipeline=self.custom_pipeline,
+            noise_scheduler=sampler,
+        )
+        self.hook_after_sd_init_before_load()
+        validate_control_paths(self.dataset_configs)
+        # run base sd process run
+        self.sd.load_model()
 
-        if not _used_hot:
-            self.sd = ModelClass(
-                # todo handle single gpu and multi gpu here
-                # device=self.device,
-                device=self.accelerator.device,
-                model_config=model_config_to_load,
-                dtype=self.train_config.dtype,
-                custom_pipeline=self.custom_pipeline,
-                noise_scheduler=sampler,
-            )
-            self.hook_after_sd_init_before_load()
-            validate_control_paths(self.dataset_configs)
-            # run base sd process run
-            self.sd.load_model()
+        # Startup phase timing, opt-in via AITK_PROFILE_STARTUP=1. Model loading
+        # turned out to be a small slice of time-to-first-step, so measure the
+        # rest rather than guessing at it. The "Time to first step" total below
+        # is NOT gated — that one feeds the training time grid.
+        # NB: uses its own alias — `_t` is imported locally further down in this
+        # function, which makes it an unbound local anywhere above that point.
+        import time as _startup_time
+        # Seed the first phase from process start, not from here. Previously the
+        # mark was taken *after* load_model and the first phase was still labelled
+        # "load_model", so it always reported 0.0s and everything from interpreter
+        # start to this point — the largest slice by far — went unmeasured.
+        _startup_mark = _startup_time.time()
+        _proc_start_env = os.environ.get('AITK_PROCESS_START')
+        if _proc_start_env:
+            try:
+                _startup_mark = float(_proc_start_env)
+            except ValueError:
+                pass
+
+        def _startup_phase(label: str):
+            nonlocal _startup_mark
+            _now = _startup_time.time()
+            print_timing(f"  [startup] {label}: {_now - _startup_mark:.1f}s")
+            _startup_mark = _now
+
+        _startup_phase("process start -> model ready (imports + load/hot-reuse)")
 
         self.sd.add_after_sample_image_hook(self.sample_step_hook)
 
@@ -2025,6 +2125,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         #     except ImportError:
         #         print_acc("sage attention is not installed. Using SDP instead")
 
+        _startup_phase("attention_backend")
+
         if self.train_config.gradient_checkpointing:
             # if has method enable_gradient_checkpointing
             if hasattr(unet, 'enable_gradient_checkpointing'):
@@ -2045,6 +2147,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if hasattr(text_encoder, "gradient_checkpointing_enable"):
                     text_encoder.gradient_checkpointing_enable()
 
+        _startup_phase("gradient_checkpointing")
+
         if self.sd.refiner_unet is not None:
             self.sd.refiner_unet.to(self.device_torch, dtype=dtype)
             self.sd.refiner_unet.requires_grad_(False)
@@ -2061,12 +2165,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             text_encoder.requires_grad_(False)
             text_encoder.eval()
+        _startup_phase("text_encoder_eval")
         unet.to(self.device_torch, dtype=dtype)
         unet.requires_grad_(False)
         unet.eval()
+        _startup_phase("unet_to_device")
         vae = vae.to(torch.device('cpu'), dtype=dtype)
         vae.requires_grad_(False)
         vae.eval()
+        _startup_phase("vae_to_cpu")
         if self.train_config.learnable_snr_gos:
             self.snr_gos = LearnableSNRGamma(
                 self.sd.noise_scheduler, device=self.device_torch
@@ -2086,7 +2193,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self.snr_gos.gamma.data = torch.tensor(json_data['gamma'], device=self.device_torch)
 
         self.hook_after_model_load()
+        _startup_phase("hook_after_model_load")
         flush()
+        _startup_phase("flush")
         if not self.is_fine_tuning:
             if self.network_config is not None:
                 print_acc("Setting up LoRA network...")
@@ -2161,7 +2270,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # we cannot merge in if quantized or offloading. note: torchao quantized weights can
                 # still be force merged at save time for the merge-and-reset method (see save logic),
                 # but we keep can_merge_in False here so sampling never merges in/out.
-                if self.model_config.quantize or self.model_config.layer_offloading:
+                # models loaded from pre-quantized checkpoints (e.g. comfy convrot/nvfp4
+                # imports) never set model_config.quantize, so detect their layers too
+                model_is_prequantized = any(
+                    getattr(m, 'is_ostris_quantized', False) for m in unet.modules()
+                ) if unet is not None else False
+                if self.model_config.quantize or self.model_config.layer_offloading or model_is_prequantized:
                     # todo find a way around this
                     self.network.can_merge_in = False
 
@@ -2211,8 +2325,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if latest_save_path is not None and not self.train_config.merge_network_on_save:
                     print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
                     print_acc(f"Loading from {latest_save_path}")
+                    # load_weights already loads the training state from metadata
+                    # when there is a network, which there always is here
                     extra_weights = self.load_weights(latest_save_path)
-                    self.load_training_state_from_metadata(latest_save_path)
                     self.network.multiplier = 1.0
                 elif self.train_config.merge_network_on_save and self.network_config.pretrained_lora_path is not None:
                     # with merge_network_on_save, saved checkpoints are full models that get loaded as the
@@ -2416,19 +2531,50 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         self.lr_scheduler = lr_scheduler
 
+        _startup_phase("network/optimizer setup")
+
         # cache validation latents and embeddings now, the vae and text encoder
         # may be dumped before the train loop starts
         self.setup_validation()
+        _startup_phase("setup_validation")
 
         ### HOOk ###
         self.before_dataset_load()
+        _startup_phase("before_dataset_load")
         # some models (e.g. wan22_14b_i2v) need the raw image tensor every step
         # even when latents are cached to disk
         if getattr(self.sd, 'requires_pixels_with_cached_latents', False):
+            caches_condition = getattr(
+                self.sd, 'encode_first_frame_condition_for_cache', None) is not None
             for ds_list in (self.datasets, self.datasets_reg):
                 if ds_list is not None:
                     for ds in ds_list:
+                        # i2v video datasets get the conditioning precomputed into the
+                        # latent cache, so there is no reason to decode the whole clip
+                        # every step just to read frame 0.
+                        is_video = ds.auto_frame_count or ds.num_frames > 1
+                        if caches_condition and is_video and ds.do_i2v:
+                            continue
                         ds.load_image_when_caching_latents = True
+        # Separate mechanism from the flag above (that one is wan22_14b_i2v's
+        # load_image_when_caching_latents; this is minimax_h3's on-disk tensor
+        # cache). Both can be active independently, so keep them both.
+        if getattr(self.sd, 'require_pixel_tensor_cache', False):
+            # model needs pixel tensors at train time even with cached latents;
+            # storing them changes the latent cache key (first run re-caches)
+            for ds_list in [self.datasets, self.datasets_reg]:
+                if ds_list is None:
+                    continue
+                for ds in ds_list:
+                    if not (ds.cache_latents or ds.cache_latents_to_disk):
+                        # live-loading datasets already have pixels on the batch
+                        continue
+                    if not ds.cache_tensors_to_disk:
+                        print_acc(
+                            f"Model requires cached pixel tensors: forcing "
+                            f"cache_tensors_to_disk on dataset {ds.folder_path}"
+                        )
+                        ds.cache_tensors_to_disk = True
         # load datasets if passed in the root process
         if self.datasets is not None and not self.sample_only:
             self.data_loader = get_dataloader_from_datasets(
@@ -2440,9 +2586,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                                                 self.sd)
 
         flush()
+        _startup_phase("dataloaders (buckets/latents/embeddings)")
         self.last_save_step = self.step_num
         ### HOOK ###
         self.hook_before_train_loop()
+        _startup_phase("hook_before_train_loop")
 
         # ============================================================
         # COMPILE
@@ -2732,6 +2880,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if _proc_start:
             import time as _t
             _elapsed = _t.time() - float(_proc_start)
+            _startup_phase("compile/sampling -> first step")
             print_acc(f"Time to first step: {_elapsed:.0f}s ({_elapsed / 60:.1f}min)")
             if self.accelerator.is_main_process:
                 self.logger.record_startup_time(_elapsed)
@@ -2782,15 +2931,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         except StopIteration:
                             with self.timer('reset_batch:reg'):
                                 # hit the end of an epoch, reset
-                                if self.progress_bar is not None:
-                                    self.progress_bar.pause()
                                 dataloader_iterator_reg = iter(dataloader_reg)
-                                trigger_dataloader_setup_epoch(dataloader_reg)
+                                trigger_dataloader_setup_epoch(dataloader_reg, self.step_num)
 
                             with self.timer('get_batch:reg'):
                                 batch = next(dataloader_iterator_reg)
-                            if self.progress_bar is not None:
-                                self.progress_bar.unpause()
                         is_reg_step = True
                     elif dataloader is not None:
                         try:
@@ -2799,10 +2944,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         except StopIteration:
                             with self.timer('reset_batch'):
                                 # hit the end of an epoch, reset
-                                if self.progress_bar is not None:
-                                    self.progress_bar.pause()
                                 dataloader_iterator = iter(dataloader)
-                                trigger_dataloader_setup_epoch(dataloader)
+                                trigger_dataloader_setup_epoch(dataloader, self.step_num)
                                 self.epoch_num += 1
                                 if self.train_config.gradient_accumulation_steps == -1:
                                     # if we are accumulating for an entire epoch, trigger a step
@@ -2810,8 +2953,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     self.grad_accumulation_step = 0
                             with self.timer('get_batch'):
                                 batch = next(dataloader_iterator)
-                            if self.progress_bar is not None:
-                                self.progress_bar.unpause()
                     else:
                         batch = None
                     batch_list.append(batch)
@@ -2959,8 +3100,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             self.progress_bar.unpause()
 
                     if self.logging_config.log_every and self.step_num % self.logging_config.log_every == 0:
-                        if self.progress_bar is not None:
-                            self.progress_bar.pause()
                         with self.timer('log_to_tensorboard'):
                             # log to tensorboard
                             if self.accelerator.is_main_process:
@@ -2969,9 +3108,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                         for key, value in loss_dict.items():
                                             self.writer.add_scalar(f"{key}", value, self.step_num)
                                         self.writer.add_scalar(f"lr", learning_rate, self.step_num)
-                                if self.progress_bar is not None:
-                                    self.progress_bar.unpause()
-                        
+
                         if self.accelerator.is_main_process:
                             # log to logger
                             self.logger.log({
@@ -3007,22 +3144,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
 
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:
-                        if self.progress_bar is not None:
-                            self.progress_bar.pause()
                         # print the timers and clear them
                         self.timer.print()
                         self.timer.reset()
-                        if self.progress_bar is not None:
-                            self.progress_bar.unpause()
                 
                 # commit log
                 if self.accelerator.is_main_process:
                     with self.timer('commit_logger'):
                         self.logger.commit(step=self.step_num)
 
-                # sets progress bar to match out step
+                # sets progress bar to match our step (step is complete, so completed count is step + 1)
                 if self.progress_bar is not None:
-                    self.progress_bar.update(step - self.progress_bar.n)
+                    self.progress_bar.update(step + 1 - self.progress_bar.n)
 
                 #############################
                 # End of step

@@ -4,12 +4,13 @@ import json
 import os
 import shutil
 import sqlite3
+import statistics
 import asyncio
 import concurrent.futures
 import traceback
 from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
 from toolkit.config_modules import SampleConfig
-from toolkit.ui_utils import JobStoppedException
+from toolkit.ui_utils import JobStoppedException, SampleAbortedException, SampleSkippedException
 from typing import Literal, Optional
 import threading
 import time
@@ -21,6 +22,11 @@ AITK_Status = Literal["running", "stopped", "error", "completed"]
 
 
 class DiffusionTrainer(SDTrainer):
+    # How long the stop watcher waits for an in-flight checkpoint write before
+    # interrupting anyway. A write is seconds; this only exists so a wedged one
+    # can never make a job impossible to stop.
+    STOP_WATCHER_SAVE_GRACE_SEC = 300
+
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super(DiffusionTrainer, self).__init__(process_id, job, config, **kwargs)
         self.sqlite_db_path = self.config.get("sqlite_db_path", "./aitk_db.db")
@@ -35,7 +41,14 @@ class DiffusionTrainer(SDTrainer):
             self.is_ui_trainer = False
         else:
             print(f"Job ID: \"{self.job_id}\"")
-        
+
+        # >0 while a checkpoint write is pending or in flight. The stop watcher
+        # refuses to interrupt the main thread while this is raised, so a
+        # save-and-pause always gets its checkpoint. Set before the watcher
+        # thread can start, and unconditionally (save() runs for periodic saves
+        # even when this isn't a UI trainer).
+        self._save_guard = 0
+
         if self.is_ui_trainer:
             self.is_stopping = False
             # Create a thread pool for database operations
@@ -44,8 +57,22 @@ class DiffusionTrainer(SDTrainer):
             self._async_tasks = []
             # Initialize the status
             self._run_async_operation(self._update_status("running", "Starting"))
+            # A job that is only now starting cannot have a checkpoint write
+            # pending, so `stop_after_save` here can only be a leftover from a
+            # previous run -- and a leftover is fatal: hook_before_model_load()
+            # calls maybe_stop() before the model is even loaded, so a stale flag
+            # stops the job dead within milliseconds and it silently drops out of
+            # the queue with no error to show for it. Clear it here rather than
+            # trusting whoever launched us: this is the one point every launch
+            # path (Node's startJob and run_ui.py's hot-model handoff) shares.
+            self.update_db_key("stop_after_save", 0)
             self._stop_watcher_started = False
-            # self.start_stop_watcher(interval_sec=2.0)
+            if os.name == "nt":
+                # On Windows the stop route cannot send us SIGINT from outside
+                # (no console to deliver a Ctrl+C to), so watch the stop flag
+                # and raise the interrupt from inside. On Linux the route
+                # sends a real SIGINT to the pid and this is unnecessary.
+                self.start_stop_watcher(interval_sec=2.0)
 
         # Alert detection state (maintained regardless of is_ui_trainer so the
         # rolling history works even for non-UI runs — only DB writes are gated)
@@ -54,6 +81,14 @@ class DiffusionTrainer(SDTrainer):
         self._last_spike_step: int = -1
         self._spike_streak: int = 0
         self._baseline_sample_avg_bytes: float | None = None
+        # Stall detection state (separate, longer horizon than spike detection above —
+        # a spike is a single bad step, a stall is loss never improving over thousands
+        # of steps, e.g. automagic3's per-tensor LR decaying to near-zero before it
+        # fits anything). See _check_loss_stall.
+        self._stall_window: deque = deque(maxlen=300)
+        self._stall_best_median: float | None = None
+        self._stall_best_step: int = 0
+        self._last_stall_alert_step: int = -1
 
     def start_stop_watcher(self, interval_sec: float = 5.0):
         """
@@ -71,29 +106,43 @@ class DiffusionTrainer(SDTrainer):
         t.start()
 
     def _stop_watcher_thread(self, interval_sec: float):
+        deferred_since: float | None = None
         while True:
             try:
                 if self.should_stop():
-                    # Mark and update status (non-blocking; uses existing infra)
-                    self.is_stopping = True
-                    self._run_async_operation(
-                        self._update_status("stopped", "Job stopped (remote)")
-                    )
-                    # Best-effort flush pending async ops
-                    try:
-                        asyncio.run(self.wait_for_all_async())
-                    except RuntimeError:
-                        pass
-                    # Try to stop DB thread pool quickly
-                    try:
-                        self.thread_pool.shutdown(wait=False, cancel_futures=True)
-                    except TypeError:
-                        self.thread_pool.shutdown(wait=False)
+                    if self.is_stopping:
+                        # maybe_stop() already started the graceful shutdown;
+                        # a second interrupt would only break its cleanup.
+                        return
+                    # `stop` now unambiguously means "interrupt now" -- the
+                    # save-then-stop buttons use stop_after_save, which this
+                    # thread never looks at. The only thing worth waiting for
+                    # is a checkpoint write already in flight, since killing
+                    # mid-write leaves a truncated file. Bounded purely so a
+                    # wedged write can't make a job unstoppable.
+                    if self._save_guard > 0:
+                        now = time.time()
+                        if deferred_since is None:
+                            deferred_since = now
+                        if now - deferred_since < self.STOP_WATCHER_SAVE_GRACE_SEC:
+                            time.sleep(interval_sec)
+                            continue
+                        print("")
+                        print(
+                            f"Checkpoint write still running after "
+                            f"{self.STOP_WATCHER_SAVE_GRACE_SEC}s; stopping anyway."
+                        )
                     print("")
                     print("****************************************************")
                     print("    Stop signal received; terminating process.      ")
                     print("****************************************************")
-                    os.kill(os.getpid(), signal.SIGINT)
+                    # Deliver a real KeyboardInterrupt to the main thread so
+                    # on_error runs the normal shutdown (final DB write, last
+                    # log). os.kill(pid, SIGINT) must not be used here: on
+                    # Windows it is TerminateProcess and kills us instantly.
+                    # Leave the thread pool alone -- on_error still needs it.
+                    signal.raise_signal(signal.SIGINT)
+                    return
                 time.sleep(interval_sec)
             except Exception:
                 time.sleep(interval_sec)
@@ -180,9 +229,30 @@ class DiffusionTrainer(SDTrainer):
 
         return self._retry_db_operation(_check_return_to_queue)
 
+    def should_stop_after_save(self):
+        """Cooperative 'save then stop' (our save-and-pause). Deliberately a
+        separate flag from `stop`: the stop-watcher thread raises SIGINT the
+        moment it sees `stop`, which killed the training step before the
+        checkpoint was ever written. Nothing watches this one but maybe_stop()."""
+        if not self.is_ui_trainer:
+            return False
+        def _check():
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT stop_after_save FROM Job WHERE id = ?", (self.job_id,))
+                row = cursor.fetchone()
+                return False if row is None else row[0] == 1
+
+        return self._retry_db_operation(_check)
+
+    def reset_stop_after_save(self):
+        if self.accelerator.is_main_process and self.is_ui_trainer:
+            self.update_db_key("stop_after_save", 0)
+
     def should_save(self):
         # Reads the `save_now` flag (ostris' canonical on-demand-save schema).
-        # Save-and-pause sets `save_now` + `stop` together; see maybe_save/save.
+        # Save-and-pause pairs it with `stop_after_save`; see maybe_save/maybe_stop.
         if not self.is_ui_trainer:
             return False
         def _check_save():
@@ -199,52 +269,134 @@ class DiffusionTrainer(SDTrainer):
         if self.accelerator.is_main_process and self.is_ui_trainer:
             self.update_db_key("save_now", 0)
 
-    def should_sample(self):
-        if not self.is_ui_trainer:
-            return False
-
-        def _check_sample():
-            with self._db_connect() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT sample FROM Job WHERE id = ?", (self.job_id,))
-                sample = cursor.fetchone()
-                return False if sample is None else sample[0] == 1
-
-        return _check_sample()
-
     def reset_sample(self):
         if self.accelerator.is_main_process and self.is_ui_trainer:
             self.update_db_key("sample", False)
 
+    def should_stop_sample(self):
+        """The 'Return to Training' button: abandon the sample, keep training."""
+        if not self.is_ui_trainer:
+            return False
+
+        def _check():
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT stop_sample FROM Job WHERE id = ?", (self.job_id,))
+                row = cursor.fetchone()
+                return False if row is None else row[0] == 1
+
+        return self._retry_db_operation(_check)
+
+    def reset_stop_sample(self):
+        if self.accelerator.is_main_process and self.is_ui_trainer:
+            self.update_db_key("stop_sample", False)
+
+    def should_skip_sample(self):
+        """The 'Skip' button on the live preview: abandon only the clip
+        currently rendering, unlike stop_sample which abandons the whole
+        batch. Checked every denoise step via the maybe_skip hook below, not
+        just once per image, so it lands within one step of being clicked."""
+        if not self.is_ui_trainer:
+            return False
+
+        def _check():
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT skip_sample FROM Job WHERE id = ?", (self.job_id,))
+                row = cursor.fetchone()
+                return False if row is None else row[0] == 1
+
+        return self._retry_db_operation(_check)
+
+    def reset_skip_sample(self):
+        if self.accelerator.is_main_process and self.is_ui_trainer:
+            self.update_db_key("skip_sample", False)
+
+    def _maybe_skip_sample_hook(self):
+        """Registered on the model via add_maybe_skip_hook; raises to unwind
+        out of the current clip's denoise loop. See BaseModel.maybe_skip_sample
+        and generate_images, which catches this around the single-image call."""
+        if self.should_skip_sample():
+            self.reset_skip_sample()
+            raise SampleSkippedException("Sample skipped by user")
+
+    def _reset_control_flags(self):
+        """Clear the on-demand control flags (and the launcher-owned `pid`) once
+        this job has committed to a terminal state (stopped/queued). Node never
+        clears these on a clean, self-reported exit -- see the comment on
+        watchDetachedJob in ui/cron/actions/startJob.ts -- so if we don't do it
+        here they persist forever and the UI keeps treating the row as busy/in
+        flight (stale pid, stop/save/save_now still set)."""
+        if self.accelerator.is_main_process and self.is_ui_trainer:
+            self.update_db_key("stop", False)
+            self.update_db_key("save", False)
+            self.update_db_key("save_now", 0)
+            self.update_db_key("return_to_queue", False)
+            # Must be cleared here, not only in the should_stop_after_save()
+            # branch below. Save and Stop Queue sets return_to_queue AND
+            # stop_after_save together, and maybe_stop() checks return_to_queue
+            # first -- so that branch raises and the reset in the stop_after_save
+            # branch is never reached, leaving the flag set forever.
+            self.update_db_key("stop_after_save", 0)
+            self.update_db_key("pid", None)
+
     def maybe_stop(self):
         if not self.is_ui_trainer:
             return
+        # Hard stop: the user asked to stop now, nothing to wait for.
         if self.should_stop():
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
+            self._reset_control_flags()
             self.is_stopping = True
             raise JobStoppedException("Job stopped")
+        # Cooperative stops below must never pre-empt a pending save --
+        # save-and-pause / save-and-requeue set save_now alongside them and the
+        # checkpoint has to land first. maybe_save() clears save_now, so these
+        # fire on the very next call (including save()'s own trailing one).
+        if self.should_save():
+            return
         if self.should_return_to_queue():
             self._run_async_operation(
                 self._update_status("queued", "Job queued"))
+            self._reset_control_flags()
             self.is_stopping = True
             raise JobStoppedException("Job returning to queue")
+        if self.should_stop_after_save():
+            self.reset_stop_after_save()
+            self._run_async_operation(
+                self._update_status("stopped", "Job stopped"))
+            self._reset_control_flags()
+            self.is_stopping = True
+            raise JobStoppedException("Job stopped")
 
     def maybe_save(self):
+        """Returns True if a checkpoint was actually written this step, so the
+        caller can tell maybe_sample() not to write an identical one again."""
         if not self.is_ui_trainer:
-            return
+            return False
         if self.should_save():
-            self.reset_save()
-            if self.progress_bar is not None:
-                self.progress_bar.pause()
-            print_acc(f"\nSaving at step {self.step_num}")
-            self.optimizer.zero_grad()
-            self.save(self.step_num)
-            self.ensure_params_requires_grad()
-            flush()
-            if self.progress_bar is not None:
-                self.progress_bar.unpause()
+            # raise the guard before reset_save() clears the flag, so there is no
+            # window where the watcher sees `stop` with no save pending and kills
+            # the step before the write starts
+            self._save_guard += 1
+            try:
+                self.reset_save()
+                if self.progress_bar is not None:
+                    self.progress_bar.pause()
+                print_acc(f"\nSaving at step {self.step_num}")
+                self.optimizer.zero_grad()
+                self.save(self.step_num)
+                self.ensure_params_requires_grad()
+                flush()
+                if self.progress_bar is not None:
+                    self.progress_bar.unpause()
+            finally:
+                self._save_guard -= 1
+            return True
+        return False
 
 
     def reload_sample_config(self):
@@ -293,14 +445,25 @@ class DiffusionTrainer(SDTrainer):
                 return False if sample_now is None else sample_now[0] == 1
 
         return self._retry_db_operation(_check_sample_now)
-    def maybe_sample(self):
+
+    def maybe_sample(self, already_saved: bool = False):
         if not self.is_ui_trainer:
             return
         if self.should_sample():
             self.reload_sample_config()
             self.reset_sample()
-            # save model and optimizer first as requested
-            self.save(self.step_num)
+            # clear any abort/skip left over from a previous sample. Without
+            # this a single stale flag would abort or skip every future
+            # sample, and nothing else ever clears it.
+            self.reset_stop_sample()
+            self.reset_skip_sample()
+            # save model and optimizer first as requested, UNLESS maybe_save()
+            # already wrote this exact step (both flags land together whenever
+            # Save Snapshot is clicked while an on-demand sample is pending).
+            # Saving twice rewrote the same checkpoint and made save() archive
+            # the optimizer it had just written as optimizer_<thisstep>.pt.
+            if not already_saved:
+                self.save(self.step_num)
             # then sample
             self.sample(self.step_num)
 
@@ -311,6 +474,8 @@ class DiffusionTrainer(SDTrainer):
             return
         if self.should_sample_now():
             self.update_db_key("sample_now", 0)
+            self.reset_stop_sample()
+            self.reset_skip_sample()
             if self.progress_bar is not None:
                 self.progress_bar.pause()
             print_acc(f"\nSampling at step {self.step_num}")
@@ -361,10 +526,87 @@ class DiffusionTrainer(SDTrainer):
 
         await self._execute_db_operation(_do_update)
 
+    async def _update_step_and_epoch(self):
+        if not self.accelerator.is_main_process:
+            return
+
+        def _do_update():
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor.execute(
+                        "UPDATE Job SET step = ?, epoch = ? WHERE id = ?",
+                        (int(self.step_num), int(self.epoch_num), self.job_id)
+                    )
+                except Exception:
+                    try:
+                        cursor.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+                else:
+                    cursor.execute("COMMIT")
+
+        await self._execute_db_operation(_do_update)
+
     def update_step(self):
-        """Non-blocking update of the step count."""
+        """Non-blocking update of the step count (and the epoch it belongs to).
+
+        Both columns go out in a single UPDATE so the UI can never read a step
+        from one moment paired with an epoch from another.
+        """
         if self.accelerator.is_main_process and self.is_ui_trainer:
-            self._run_async_operation(self._update_key("step", self.step_num))
+            self._note_epoch_progress()
+            self._run_async_operation(self._update_step_and_epoch())
+
+    def _persist_steps_per_epoch(self):
+        """Mark epoch tracking as live for this session but not yet measured.
+
+        -1 is a sentinel meaning "this job reports epochs, length still unknown";
+        0 means "no epoch info at all" (a job that has not run since the epoch
+        columns were added). The UI distinguishes the two so it can show the epoch
+        number immediately and add the projected total once one is measured."""
+        try:
+            self.update_db_key("steps_per_epoch", -1.0)
+        except Exception as e:
+            print(f"[AITK] Warning: could not flag epoch tracking: {e}")
+
+    # --- epoch length measurement -------------------------------------------
+    # len(dataloader) is NOT the number of iterations the train loop pulls in a
+    # pass (bucketed datasets batch inside the dataset, reg datasets alternate,
+    # and the dataset can change size between sessions), so epoch length is
+    # measured from observed rollovers instead: the gap between two consecutive
+    # increments of epoch_num is exactly one epoch, by definition.
+    _prev_rollover_step = None
+    _last_epoch_seen = None
+
+    def _note_epoch_progress(self):
+        """Called once per step. Writes steps_per_epoch after a full epoch is observed."""
+        try:
+            ep = int(self.epoch_num)
+            st = int(self.step_num)
+            if self._last_epoch_seen is None:
+                self._last_epoch_seen = ep
+                return
+            if ep == self._last_epoch_seen:
+                return
+            self._last_epoch_seen = ep
+            if self._prev_rollover_step is None:
+                # We joined this epoch partway through (fresh start or resume), so
+                # its span is a lower bound, not a measurement. Anchor and measure
+                # from the next rollover onward.
+                self._prev_rollover_step = st
+                return
+            span = st - self._prev_rollover_step
+            self._prev_rollover_step = st
+            if span > 0:
+                # Most recent epoch only, not an average: the dataset can grow
+                # mid-run (datasets get added between sessions) and the latest
+                # span is the one that projects the remaining steps correctly.
+                self.update_db_key("steps_per_epoch", float(span))
+        except Exception as e:
+            print(f"[AITK] Warning: could not measure epoch length: {e}")
 
     def load_training_state_from_metadata_if_available(self):
         """Read step/epoch from the latest checkpoint metadata without loading weights.
@@ -561,6 +803,17 @@ class DiffusionTrainer(SDTrainer):
                 self.thread_pool.shutdown(wait=True)
 
     def handle_timing_print_hook(self, timing_dict):
+        # pull the rate from the progress bar's EMA so the UI matches it exactly
+        rate = None  # iter/sec
+        if self.progress_bar is not None:
+            rate = self.progress_bar.format_dict.get("rate")
+        if rate:
+            if rate >= 1:
+                self.update_db_key("speed_string", f"{rate:.2f} iter/sec")
+            else:
+                self.update_db_key("speed_string", f"{1 / rate:.2f} sec/iter")
+            return
+        # fallback: bar not available yet (no rate until its first refresh)
         if "train_loop" not in timing_dict:
             print("train_loop not found in timing_dict", timing_dict)
             return
@@ -623,17 +876,69 @@ class DiffusionTrainer(SDTrainer):
             })
             self.preserve_safe_snapshot("loss_spike")
 
+    # Rolling-median window for stall detection, how long loss can go without a
+    # new low before we call it stalled, how much improvement counts as a genuine
+    # new low (filters noise so a run doesn't reset its own clock every step), and
+    # how early training can start being evaluated. Calibrated against this
+    # project's own run history: every labelled-good ACE-Step run (including
+    # noisy automagic2/3 runs that dip and partially recover mid-run) went at
+    # most ~2,600 steps without a new low; every automagic3 run that flatlined
+    # and never recovered went >=3,750 steps. 3000 sits in that gap.
+    STALL_WINDOW = 300
+    STALL_PATIENCE = 3000
+    STALL_MARGIN = 0.01
+    STALL_MIN_STEP = 2500
+
+    def _check_loss_stall(self):
+        """Fire an alert if the loss hasn't set a new (meaningfully lower) rolling
+        median in STALL_PATIENCE steps.
+
+        Unlike _check_loss_spike (a single bad step), this catches a run that never
+        diverges but also never learns — e.g. automagic3's per-tensor LR decaying
+        toward its floor before the model fits anything, which produces a loss curve
+        that looks calm (no spikes) but never moves. A plain "loss went up over
+        window X" check would false-alarm on good automagic2/3 runs, which are
+        noisy and dip-then-partially-recover mid-run without ever being stalled;
+        tracking the best-seen rolling median (like early-stopping patience) avoids
+        that because those runs keep setting new lows overall, just non-monotonically.
+        """
+        loss = getattr(self, '_last_step_loss', 0.0)
+        self._stall_window.append(loss)
+        if self.step_num < self.STALL_MIN_STEP or len(self._stall_window) < self.STALL_WINDOW:
+            return
+        median = statistics.median(self._stall_window)
+        if self._stall_best_median is None or median < self._stall_best_median * (1 - self.STALL_MARGIN):
+            self._stall_best_median = median
+            self._stall_best_step = self.step_num
+            return
+        gap = self.step_num - self._stall_best_step
+        if (gap >= self.STALL_PATIENCE
+                and self.step_num - self._last_stall_alert_step >= self.STALL_PATIENCE):
+            self._last_stall_alert_step = self.step_num
+            msg = (f"Loss hasn't improved in {gap} steps (best {self._stall_best_median:.4f} "
+                   f"at step {self._stall_best_step}, currently {median:.4f}). This matches "
+                   f"the stall pattern seen in past runs that never recovered — worth checking "
+                   f"the optimizer/LR rather than waiting it out.")
+            print(f"\n[AITK] ⚠ {msg}")
+            self.append_alert("loss_stalled", msg, {
+                "best_median": self._stall_best_median,
+                "best_step": self._stall_best_step,
+                "current_median": median,
+                "gap_steps": gap,
+            })
+
     def end_step_hook(self):
         super(DiffusionTrainer, self).end_step_hook()
         self._check_loss_spike()
+        self._check_loss_stall()
         if self.is_ui_trainer:
             self.update_step()
             # Order matters: maybe_save() runs before maybe_stop() so that
             # save-and-pause (save_now + stop set together) writes the checkpoint
             # before the stop is raised. save()'s trailing maybe_stop() then stops
             # cleanly. maybe_sample() is our on-demand sample feature.
-            self.maybe_save()
-            self.maybe_sample()
+            saved_this_step = self.maybe_save()
+            self.maybe_sample(already_saved=saved_this_step)
             self.maybe_sample_now()
             self.maybe_stop()
             self.maybe_sample()
@@ -698,6 +1003,7 @@ class DiffusionTrainer(SDTrainer):
             self.update_status("running", "Training")
             self.timer.add_after_print_hook(self.handle_timing_print_hook)
             self._persist_dataset_stats()
+            self._persist_steps_per_epoch()
 
     def status_update_hook_func(self, string):
         self.update_status("running", string)
@@ -708,11 +1014,15 @@ class DiffusionTrainer(SDTrainer):
             self.maybe_stop()
             self.sd.add_status_update_hook(self.status_update_hook_func)
             self.sd.add_maybe_stop_hook(self.maybe_stop)
+            self.sd.add_maybe_skip_hook(self._maybe_skip_sample_hook)
 
     def sample_step_hook(self, img_num, total_imgs):
         super().sample_step_hook(img_num, total_imgs)
         if self.is_ui_trainer:
             self.maybe_stop()
+            if self.should_stop_sample():
+                raise SampleAbortedException(
+                    "Sample generation aborted by user")
             self.update_status(
                 "running", f"Generating images - {img_num + 1}/{total_imgs}")
 
@@ -727,6 +1037,13 @@ class DiffusionTrainer(SDTrainer):
                 super().sample(step, is_first)
             except JobStoppedException:
                 raise
+            except SampleAbortedException:
+                # user hit Return to Training: drop the remaining prompts and
+                # carry on. Clearing the flag here is what makes the next
+                # sample possible at all.
+                print_acc(f"\nSample generation aborted by user at step {step}")
+                self.reset_stop_sample()
+                self.sd._after_sample_failure()
             except Exception as e:
                 if self.sample_only:
                     raise
@@ -764,7 +1081,12 @@ class DiffusionTrainer(SDTrainer):
         # do NOT. Save-and-pause sets save_now + stop together, so a leading
         # maybe_stop() would raise before the model is ever written to disk. The
         # trailing maybe_stop() below handles the stop cleanly after the save.
-        self.update_status("running", "Saving model")
-        super().save(step)
+        # The guard keeps the stop watcher from interrupting the write half-done.
+        self._save_guard += 1
+        try:
+            self.update_status("running", "Saving model")
+            super().save(step)
+        finally:
+            self._save_guard -= 1
         self.maybe_stop()
         self.update_status("running", "Training")

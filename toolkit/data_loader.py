@@ -21,7 +21,7 @@ from toolkit.buckets import get_bucket_for_image_size, BucketResolution
 from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
 from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin, read_text_file
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
-from toolkit.print import print_acc
+from toolkit.print import print_acc, print_timing
 from toolkit.accelerator import get_accelerator
 
 import platform
@@ -406,6 +406,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.is_caching_clip_vision_to_disk = dataset_config.cache_clip_vision_to_disk
         self.is_generating_controls = len(dataset_config.controls) > 0
         self.epoch_num = 0
+        self.current_step = 0   # set by trigger_dataloader_setup_epoch
+        self.is_retired = False  # past dataset_config.stop_after_step
 
         self.sd = sd
 
@@ -429,10 +431,23 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             if self.is_audio_model:
                 # only look for audio files
                 extensions = audio_extensions
-            elif self.is_video:
-                # only look for videos
-                extensions = video_extensions
-            file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if file.lower().endswith(tuple(extensions)) and not file.startswith('.')]
+            else:
+                if self.is_video:
+                    # look for videos and images. Video models can train on both;
+                    # images are bucketed separately as single-frame items
+                    extensions = video_extensions + image_extensions
+                # Joint video+audio models additionally train standalone audio files as
+                # voice items. NOT nested under is_video: a voice-only dataset legitimately
+                # has num_frames=1 (each item takes its frame count from its own duration),
+                # so gating on the dataset being "video" would make its clips invisible.
+                # do_audio still gates it, so no existing dataset picks up loose .wav files.
+                if getattr(self.sd, 'supports_audio_only_items', False) and dataset_config.do_audio:
+                    extensions = extensions + audio_extensions
+            # prune hidden dirs (.thumbs, .tmp) so their contents never train
+            file_list = []
+            for root, dirs, files in os.walk(self.dataset_path):
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                file_list.extend(os.path.join(root, file) for file in files if file.lower().endswith(tuple(extensions)) and not file.startswith('.'))
         else:
             # assume json
             with open(self.dataset_path, 'r') as f:
@@ -527,16 +542,32 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     sd=self.sd,
                     path=file,
                     is_audio_model=self.is_audio_model,
+                    # gates the first_frame_condition cache-key marker to models that
+                    # actually precompute it, so other i2v archs keep their caches
+                    caches_first_frame_condition=(
+                        getattr(self.sd, 'encode_first_frame_condition_for_cache', None)
+                        is not None if self.sd else False),
                     dataset_config=dataset_config,
                     dataloader_transforms=self.transform,
                     size_database=self.size_database,
                     dataset_root=dataset_folder,
                     encode_control_in_text_embeddings=self.sd.encode_control_in_text_embeddings if self.sd else False,
+                    encode_first_frame_in_text_embeddings=getattr(self.sd, 'encode_first_frame_in_text_embeddings', False) if self.sd else False,
+                    dopsd_self_ref=getattr(self.sd, 'dopsd_self_ref', False) if self.sd else False,
                     text_embedding_space_version=self.sd.text_embedding_space_version if self.sd else "sd1",
                     te_padding_side=self.sd.te_padding_side if self.sd else "right",
                     latent_space_version=latent_space_version,
                     temporal_compression=temporal_compression,
                     sample_rate=self.sd.sample_rate if self.is_audio_model and self.sd is not None else 48000,
+                    # non-None only for models that train standalone audio as voice
+                    # items; also what FileItemDTO uses to detect one.
+                    audio_grid=(
+                        self.sd.get_audio_grid()
+                        if self.sd is not None
+                        and getattr(self.sd, 'supports_audio_only_items', False)
+                        and dataset_config.do_audio
+                        else None
+                    ),
                 )
                 self.file_list.append(file_item)
             except Exception as e:
@@ -548,12 +579,30 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 print_acc(e)
                 bad_count += 1
 
+        # Voice items have no pixels: their video side is a zeros latent the model builds
+        # directly, so there is nothing for the non-cached path (which VAE-encodes
+        # batch.tensor every step) to work from. Fail here with something actionable
+        # rather than at the first batch with an AttributeError on a None tensor.
+        num_voice = len([x for x in self.file_list if getattr(x, 'is_audio_only', False)])
+        if num_voice > 0 and not self.is_caching_latents:
+            raise ValueError(
+                f"{self.dataset_path}: found {num_voice} audio-only (voice) item(s), which "
+                f"require latent caching. Set cache_latents_to_disk: true on this dataset."
+            )
+        if num_voice > 0:
+            print_acc(f"  -  Found {num_voice} voice items (audio-only, video loss zeroed)")
+
         # save the size database
         with open(dataset_size_file, 'w') as f:
             json.dump(self.size_database, f)
         
         if self.is_video:
-            print_acc(f"  -  Found {len(self.file_list)} videos")
+            num_videos = len([x for x in self.file_list if x.is_video])
+            num_images = len(self.file_list) - num_videos
+            if num_images > 0:
+                print_acc(f"  -  Found {num_videos} videos and {num_images} images")
+            else:
+                print_acc(f"  -  Found {num_videos} videos")
             assert len(self.file_list) > 0, f"no videos found in {self.dataset_path}"
         else:
             print_acc(f"  -  Found {len(self.file_list)} images")
@@ -591,24 +640,64 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         if self.epoch_num == 0:
             # initial setup
             # do not call for now
+            # Phase timing: the per-item cache *checks* here (hashing paths,
+            # stat-ing cache files) can cost far more than the caching itself,
+            # which the progress bars make look instant.
+            import time as _ep_time
+            _ep_mark = _ep_time.time()
+
+            def _ep_phase(label):
+                nonlocal _ep_mark
+                _now = _ep_time.time()
+                print_timing(f"   [dataset] {label}: {_now - _ep_mark:.1f}s")
+                _ep_mark = _now
+
             if self.dataset_config.buckets:
                 # setup buckets
                 print_acc(" - Setting up buckets...")
                 self.setup_buckets()
+                _ep_phase("setup_buckets")
             if self.is_caching_latents:
                 print_acc(" - Caching latents...")
                 self.cache_latents_all_latents()
+                _ep_phase("cache_latents_all_latents")
             if self.is_caching_clip_vision_to_disk:
                 print_acc(" - Caching CLIP vision...")
                 self.cache_clip_vision_to_disk()
+                _ep_phase("cache_clip_vision_to_disk")
             if self.is_caching_text_embeddings:
                 print_acc(" - Caching text embeddings...")
                 self.cache_text_embeddings()
+                _ep_phase("cache_text_embeddings")
             if self.is_generating_controls:
                 # always do this last
                 print_acc(" - Setting up controls...")
                 self.setup_controls()
+                _ep_phase("setup_controls")
         self.epoch_num += 1
+
+        # Per-dataset retirement. setup_buckets() early-returns after the first epoch, so
+        # the batch list is otherwise fixed for the run -- rebuild it here on the tick the
+        # dataset crosses its cutoff. The check is at the loader WRAP, so retirement lands
+        # at the next wrap after the step, not exactly on it; the log reports the real step
+        # rather than echoing the configured one.
+        stop_at = self.dataset_config.stop_after_step
+        if stop_at is not None and not getattr(self, 'is_retired', False):
+            if self.current_step >= int(stop_at):
+                self.is_retired = True
+                self.build_batch_indices()
+                print_acc(
+                    f" - Retiring dataset {self.dataset_path} at step {self.current_step} "
+                    f"(stop_after_step={stop_at}); its items will no longer be sampled."
+                )
+
+    def __getstate__(self):
+        # on Windows/macOS dataloader workers are spawned, which pickles the dataset.
+        # sd (the model) is not picklable (weakrefs, cuda tensors) and is only needed
+        # for caching, which runs in the main process before iteration starts.
+        state = self.__dict__.copy()
+        state['sd'] = None
+        return state
 
     def __len__(self):
         if self.dataset_config.buckets:
@@ -656,6 +745,13 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             return self._get_single_item(item)
 
 
+def dto_collation(batch: List['FileItemDTO']):
+    # must be a module level function so spawned dataloader workers can pickle it
+    return DataLoaderBatchDTO(
+        file_items=batch
+    )
+
+
 def validate_control_paths(dataset_configs: list):
     """Check all control images exist before loading the model."""
     from toolkit.config_modules import DatasetConfig
@@ -674,11 +770,16 @@ def validate_control_paths(dataset_configs: list):
         if dataset_path is None or not os.path.isdir(dataset_path):
             continue
 
-        img_files = [
-            f for root, _, files in os.walk(dataset_path)
-            for f in files
-            if f.lower().endswith(tuple(image_extensions)) and not f.startswith('.')
-        ]
+        # prune hidden dirs (.thumbs, .tmp) exactly like the real dataset scan
+        # does -- otherwise UI thumbnails (<original name>.jpg) get validated as
+        # if they were training images and never match a control file
+        img_files = []
+        for root, dirs, files in os.walk(dataset_path):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            img_files.extend(
+                f for f in files
+                if f.lower().endswith(tuple(image_extensions)) and not f.startswith('.')
+            )
 
         for img_file in img_files:
             stem = os.path.splitext(img_file)[0]
@@ -725,7 +826,9 @@ def get_dataloader_from_datasets(
     for config in dataset_config_list:
 
         if config.type == 'image':
-            dataset = AiToolkitDataset(config, batch_size=batch_size, sd=sd)
+            # dataset level batch_size overrides the train config batch_size when set
+            dataset_batch_size = config.batch_size if config.batch_size is not None else batch_size
+            dataset = AiToolkitDataset(config, batch_size=dataset_batch_size, sd=sd)
             datasets.append(dataset)
             if config.buckets:
                 has_buckets = True
@@ -734,65 +837,94 @@ def get_dataloader_from_datasets(
         else:
             raise ValueError(f"invalid dataset type: {config.type}")
 
-    # When combine_datasets is set and we have more than one dataset, merge all file
-    # lists into the first dataset and re-run bucket assignment on the combined pool.
-    # Each FileItemDTO retains its own dataset_config so per-item settings are preserved.
+    # When combine_datasets is set, merge the file lists so several folders train as
+    # though their images sat in one folder: one shared bucket pool, so batches can mix
+    # images across folders instead of each small folder bucketing alone.
+    #
+    # Merging is per compatibility group, not global. setup_buckets() reads resolution,
+    # buckets, square_crop and bucket_tolerance off the *dataset-level* config
+    # (self.dataset_config) rather than off each item, so items pooled into a primary get
+    # bucketed with the primary's values. Datasets disagreeing on those cannot share a
+    # pool without silently re-bucketing someone's images.
+    #
+    # That is not an error case, though: preprocess_dataset_raw_config() splits a single
+    # dataset with resolution [512, 1024] into two configs on the same folder, so
+    # differing resolutions are the normal multi-resolution setup, and rejecting them
+    # broke ordinary jobs. Grouping gives the intended behaviour in both directions: two
+    # folders at 512 merge into one pool, while a folder at [512, 1024] keeps one pool
+    # per resolution. Two folders both at [512, 1024] yield two pools each holding both
+    # folders, which is what physically copying them together would produce.
     if combine_datasets and len(datasets) > 1:
-        base_config = datasets[0].dataset_config
-        for ds in datasets[1:]:
-            dc = ds.dataset_config
-            if dc.resolution != base_config.resolution:
-                raise ValueError(
-                    f"combine_datasets requires all datasets to have the same resolution "
-                    f"({base_config.resolution} vs {dc.resolution} for {dc.folder_path or dc.dataset_path})"
-                )
-            if dc.buckets != base_config.buckets:
-                raise ValueError(
-                    f"combine_datasets requires all datasets to have the same buckets setting"
-                )
-            if dc.square_crop != base_config.square_crop:
-                raise ValueError(
-                    f"combine_datasets requires all datasets to have the same square_crop setting"
-                )
-
-        combined_file_list = []
+        groups = {}
         for ds in datasets:
-            combined_file_list.extend(ds.file_list)
+            dc = ds.dataset_config
+            key = (dc.resolution, dc.buckets, dc.square_crop, dc.bucket_tolerance)
+            groups.setdefault(key, []).append(ds)
 
-        primary = datasets[0]
-        primary.file_list = combined_file_list
-        if has_buckets:
-            # primary.epoch_num was already bumped to 1 by its own setup_epoch()
-            # during construction above, and setup_buckets() no-ops once
-            # epoch_num > 0 (see dataloader_mixins.py) — without resetting it
-            # here, the merged file list from the other dataset(s) would never
-            # actually get assigned to a bucket.
-            primary.epoch_num = 0
-            primary.setup_buckets()
-            primary.epoch_num = 1
-        datasets = [primary]
+        combined_datasets = []
+        for group in groups.values():
+            primary = group[0]
+            if len(group) > 1:
+                combined_file_list = []
+                for ds in group:
+                    combined_file_list.extend(ds.file_list)
+                primary.file_list = combined_file_list
+                if primary.dataset_config.buckets:
+                    # primary.epoch_num was already bumped to 1 by its own setup_epoch()
+                    # during construction above, and setup_buckets() no-ops once
+                    # epoch_num > 0 (see dataloader_mixins.py), so without resetting it
+                    # here the merged file list from the other dataset(s) would never
+                    # actually get assigned to a bucket.
+                    primary.epoch_num = 0
+                    primary.setup_buckets()
+                    primary.epoch_num = 1
+            combined_datasets.append(primary)
+
+        if len(combined_datasets) != len(datasets):
+            summary = ", ".join(
+                f"{len(g)} @ {key[0]}px" for key, g in groups.items()
+            )
+            print_acc(
+                f" - Combining {len(datasets)} datasets into "
+                f"{len(combined_datasets)} shared pool(s): {summary}"
+            )
+        datasets = combined_datasets
 
     concatenated_dataset = ConcatDataset(datasets)
 
     # todo build scheduler that can get buckets from all datasets that match
     # todo and evenly distribute reg images
 
-    def dto_collation(batch: List['FileItemDTO']):
-        # create DTO batch
-        batch = DataLoaderBatchDTO(
-            file_items=batch
-        )
-        return batch
-
     # check if is caching latents
 
     dataloader_kwargs = {}
-    
-    if is_native_windows() or is_macos():
-        dataloader_kwargs['num_workers'] = 0
-    else:
-        dataloader_kwargs['num_workers'] = dataset_config_list[0].num_workers
+
+    dataloader_kwargs['num_workers'] = dataset_config_list[0].num_workers
+    if dataloader_kwargs['num_workers'] > 0:
         dataloader_kwargs['prefetch_factor'] = dataset_config_list[0].prefetch_factor
+        # keep workers alive across epochs. Without this, spawn platforms (Windows/macOS)
+        # boot new worker processes every epoch, which can take longer than the epoch
+        # itself on small datasets. The dataset is static after epoch 0 (setup_epoch only
+        # does work on the first call) and per-epoch shuffling happens in the main process
+        # sampler, so workers never hold stale state.
+        dataloader_kwargs['persistent_workers'] = True
+        # spawned workers re-import the full stack at boot and would repeat every
+        # import-time warning the parent already printed. Children inherit these env
+        # vars; the parent is unaffected since its imports already happened.
+        os.environ.setdefault('PYTHONWARNINGS', 'ignore::FutureWarning')
+        os.environ.setdefault('TORCH_LOGS', '-torch.utils._pytree')
+        os.environ.setdefault('DIFFUSERS_VERBOSITY', 'error')
+        os.environ.setdefault('NO_ALBUMENTATIONS_UPDATE', '1')
+
+    # Enable pinned memory only when explicitly opted in via dataset config and
+    # CUDA is available. pin_memory speeds up CPU->GPU transfer (helpful even at
+    # num_workers=0), but page-locked RAM cannot be relocated by NVIDIA's
+    # Windows driver shared-memory VRAM-overflow fallback, which can cause
+    # severe PCIe thrashing for users at the VRAM ceiling. Off by default; opt
+    # in via 'pin_memory: true' on the dataset config when VRAM headroom is
+    # stable.
+    if torch.cuda.is_available() and dataset_config_list[0].pin_memory:
+        dataloader_kwargs['pin_memory'] = True
 
     if has_buckets:
         # make sure they all have buckets
@@ -808,6 +940,13 @@ def get_dataloader_from_datasets(
             **dataloader_kwargs
         )
     else:
+        # without buckets the dataloader batches across all datasets at once,
+        # so a dataset level batch_size cannot apply
+        for config in dataset_config_list:
+            if config.batch_size is not None:
+                raise ValueError(
+                    f"Dataset level batch_size requires buckets to be enabled. Dataset {config.folder_path or config.dataset_path} has buckets disabled."
+                )
         data_loader = DataLoader(
             concatenated_dataset,
             batch_size=batch_size,
@@ -818,21 +957,28 @@ def get_dataloader_from_datasets(
     return data_loader
 
 
-def trigger_dataloader_setup_epoch(dataloader: DataLoader):
+def trigger_dataloader_setup_epoch(dataloader: DataLoader, current_step: int = 0):
     # hacky but needed because of different types of datasets and dataloaders
     dataloader.len = None
+
+    def _mark(ds):
+        # datasets need the step to evaluate stop_after_step; they have no other way to
+        # know where training is
+        ds.current_step = current_step
+        return ds
+
     if isinstance(dataloader.dataset, list):
         for dataset in dataloader.dataset:
             if hasattr(dataset, 'datasets'):
                 for sub_dataset in dataset.datasets:
                     if hasattr(sub_dataset, 'setup_epoch'):
-                        sub_dataset.setup_epoch()
+                        _mark(sub_dataset).setup_epoch()
                         sub_dataset.len = None
             elif hasattr(dataset, 'setup_epoch'):
-                dataset.setup_epoch()
+                _mark(dataset).setup_epoch()
                 dataset.len = None
     elif hasattr(dataloader.dataset, 'setup_epoch'):
-        dataloader.dataset.setup_epoch()
+        _mark(dataloader.dataset).setup_epoch()
         dataloader.dataset.len = None
     elif hasattr(dataloader.dataset, 'datasets'):
         dataloader.dataset.len = None

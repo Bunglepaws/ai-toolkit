@@ -1,16 +1,21 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Queue } from '@prisma/client';
 import { apiClient } from '@/utils/api';
 
-export default function useQueueList() {
+type UseQueueListProps = {
+  reloadInterval?: number | null;
+};
+
+export default function useQueueList({ reloadInterval = null }: UseQueueListProps = {}) {
   const [queues, setQueues] = useState<Queue[]>([]);
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const refreshQueues = () => {
+  const fetchQueues = () => {
     setStatus('loading');
-    apiClient
+    return apiClient
       .get('/api/queue')
       .then(res => res.data)
       .then(data => {
@@ -28,9 +33,29 @@ export default function useQueueList() {
         setStatus('error');
       });
   };
+
+  const scheduleNext = (delay: number) => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    if (!reloadInterval) return;
+    timerRef.current = setTimeout(async () => {
+      await fetchQueues();
+      scheduleNext(reloadInterval);
+    }, delay);
+  };
+
   useEffect(() => {
-    refreshQueues();
+    fetchQueues();
+    scheduleNext(reloadInterval || 0);
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const refreshQueues = () => {
+    fetchQueues();
+    scheduleNext(reloadInterval || 0);
+  };
 
   return { queues, setQueues, status, refreshQueues };
 }

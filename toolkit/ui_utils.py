@@ -11,10 +11,20 @@ class JobStoppedException(BaseException):
 
 
 class SampleAbortedException(BaseException):
-    """Raised mid-sample to abort image generation and resume training.
-    Inherits from BaseException so it bypasses DiffusionTrainer's broad
-    'except Exception' guard and propagates to UITrainer.sample() which
-    catches it and continues the training loop normally."""
+    """Raised mid-sample ('Return to Training') to abort the whole sample
+    batch and resume training. Inherits from BaseException so it bypasses
+    DiffusionTrainer.sample()'s broad 'except Exception' guard; that method
+    catches it specifically and continues the training loop normally."""
+    pass
+
+
+class SampleSkippedException(BaseException):
+    """Raised mid-denoise ('Skip') to abandon only the clip currently
+    rendering and move on to the next prompt in the batch, unlike
+    SampleAbortedException which abandons the whole batch. Inherits from
+    BaseException so it passes through any model pipeline's denoise loop
+    without being caught by a broad 'except Exception' there; BaseModel.
+    generate_images catches it around the single-image call."""
     pass
 
 

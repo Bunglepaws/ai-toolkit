@@ -235,20 +235,33 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
     def merge_in(self: 'FullModule', merge_weight=1.0):
         if not self.can_merge_in:
             return
-        om = self.org_module[0]
-        if 'weight._data' in om.state_dict():
-            # quanto quantized weight, can't merge
+        # a zero diff merges to identity: skip entirely (a quantized base would
+        # otherwise still get requantized, which is not lossless)
+        if not self.diff.any() and (self.diff_b is None or not self.diff_b.any()):
             return
-        org_weight = om.weight
-        orig_dtype = org_weight.dtype
-        # dequantize torchao weights so we can fold the full precision delta in
-        merged_weight = _dequantize_if_needed(org_weight).float() + merge_weight * self.diff.float().to(org_weight.device)
+        om = self.org_module[0]
+        if getattr(om, "is_ostris_quantized", False):
+            # fp32 dequant straight from the backend; the bf16 weight property
+            # would resample the quant scales on every merge cycle
+            orig_dtype = om.ostris_orig_dtype
+            base_weight = om.ostris_quantizer.dequantize(om)
+            weight_device = base_weight.device
+        else:
+            if 'weight._data' in om.state_dict():
+                # quanto quantized weight, can't merge
+                return
+            org_weight = om.weight
+            orig_dtype = org_weight.dtype
+            base_weight = _dequantize_if_needed(org_weight).float()
+            weight_device = org_weight.device
+        # fold the full precision delta in
+        merged_weight = base_weight + merge_weight * self.diff.float().to(weight_device)
         if self.weight_is_quantized:
             # re-quantize so the model stays quantized across continuous merge/reset cycles
             from toolkit.util.quantize import get_torchao_config, requantize_module_weight
             requantize_module_weight(om, merged_weight, orig_dtype, get_torchao_config(self._get_base_qtype()))
         else:
-            om.weight.data = merged_weight.to(org_weight.device, orig_dtype)
+            om.weight.data = merged_weight.to(weight_device, orig_dtype)
         # bias is never quantized
         if self.diff_b is not None and getattr(om, 'bias', None) is not None:
             om.bias.data = (om.bias.data.float() + merge_weight * self.diff_b.float().to(om.bias.device)).to(om.bias.dtype)
@@ -494,9 +507,18 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                         # - full_if_contains: any matching layer, INCLUDING linear/conv, overriding the
                         #   normal lora for it
                         all_layers = self.network_config is not None and getattr(self.network_config, 'all_layers', False)
+                        # read _parameters directly rather than `child_module.weight`:
+                        # quantized layers (OstrisLinear, Int8Embedding) expose `weight`
+                        # as a property that materializes the FULL dequantized tensor on
+                        # every access. Going through the property here dequantized every
+                        # quantized layer in the model just to type-check the result --
+                        # ~19B elements / ~2.5 min of pure waste on a quantized MiniMax H3,
+                        # plus the transient host allocations that went with it. The answer
+                        # is identical: a dequantized weight is a plain Tensor, never an
+                        # nn.Parameter, so this was always False for those layers anyway.
                         is_leaf_with_weight = (
                             len(list(child_module.children())) == 0
-                            and isinstance(getattr(child_module, 'weight', None), torch.nn.Parameter)
+                            and isinstance(child_module._parameters.get('weight', None), torch.nn.Parameter)
                         )
                         matches_full_if_contains = len(self.full_if_contains) > 0 and (
                             any([word in clean_name for word in self.full_if_contains])
@@ -511,8 +533,10 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                         if any([word in clean_name for word in self.ignore_if_contains]):
                             skip = True
 
-                        # see if it is over threshold
-                        if count_parameters(child_module) < parameter_threshold:
+                        # see if it is over threshold. guarded: the default threshold is
+                        # 0.0, where the comparison can never be true (numel >= 0), so
+                        # walking every subtree's parameters to compute it is wasted work.
+                        if parameter_threshold > 0 and count_parameters(child_module) < parameter_threshold:
                             skip = True
                         
                         if self.transformer_only and is_unet:

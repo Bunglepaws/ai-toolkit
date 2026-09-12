@@ -36,12 +36,25 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
   // cooperatively — the trainer finishes its step and saves before exiting, which
   // can take minutes. Until it actually exits it still holds the GPU, so the PID
   // has to stay so the queue's liveness check can see it.
+  // Clear the cooperative flags along with the status. They mean "do this at the
+  // next end_step_hook", and this run will never reach another one: we have just
+  // force-killed the process (taskkill /F on Windows) and set stop, which the
+  // watcher turns into an immediate interrupt. Left set, they are not inert --
+  // they are read by the NEXT launch, where a stale stop_after_save stops the job
+  // the moment it starts and a stale return_to_queue bounces it straight back to
+  // the queue, with nothing in the UI to explain either. Self-healing per the
+  // repo rule: the operation that owns the flag clears it rather than leaving it
+  // to break a future run.
   await prisma.job.update({
     where: { id: jobID },
     data: {
       stop: true,
       status: 'stopped',
       info: 'Job stopped',
+      save_now: false,
+      stop_after_save: false,
+      return_to_queue: false,
+      sample: false,
     },
   });
 

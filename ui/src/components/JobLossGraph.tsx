@@ -6,6 +6,7 @@ import { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import JobTrainingSessions from '@/components/JobTrainingSessions';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
+import { openConfirm } from '@/components/ConfirmModal';
 
 interface Props {
   job: Job;
@@ -26,6 +27,29 @@ function formatNum(v: number) {
 
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
+}
+
+// A constant metric (e.g. learning_rate under a constant scheduler) does not
+// reach the chart as bit-identical values: the zero-phase EMA below computes
+// s/w, which is algebraically the input but lands on a few adjacent float64
+// ULPs. Handing those extents straight to a y-scale zooms the axis into ~1e-20
+// of rounding noise and renders it as a full-height square wave. Anything
+// narrower than this (relative) span is noise, not signal.
+const DEGENERATE_SPAN_RATIO = 1e-9;
+
+function isDegenerateSpan(min: number, max: number): boolean {
+  const span = max - min;
+  if (!(span > 0)) return true;
+  const mag = Math.max(Math.abs(min), Math.abs(max));
+  return mag > 0 ? span <= mag * DEGENERATE_SPAN_RATIO : true;
+}
+
+// Widen a flat/degenerate domain to ±10% of its magnitude so the series draws
+// as a centered flat line instead of noise filling the canvas.
+function padDegenerate(min: number, max: number): [number, number] {
+  const center = (min + max) / 2;
+  const pad = center !== 0 ? Math.abs(center) * 0.1 : 1;
+  return [center - pad, center + pad];
 }
 
 // Fallback canvas height used before the container has been measured.
@@ -113,7 +137,8 @@ const PALETTE = [
 ];
 
 // Persisted, per-URL graph settings. Sliders + display toggles + which loss
-// series are visible. Zoom / highlighted window is intentionally NOT persisted.
+// series are visible, plus the x-axis zoom window so returning to a job's chart
+// restores the range you were looking at instead of refitting to all data.
 interface PersistedSettings {
   useLogScale: boolean;
   showTrend: boolean;
@@ -121,6 +146,9 @@ interface PersistedSettings {
   plotStride: number;
   clipOutliers: boolean;
   enabled: Record<string, boolean>;
+  // null = not zoomed (full range). Stale windows that no longer overlap the
+  // data (e.g. after a range delete) are discarded on restore.
+  zoom: { min: number; max: number } | null;
 }
 
 // Key by the exact URL so each job remembers its own settings independently.
@@ -139,7 +167,7 @@ function dulledColor(rgba: string): string {
 }
 
 export default function JobLossGraph({ job }: Props) {
-  const { series, lossKeys, status, refreshLoss, fullReset } = useJobLossLog(job.id, 2000);
+  const { series, lossKeys, status, refreshLoss, deleteRange } = useJobLossLog(job.id, 2000);
 
   // Controls
   const [useLogScale, setUseLogScale] = useState(false);
@@ -162,8 +190,10 @@ export default function JobLossGraph({ job }: Props) {
 
   const [isZoomed, setIsZoomed] = useState(false);
 
-  const [trimStep, setTrimStep] = useState('');
-  const [trimming, setTrimming] = useState(false);
+  // Persisted x-zoom window. The ref mirrors it so the chart-create effect can
+  // re-apply it without re-running on every zoom change.
+  const [zoom, setZoom] = useState<{ min: number; max: number } | null>(null);
+  const zoomRef = useRef<{ min: number; max: number } | null>(null);
 
   // Gate persistence writes until we've loaded any stored settings, so the
   // initial defaults don't clobber what was saved before the load effect runs.
@@ -178,6 +208,9 @@ export default function JobLossGraph({ job }: Props) {
   useEffect(() => {
     setHydrated(false);
     persistedEnabledRef.current = null;
+    zoomRef.current = null;
+    setZoom(null);
+    setIsZoomed(false);
     const key = settingsStorageKey();
     if (!key) {
       setHydrated(true);
@@ -196,6 +229,16 @@ export default function JobLossGraph({ job }: Props) {
           persistedEnabledRef.current = s.enabled;
           setEnabled(s.enabled);
         }
+        if (
+          s.zoom &&
+          typeof s.zoom === 'object' &&
+          Number.isFinite(s.zoom.min) &&
+          Number.isFinite(s.zoom.max) &&
+          s.zoom.min < s.zoom.max
+        ) {
+          zoomRef.current = { min: s.zoom.min, max: s.zoom.max };
+          setZoom(zoomRef.current);
+        }
       }
     } catch {
       // ignore malformed / unavailable storage
@@ -209,12 +252,12 @@ export default function JobLossGraph({ job }: Props) {
     const key = settingsStorageKey();
     if (!key) return;
     try {
-      const payload: PersistedSettings = { useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled };
+      const payload: PersistedSettings = { useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled, zoom };
       localStorage.setItem(key, JSON.stringify(payload));
     } catch {
       // ignore unavailable storage
     }
-  }, [hydrated, useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled]);
+  }, [hydrated, useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled, zoom]);
 
   // keep enabled map in sync with discovered keys. "loss/loss" and "val/loss"
   // are on by default; every other metric starts deactivated (user can toggle
@@ -226,7 +269,8 @@ export default function JobLossGraph({ job }: Props) {
     setEnabled(prev => {
       const next = { ...prev };
       for (const k of lossKeys) {
-        if (next[k] === undefined) next[k] = persistedEnabledRef.current?.[k] ?? (k === 'loss/loss' || k === 'val/loss');
+        if (next[k] === undefined)
+          next[k] = persistedEnabledRef.current?.[k] ?? (k === 'loss/loss' || k === 'val/loss');
       }
       for (const k of Object.keys(next)) {
         if (!lossKeys.includes(k)) delete next[k];
@@ -352,6 +396,12 @@ export default function JobLossGraph({ job }: Props) {
           const min = c ? c.min : dataMin;
           const max = c ? c.max : dataMax;
           if (min == null || max == null) return [null, null];
+          // Flat series: pad before the log snap too, so rangeLog gets a real
+          // interval rather than a single point.
+          if (isDegenerateSpan(min, max)) {
+            const [pMin, pMax] = padDegenerate(min, max);
+            return useLogScale && pMin > 0 ? uPlot.rangeLog(pMin, pMax, 10, false) : [pMin, pMax];
+          }
           // uPlot's log tick generator (logAxisSplits) assumes the scale min
           // sits on a magnitude boundary — its default log range snaps via
           // rangeLog before ticks are computed. Handing it raw data extents
@@ -393,7 +443,9 @@ export default function JobLossGraph({ job }: Props) {
           vals.sort((a, b) => a - b);
           const lo = vals[Math.floor(vals.length * 0.02)];
           const hi = vals[Math.ceil(vals.length * 0.98) - 1];
-          if (Number.isFinite(lo) && Number.isFinite(hi) && lo !== hi) {
+          // `lo !== hi` alone is satisfied by ULP-level noise on a constant
+          // metric, which would then be handed back as the clip band.
+          if (Number.isFinite(lo) && Number.isFinite(hi) && !isDegenerateSpan(lo, hi)) {
             yClip[scaleKey] = { min: lo, max: hi };
           }
         }
@@ -464,6 +516,11 @@ export default function JobLossGraph({ job }: Props) {
             const sx = u.scales.x;
             const zoomed = sx.min !== xs[0] || sx.max !== xs[xs.length - 1];
             setIsZoomed(zoomed);
+            // Record the window so it survives navigating away and back.
+            const nextZoom =
+              zoomed && sx.min != null && sx.max != null ? { min: sx.min, max: sx.max } : null;
+            zoomRef.current = nextZoom;
+            setZoom(nextZoom);
           },
         ],
       },
@@ -480,6 +537,23 @@ export default function JobLossGraph({ job }: Props) {
       if (uplotRef.current !== uplotInstance) return;
       const fitted = computeCanvasSize(host);
       if (fitted) uplotInstance.setSize(fitted);
+
+      // Re-apply the saved zoom window. Done here rather than in the options so
+      // it also survives a structural recreate (toggling a series), and after
+      // setSize so the scale applies against the final canvas width.
+      const saved = zoomRef.current;
+      if (!saved) return;
+      const xs = uplotInstance.data[0] as number[];
+      if (!xs || xs.length < 2) return;
+      // Drop a window that no longer overlaps the data at all — e.g. the range
+      // was deleted, or this is a fresh run that hasn't reached those steps.
+      if (saved.max <= xs[0] || saved.min >= xs[xs.length - 1]) {
+        zoomRef.current = null;
+        setZoom(null);
+        return;
+      }
+      // setScale fires the setScale hook above, which sets isZoomed for us.
+      uplotInstance.setScale('x', { min: saved.min, max: saved.max });
     });
 
     return () => {
@@ -523,29 +597,6 @@ export default function JobLossGraph({ job }: Props) {
     return () => ro.disconnect();
   }, [hasData]);
 
-  const handleTrim = useCallback(async () => {
-    const step = Number(trimStep);
-    if (!Number.isFinite(step) || step < 0) return;
-    if (!window.confirm(`Delete all loss log entries after step ${step}?\n\nThis cannot be undone.`)) return;
-    setTrimming(true);
-    try {
-      const res = await fetch(`/api/jobs/${job.id}/loss`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ trimAfterStep: step }),
-      });
-      if (!res.ok) {
-        const msg = await res.text();
-        throw new Error(msg);
-      }
-      fullReset();
-    } catch (err) {
-      window.alert(`Trim failed: ${err}`);
-    } finally {
-      setTrimming(false);
-    }
-  }, [trimStep, job.id, fullReset]);
-
   const handleResetZoom = useCallback(() => {
     const u = uplotRef.current;
     if (!u) return;
@@ -554,8 +605,47 @@ export default function JobLossGraph({ job }: Props) {
     u.setScale('x', { min: xs[0], max: xs[xs.length - 1] });
   }, []);
 
+  const [deleting, setDeleting] = useState(false);
+
+  // Delete every logged step inside the current zoom window, then zoom back out.
+  const handleDeleteSelectedRange = useCallback(() => {
+    const u = uplotRef.current;
+    if (!u) return;
+    const xs = u.data[0] as number[];
+    if (!xs || !xs.length) return;
+    const sx = u.scales.x;
+    if (sx.min == null || sx.max == null) return;
+    // Snap the visible window to whole steps that actually fall inside it.
+    const minStep = Math.ceil(sx.min);
+    const maxStep = Math.floor(sx.max);
+    if (minStep > maxStep) return;
+    const count = xs.filter(x => x >= minStep && x <= maxStep).length;
+
+    openConfirm({
+      title: 'Delete Selected Range',
+      message: `Permanently delete steps ${minStep.toLocaleString()}–${maxStep.toLocaleString()} (${count.toLocaleString()} plotted points) from the loss log for all metrics? This cannot be undone.`,
+      type: 'danger',
+      confirmText: 'Delete',
+      onConfirm: async () => {
+        setDeleting(true);
+        try {
+          await deleteRange(minStep, maxStep);
+          // Zoom out: clear the zoom flag first so the data-update effect
+          // refits the x-scale to the remaining data instead of holding the
+          // old window.
+          isZoomedRef.current = false;
+          setIsZoomed(false);
+          handleResetZoom();
+        } catch (e) {
+          console.error('Error deleting loss range:', e);
+        } finally {
+          setDeleting(false);
+        }
+      },
+    });
+  }, [deleteRange, handleResetZoom]);
+
   const totalPoints = built.data[0]?.length ?? 0;
-  const maxStep = (built.data[0] as number[])?.[totalPoints - 1] ?? 0;
 
   return (
     <div className="bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col h-full">
@@ -594,13 +684,23 @@ export default function JobLossGraph({ job }: Props) {
           ) : (
             <>
               {isZoomed && (
-                <button
-                  type="button"
-                  onClick={handleResetZoom}
-                  className="absolute top-2 right-2 z-10 px-2 py-1 rounded text-xs bg-blue-600/80 hover:bg-blue-600 text-white border border-blue-500/50"
-                >
-                  Reset zoom
-                </button>
+                <div className="absolute top-2 right-2 z-10 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleDeleteSelectedRange}
+                    disabled={deleting}
+                    className="px-2 py-1 rounded text-xs bg-red-600/80 hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed text-white border border-red-500/50"
+                  >
+                    {deleting ? 'Deleting...' : 'Delete Selected Range'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleResetZoom}
+                    className="px-2 py-1 rounded text-xs bg-blue-600/80 hover:bg-blue-600 text-white border border-blue-500/50"
+                  >
+                    Reset zoom
+                  </button>
+                </div>
               )}
               <div ref={chartHostRef} className="absolute top-0 left-0 right-0 bottom-2 overflow-hidden">
                 <div ref={containerRef} />
@@ -679,33 +779,6 @@ export default function JobLossGraph({ job }: Props) {
               className="w-full accent-blue-500"
             />
             <div className="mt-2 text-[11px] text-gray-500">UI downsample for huge runs.</div>
-          </div>
-
-          <div className="bg-gray-950 border border-gray-800 rounded-lg p-3 md:col-span-2">
-            <label className="block text-xs text-gray-400 mb-2">
-              Trim log after step
-              {maxStep > 0 && <span className="ml-1 text-gray-500">(current max: {maxStep.toLocaleString()})</span>}
-            </label>
-            <div className="flex gap-2 items-center">
-              <input
-                type="number"
-                min={0}
-                step={1}
-                placeholder={maxStep > 0 ? String(maxStep) : 'step number'}
-                value={trimStep}
-                onChange={e => setTrimStep(e.target.value)}
-                className="w-40 px-2 py-1 rounded-md text-xs bg-gray-900 border border-gray-700 text-gray-200 focus:outline-none focus:border-red-500"
-              />
-              <button
-                type="button"
-                disabled={trimming || trimStep === '' || Number(trimStep) < 0}
-                onClick={handleTrim}
-                className="px-3 py-1 rounded-md text-xs bg-red-900/60 hover:bg-red-800/80 text-red-200 border border-red-800/60 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-              >
-                {trimming ? 'Trimming…' : 'Trim'}
-              </button>
-              <span className="text-[11px] text-gray-500">Permanently deletes log entries after the given step.</span>
-            </div>
           </div>
         </div>
       </div>

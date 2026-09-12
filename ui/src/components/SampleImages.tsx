@@ -9,9 +9,11 @@ import { Camera } from 'lucide-react';
 import { Button } from '@headlessui/react';
 import { FaDownload } from 'react-icons/fa';
 import { apiClient } from '@/utils/api';
+import { encodeFilePathForUrl } from '@/utils/basic';
 import classNames from 'classnames';
 import { FaCaretDown, FaCaretUp } from 'react-icons/fa';
 import SampleImageViewer from './SampleImageViewer';
+import SamplePreview from './SamplePreview';
 import { getAvaliableJobActions, getTotalSteps, sampleJob, stopSampleJob } from '@/utils/jobs';
 
 interface SampleImagesMenuProps {
@@ -39,7 +41,7 @@ export const SampleImagesMenu = ({ job, onRefresh, hasSamples, isAnyJobRunning }
       const zipPath = res.data.zipPath; // e.g. /mnt/Train2/out/ui/.../samples.zip
       if (!zipPath) throw new Error('No zipPath in response');
 
-      const downloadPath = `/api/files/${encodeURIComponent(zipPath)}`;
+      const downloadPath = `/api/files/${encodeFilePathForUrl(zipPath)}`;
       const a = document.createElement('a');
       a.href = downloadPath;
       // optional: suggest filename (browser may ignore if server sets Content-Disposition)
@@ -277,6 +279,8 @@ export default function SampleImages({ job }: SampleImagesProps) {
   return (
     <div ref={scrollParentCallback} className="absolute top-[80px] left-0 right-0 bottom-0 overflow-y-auto">
       <div className="pb-4">
+        {/* Renders itself only while a sample is actually being denoised. */}
+        <SamplePreview job={job} />
         {PageInfoContent}
         {sampleImages && rows.length > 0 && scrollParent && (
           <Virtuoso

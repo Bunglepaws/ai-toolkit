@@ -19,8 +19,10 @@ This is a personal fork of [ostris/ai-toolkit](https://github.com/ostris/ai-tool
 - **Automagic v3 backward compat** — resumes from checkpoints saved by any prior v3 variant (per-row lr tensors, missing `dir_ema`/`prev_sign` keys all handled)
 - **LightX2V for WAN 2.2** — 4-step distilled samples (~40s vs ~6 min); PEFT adapter reuse fix
 - **LTX-2.3 distilled LoRA** — 8-step samples instead of 30
-- **Gemma API for LTX-2.3** — use free Gemma API instead of loading 12B text encoder locally
-- **Sampling LoRA (Krea 2 & Qwen Image)** — apply a LoRA only during sample generation, not training; useful for filter-bypass or style LoRAs (see [Krea 2 Training](#krea-2-training)); fixed crash on quantized Qwen Image models where `QModuleMixin._load_from_state_dict` would raise `KeyError` on `_data` keys belonging to unrelated modules
+- **Gemma API for LTX-2/2.3/2.5** — use free Gemma API instead of loading the 12B text encoder locally; LTX-2.5 checkpoints don't carry the model-ID metadata the API needs, so a **Gemma API Model ID Source** setting on the Settings page lets you point at a local LTX-2.3 dev checkpoint purely to look up the ID (LTX-2/2.3 need no extra setup, their own checkpoints already carry it)
+- **LTX-2.5 two-pass spatial upscaling** — enabled for `ltx_version == "2.5"`, not just 2.3 (same `LatentUpsampler` architecture, same pinned conv VAE latent space)
+- **Sampling LoRA (Krea 2 & Qwen Image)** — apply a LoRA only during sample generation, not training; useful for turbo/distill, filter-bypass or style LoRAs (see [Krea 2 Training](#krea-2-training)); fixed crash on quantized Qwen Image models where `QModuleMixin._load_from_state_dict` would raise `KeyError` on `_data` keys belonging to unrelated modules
+- **Krea 2 sampling LoRAs are attached, not merged** — they are applied as `LoRASpecialNetwork` adapters toggled around the sample loop, so the base weights are never written and the quantization backend stops mattering. The previous merge-into-weights approach failed three different ways depending on qtype: under torchao (`qfloat8` + `layer_offloading`) `AffineQuantizedTensor` has no `aten.add_`, so sampling raised `NotImplementedError`; under `convrot8` an `OstrisLinear` has no `weight` Parameter at all, so every tensor was skipped **silently** and samples were generated with no LoRA applied; under quanto it worked but re-materialised the base weights on every sample (measured 48–141 s), which costs more wall-clock than a turbo LoRA saves at realistic image counts. A LoRA that matches zero modules now raises instead of printing `Applied 0 tensors` and sampling anyway. `.diff` (full-weight delta) files are still merged directly — they target the small modules Krea 2 keeps out of quantization on purpose — but the target is validated first (present, unquantized, right shape) and restored from an exact snapshot afterwards, since add-then-subtract is not bit-exact and would accumulate into the trained weights over a run
 - **Corrupt/truncated JSON captions** — graceful fallback with warning instead of crashing the job
 - **Optimizer archiving** — option to archive optimizer state on each save
 - **AceStep 1.5 XL audio LM (`audio_lm_path`)** — set `audio_lm_path` in your model config to a Qwen3 ACE15 safetensors file (e.g. `qwen_4b_ace15.safetensors`) to enable proper `lm_hints` context generation at sample time. Without this the DiT uses silence context and output quality is poor. The FSQ quantizer and AudioTokenDetokenizer are extracted automatically from the AIO base model file. Supports the XL AIO format (`ostris/ace_step_1.5_ComfyUI_files`); non-XL AIO untested.
@@ -28,6 +30,7 @@ This is a personal fork of [ostris/ai-toolkit](https://github.com/ostris/ai-tool
 - **Video-only files auto-fixed** — dataset videos with no audio stream at all (common with some video generators) used to crash the whole job on `torchaudio.load()`; a silent stereo AAC track is now muxed in automatically the first time the file is loaded, in place, via ffmpeg
 - **`torch.compile` + CPU/GPU layer-offloading stream fix** — the offloading autograd functions (`_BouncingLinearFn`, `_BouncingConv2dFn`) manage raw CUDA streams/events directly; newer PyTorch Dynamo's stream tracing mis-codegenned `torch.ops.streams.record_event` on them under `compile: true` + `low_vram: true`, crashing with `RuntimeError: expected event to be a torch.Event object`. Their `forward`/`backward` are now marked `@torch._dynamo.disable` so Dynamo treats them as an opaque call instead of tracing into them
 - **`block_compile` + torchao guard** — block-level `torch.compile` is automatically disabled (with a warning) when the model is torchao-quantized, avoiding an infinite-recursion crash in `torchao.utils._dispatch__torch_function__` under PyTorch 2.9+'s AOT autograd path
+- **Audio validation support** — the held-out validation-loss feature (`validation_config`) now works with audio models (AceStep), not just images. Point a validation item at an `audio_path` and a `caption_path` (or an inline `prompt`) using the same `<CAPTION>/<LYRICS>/<BPM>/...` tagged format as training captions; the audio is loaded via `torchaudio` and resampled to the model's sample rate instead of going through the image bucket-resize path, and the prompt is fed to `encode_prompt` as-is since AceStep expects the full tagged string rather than free text
 
 ### UI — Queue & Job Management
 
@@ -48,6 +51,10 @@ This is a personal fork of [ostris/ai-toolkit](https://github.com/ostris/ai-tool
 - **Cache quantized model** — skip re-quantization on subsequent runs
 - **Negative Prompt field** — exposed in job config UI
 - **Automagic v3 in optimizer dropdown** — was missing from upstream UI
+- **Text Encoder Path Override** — override which text-encoder file/checkpoint loads, independent of the DiT (`name_or_path`); hidden when Gemma API is active since no local TE loads then
+- **LTX-2.5 model-config fields completed** — Spatial Upscaler Path, Gemma API, and the new Text Encoder Path Override are now exposed for LTX-2.5 (the backend already supported all three via inherited `LTX2Model` code; only the form fields were missing)
+- **Video sample length in seconds** — the sample card's Num Frames box is replaced by a **Duration (seconds)** float with a live frame-count readout beside it, recalculated as you change duration or fps. Each video arch declares its own frame grid and tested framerates (WAN `n+1` at 16/24 fps, LTX-2.x `8n+1` at 24/25/50, MiniMax H3 `17n+5` at 24); `duration x fps + 1` snaps to the nearest valid count so the number shown is one the model will actually produce, and when snapping shifts the length the effective duration is shown too (`73 frames · 3.04s`). An untested framerate still works but warns. `sample.duration` is stored as what you typed with `num_frames` written alongside as the derived value, so the trainer is unchanged; older jobs back-fill duration from `(num_frames - 1) / fps`, and switching arch recomputes it from the new arch's defaults
+- **Moot settings zeroed on save** — job configs no longer keep stale values for settings that have no effect given their gating flag (e.g. a leftover `layer_offloading_transformer_percent` after turning `layer_offloading` off) — reset to the same default the backend would use if you re-enabled the toggle, never an arbitrary placeholder
 
 ### UI — Loss Graph
 
@@ -66,9 +73,12 @@ This is a personal fork of [ostris/ai-toolkit](https://github.com/ostris/ai-tool
 - **Step counter on Samples tab** — "Step X of Y" progress shown left of the Generate Samples Now button, updating live
 - **Sample button blocked during startup** — Generate Samples disabled while loading model, quantizing, encoding dataset, etc.; only active once in the training loop
 - **Toolbar sample button hidden on Samples tab** — avoids duplicate camera buttons when already on the Samples page
+- **Sticky video mute** — muting a video in the fullscreen sample or dataset viewer is remembered globally (`aitk_video_muted` in `localStorage`) and applied to the next video you open, so a late-night mute stays muted. Only the audible players with controls participate; grid thumbnails stay hard-muted. If the browser blocks unmuted autoplay, playback falls back to muted without overwriting the stored preference
 
 ### UI — Datasets / Captions
 
+- **Dataset list columns** — the datasets grid shows a Modified date and a file Count alongside the name. Both are scanned from the top level of each dataset folder only (subfolders hold cached/derived files) and loaded asynchronously in chunks, so the list renders immediately and fills in as the scans return. Count includes image/video/audio files; Modified also considers `.txt` / `.json` / `.caption` files, so editing a caption updates the date without inflating the count.
+- **Sortable dataset columns** — Name, Modified and Count headers toggle ascending/descending; the chosen sort is remembered per browser in `localStorage` and restored on the next visit
 - **Find & replace honors caption ext** — find/replace works correctly for JSON captions and respects the selected caption extension type
 - **Find & replace in JSON** — updates the `caption` field inside the JSON structure, preserving other fields
 - **Find & replace captions** — bulk find-and-replace with AND/OR/quoted search
@@ -79,6 +89,7 @@ This is a personal fork of [ostris/ai-toolkit](https://github.com/ostris/ai-tool
 Real-time anomaly detection that writes to the DB and surfaces in the UI without ever pausing training.
 
 - **Loss spike detection** — rolling 50-step deque; flags when current loss > 3× average and > 0.4 absolute floor; 10-step debounce prevents alert storms during sustained divergence
+- **Loss stall detection** — tracks a rolling-median best-seen loss; flags when it hasn't improved in ~3000 steps, catching runs that never diverge but also never learn (e.g. automagic3's per-tensor LR decaying to its floor) without false-alarming on noisy runs that dip and recover non-monotonically
 - **White-noise sample detection** — compares JPEG/PNG file sizes of new samples against the step-0 baseline; flags when current batch avg exceeds baseline by 1.8× (empirically confirmed signal for mode collapse / LR divergence)
 - **OOM crash detection** — `on_error()` catches CUDA out-of-memory errors, collects VRAM stats via `nvidia-smi`, and writes an `oom` alert type with memory details
 - **Dataset stats persistence** — image count and bucket distribution written to DB after each latent-caching phase so the AI Config Check has context without a running trainer
@@ -150,6 +161,7 @@ Real-time anomaly detection that writes to the DB and surfaces in the UI without
 - [circlestone-labs/Anima-Base-v1.0-Diffusers](https://huggingface.co/circlestone-labs/Anima-Base-v1.0-Diffusers) (Anima)
 - [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2)
 - [krea/Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) (Krea 2 Turbo)
+- [microsoft/Mage-Flow-Base](https://huggingface.co/microsoft/Mage-Flow-Base) (Mage-Flow)
 
 ### Instruction / Edit
 - [black-forest-labs/FLUX.1-Kontext-dev](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev) (FLUX.1-Kontext-dev)
@@ -160,6 +172,7 @@ Real-time anomaly detection that writes to the DB and surfaces in the UI without
 - [Boogu/Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit) (Boogu Image Edit)
 - [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2 Edit Training)
 - [krea/Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) (Krea 2 Turbo Edit Training)
+- [microsoft/Mage-Flow-Edit-Base](https://huggingface.co/microsoft/Mage-Flow-Edit-Base) (Mage-Flow Edit)
 
 ### Video
 - [Wan-AI/Wan2.1-T2V-1.3B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) (Wan 2.1 1.3B)
@@ -171,6 +184,7 @@ Real-time anomaly detection that writes to the DB and surfaces in the UI without
 - [Wan-AI/Wan2.2-TI2V-5B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) (Wan 2.2 TI2V 5B)
 - [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) (LTX-2)
 - [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) (LTX-2.3)
+- [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) (MiniMaxAI/MiniMax-H3)
 
 ### Audio
 - [ACE-Step/Ace-Step1.5](https://huggingface.co/ACE-Step/Ace-Step1.5) (Ace Step 1.5)
@@ -180,6 +194,57 @@ Real-time anomaly detection that writes to the DB and surfaces in the UI without
 - [lodestones/Zeta-Chroma](https://huggingface.co/lodestones/Zeta-Chroma) (Zeta Chroma)
 
 ## Installation
+
+### Install with the AI Toolkit Manager (experimental)
+
+The recommended way to install and run AI Toolkit is with the **AI Toolkit
+Manager**, built into this repo. The manager detects your hardware and sets up
+the right PyTorch build, creates the python environment, and grabs local copies
+of Node.js and FFmpeg — everything stays inside the ai-toolkit folder, nothing
+is installed system-wide. On every launch the manager checks for updates and
+applies them (your local changes are never overwritten — if you have modified
+files, the update is skipped with a warning), then starts the UI at
+`http://localhost:8675`.
+
+The manager is still **experimental** — please let me know if you have any
+issues with it. The manual instructions below still work if you prefer them
+or run into problems.
+
+The only requirement is **git** (on Windows the manager can even fetch a
+portable git for updates, but you need one installed to clone the repo first).
+
+```bash
+git clone https://github.com/ostris/ai-toolkit.git
+cd ai-toolkit
+```
+
+Then start the manager with the script for your platform:
+
+Linux:
+```bash
+chmod +x run_linux.sh
+./run_linux.sh
+```
+
+MacOS (Apple Silicon, experimental):
+```bash
+chmod +x run_mac.zsh
+./run_mac.zsh
+```
+
+Windows: double-click `run_windows.bat` (or run it from a terminal).
+
+You can also use the manager directly from a terminal (handy on headless
+servers):
+
+```bash
+python3 -m manager install   # first-time setup
+python3 -m manager update    # pull updates + sync dependencies
+python3 -m manager launch    # start the UI
+python3 -m manager doctor    # diagnose problems
+```
+
+### Manual installation
 
 Requirements:
 - python >=3.10 (3.12 recommended)
@@ -195,7 +260,7 @@ cd ai-toolkit
 python3 -m venv venv
 source venv/bin/activate
 # install torch first
-pip3 install --no-cache-dir torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+pip3 install --no-cache-dir torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 pip3 install -r requirements.txt
 ```
 
@@ -211,22 +276,8 @@ git clone https://github.com/ostris/ai-toolkit.git
 cd ai-toolkit
 python -m venv venv
 .\venv\Scripts\activate
-pip install --no-cache-dir torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+pip install --no-cache-dir torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
-```
-
-MacOS:
-
-Experimental support for Silicon Macs is available. I do not have a Mac with enough RAM to fully test this
-so please let me know if there are issues. There is a convience script to install and run on MacOS 
-locates at `./run_mac.zsh` that will install the dependencies locally and run the UI. To run this, 
-do the following:
-
-```bash
-git clone https://github.com/ostris/ai-toolkit.git
-cd ai-toolkit
-chmod +x run_mac.zsh
-./run_mac.zsh
 ```
 
 
@@ -456,6 +507,16 @@ In your config's `sample` block:
 ```
 
 The LoRA is loaded before each sample batch and removed immediately after, so it never influences the training gradient. `sample_lora_strength` can be tuned — higher values push the bypass harder; typical range is 1–8.
+
+Two slots are available — `sample_lora_path` / `sample_lora_strength` and `sample_lora_path_2` / `sample_lora_strength_2` — so a turbo/distill LoRA and a filter-bypass LoRA can be applied together.
+
+**How they are applied.** Low-rank files (`lora_A`/`lora_B`, or the older `lora_down`/`lora_up`) are attached as adapters and toggled around the sample loop; the base weights are never written, so this works whatever the model is quantized with — `qfloat8`, `convrot8` or unquantized — and costs no per-sample merge. The adapter is built once on the first sample and parked on CPU in between.
+
+`.diff` files (a full weight-shaped delta rather than a low-rank pair) are merged into the weight instead, because that is the only way to apply them. This is safe for the modules such files actually target — Krea 2 keeps `txtfusion.projector`, the timestep embedder and the final projection out of quantization by design — and the target is checked before anything is written: it must exist as a parameter, be unquantized, and match the delta's shape. The original weight is snapshotted and restored exactly after sampling rather than having the delta subtracted back off, so nothing accumulates into the trained model over a long run.
+
+If a sampling LoRA matches **zero** modules in the transformer, sampling now fails with an error naming the file. It previously logged `Applied 0 tensors` and generated the sample anyway, which looked identical to success.
+
+**Guidance with a turbo/distill LoRA.** Krea 2's sampler takes CFG in "extra weight" form (`v = v_cond + s·(v_cond − v_uncond)`), and the config value is converted with `s = guidance − 1`, matching the usual convention where `1` means CFG off. So with a turbo LoRA applied use `guidance_scale: 1` (no unconditional pass, roughly half the per-step cost) at ~8 steps. Without one, `guidance_scale: 4` at ~25 steps is the fallback — raw Krea 2 at 8 steps with CFG off produces garbage that is easily mistaken for a broken LoRA.
 
 Example community LoRA: [Krea2FilterBypass](https://civitai.red/models/2728234/krea2filterbypass) — apply at strength 4 to reliably bypass the built-in content filter during sampling.
 

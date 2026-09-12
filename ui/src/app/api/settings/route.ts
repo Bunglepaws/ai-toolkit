@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
-import { defaultTrainFolder, defaultDatasetsFolder } from '@/paths';
+import { defaultTrainFolder, defaultDatasetsFolder, defaultModelsFolder } from '@/paths';
 import { flushCache } from '@/server/settings';
 import fs from 'fs';
 import path from 'path';
@@ -31,6 +31,24 @@ export async function GET() {
     if (!settingsObject.CHECK_CONFIG_MODEL) settingsObject.CHECK_CONFIG_MODEL = 'claude-sonnet-5';
     if (!settingsObject.CHECK_CONFIG_ENABLE_WEB_SEARCH) settingsObject.CHECK_CONFIG_ENABLE_WEB_SEARCH = 'false';
 
+    // Untested: reuses an already-loaded model across consecutive same-arch queued
+    // jobs within one process instead of a fresh load+quantize per job. Defaults to
+    // on (matches prior behavior); can be turned off if it's ever suspected of
+    // causing trouble.
+
+    // Live sample preview (tiny-VAE decode of the clip forming during a
+    // sample). Defaults to on, matching toolkit/sample_preview.py's own
+    // env-var default when unset.
+    if (!settingsObject.AITK_SAMPLE_PREVIEW) settingsObject.AITK_SAMPLE_PREVIEW = 'true';
+
+    // MODELS_PATH from the env file always takes precedence over the setting
+    if (process.env.MODELS_PATH && process.env.MODELS_PATH.trim() !== '') {
+      settingsObject.MODELS_PATH = process.env.MODELS_PATH;
+    } else if (!settingsObject.MODELS_PATH || settingsObject.MODELS_PATH === '') {
+      // if MODELS_PATH is not set, use default
+      settingsObject.MODELS_PATH = defaultModelsFolder;
+    }
+
     // Read version from version.py in root
     let version = 'unknown';
     try {
@@ -55,9 +73,10 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     const {
-      HF_TOKEN, GEMMA_API_KEY, TRAINING_FOLDER, DATASETS_FOLDER, QUANTIZATION_CACHE_DIR,
+      HF_TOKEN, GEMMA_API_KEY, GEMMA_API_MODEL_ID_SOURCE, TRAINING_FOLDER, DATASETS_FOLDER, QUANTIZATION_CACHE_DIR, MODELS_PATH,
       CHECK_CONFIG_API_BASE_URL, CHECK_CONFIG_API_KEY, CHECK_CONFIG_MODEL,
-      CHECK_CONFIG_ENABLE_WEB_SEARCH,
+      CHECK_CONFIG_ENABLE_WEB_SEARCH, AITK_SAMPLE_PREVIEW,
+      OMNIVOICE_MODEL_PATH,
     } = body;
 
     const upsert = (key: string, value: string) =>
@@ -67,13 +86,17 @@ export async function POST(request: Request) {
     await Promise.all([
       upsert('HF_TOKEN', HF_TOKEN ?? ''),
       upsert('GEMMA_API_KEY', GEMMA_API_KEY ?? ''),
+      upsert('GEMMA_API_MODEL_ID_SOURCE', GEMMA_API_MODEL_ID_SOURCE ?? ''),
       upsert('TRAINING_FOLDER', TRAINING_FOLDER ?? ''),
       upsert('DATASETS_FOLDER', DATASETS_FOLDER ?? ''),
       upsert('QUANTIZATION_CACHE_DIR', QUANTIZATION_CACHE_DIR ?? ''),
+      upsert('MODELS_PATH', MODELS_PATH ?? ''),
       upsert('CHECK_CONFIG_API_BASE_URL', CHECK_CONFIG_API_BASE_URL ?? ''),
       upsert('CHECK_CONFIG_API_KEY', CHECK_CONFIG_API_KEY ?? ''),
       upsert('CHECK_CONFIG_MODEL', CHECK_CONFIG_MODEL ?? ''),
       upsert('CHECK_CONFIG_ENABLE_WEB_SEARCH', CHECK_CONFIG_ENABLE_WEB_SEARCH ?? 'false'),
+      upsert('AITK_SAMPLE_PREVIEW', AITK_SAMPLE_PREVIEW ?? 'true'),
+      upsert('OMNIVOICE_MODEL_PATH', OMNIVOICE_MODEL_PATH ?? ''),
     ]);
 
     flushCache();

@@ -135,8 +135,8 @@ class Critic:
         save_meta = get_meta_for_safetensors(self.process.meta, self.process.job.name)
         step_num = ''
         if step is not None:
-            # zeropad 9 digits
-            step_num = f"_{str(step).zfill(9)}"
+            # zeropad 5 digits
+            step_num = f"_{str(step).zfill(5)}"
         save_path = os.path.join(self.process.save_root, f"CRITIC_{self.process.job.name}{step_num}.safetensors")
         save_file(self.model.state_dict(), save_path, save_meta)
         self.print(f"Saved critic to {save_path}")

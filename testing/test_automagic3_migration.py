@@ -1,7 +1,8 @@
+import os
 import sys
 import torch
 
-sys.path.insert(0, "/mnt/c/Data/git/AIToolkitWSL/ai-toolkit")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from toolkit.optimizers.automagic3 import Automagic3
 
 torch.manual_seed(0)

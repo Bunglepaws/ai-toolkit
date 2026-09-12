@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { PrismaClient } from '@prisma/client';
-
-const prisma = new PrismaClient();
+import prisma from '@/server/prisma';
+import { invalidateCache } from '@/server/apiCache';
 
 export async function POST(request: NextRequest, { params }: { params: { jobID: string } }) {
   const { jobID } = await params;
@@ -19,15 +18,17 @@ export async function POST(request: NextRequest, { params }: { params: { jobID: 
     return NextResponse.json({ error: 'Job not in queue' }, { status: 404 });
   }
 
-  // Find all jobs in the same GPU queue, sorted by position
+  // Find all jobs in the same GPU queue, sorted by position. The secondary
+  // created_at key must match the UI's comparator exactly (compareQueueOrder in
+  // JobsTable.tsx). When two rows share a position and the two sides break the
+  // tie in opposite directions, the row the user sees at #2 is index 0 here, so
+  // every attempt to move it up is dropped as a no-op that still reports success.
   const queueJobs = await prisma.job.findMany({
     where: {
       gpu_ids: job.gpu_ids,
       status: 'queued',
     },
-    orderBy: {
-      queue_position: 'asc',
-    },
+    orderBy: [{ queue_position: 'asc' }, { created_at: 'asc' }],
   });
 
   const currentIndex = queueJobs.findIndex(j => j.id === job.id);
@@ -35,35 +36,55 @@ export async function POST(request: NextRequest, { params }: { params: { jobID: 
     return NextResponse.json({ error: 'Job not found in active queue' }, { status: 404 });
   }
 
+  let destIndex = -1;
   if (targetIndex !== undefined) {
-    const clamped = Math.max(0, Math.min(targetIndex, queueJobs.length - 1));
-    if (clamped !== currentIndex) {
-      const reordered = [...queueJobs];
-      const [removed] = reordered.splice(currentIndex, 1);
-      reordered.splice(clamped, 0, removed);
-      await prisma.$transaction(
-        reordered.map((j, idx) => prisma.job.update({ where: { id: j.id }, data: { queue_position: idx } }))
-      );
-      console.log(`Job ${job.id} moved to index ${clamped}`);
-    }
-    return NextResponse.json({ success: true });
-  }
-
-  let swapIndex = -1;
-  if (direction === 'up' && currentIndex > 0) {
-    swapIndex = currentIndex - 1;
+    destIndex = Math.max(0, Math.min(targetIndex, queueJobs.length - 1));
+  } else if (direction === 'up' && currentIndex > 0) {
+    destIndex = currentIndex - 1;
   } else if (direction === 'down' && currentIndex < queueJobs.length - 1) {
-    swapIndex = currentIndex + 1;
+    destIndex = currentIndex + 1;
   }
 
-  if (swapIndex !== -1) {
-    const neighbor = queueJobs[swapIndex];
-    const tempPos = job.queue_position;
-    await prisma.$transaction([
-      prisma.job.update({ where: { id: job.id }, data: { queue_position: neighbor.queue_position } }),
-      prisma.job.update({ where: { id: neighbor.id }, data: { queue_position: tempPos } }),
-    ]);
-    console.log(`Job ${job.id} moved ${direction}`);
+  const reordered = [...queueJobs];
+  if (destIndex !== -1 && destIndex !== currentIndex) {
+    const [removed] = reordered.splice(currentIndex, 1);
+    reordered.splice(destIndex, 0, removed);
+  }
+
+  // A job that is still running but already flagged return_to_queue (Save and
+  // Stop Queue) is pinned to position 0 by that route, because it must come back
+  // at the head of the queue. It is not in `queueJobs` — nothing here is allowed
+  // to move it — so renumber the queued rows from 1 instead of 0 and leave slot 0
+  // to it. Without this, a reorder in the window between the click and the
+  // trainer actually exiting writes a queued job into slot 0 and the pin is lost.
+  const pendingRequeue = await prisma.job.count({
+    where: { gpu_ids: job.gpu_ids, status: { in: ['running', 'stopping'] }, return_to_queue: true },
+  });
+  const base = pendingRequeue > 0 ? 1 : 0;
+
+  // Renumber to base..base+n-1 rather than swapping the two rows' positions. A
+  // swap between rows that happen to share a position writes each one its own
+  // value back, so the move silently does nothing. Renumbering also heals the
+  // duplicate, so a queue that got into that state fixes itself on the next
+  // reorder instead of staying stuck.
+  const writes = reordered
+    .map((j, idx) => ({ j, idx: idx + base }))
+    .filter(({ j, idx }) => j.queue_position !== idx);
+
+  if (writes.length > 0) {
+    await prisma.$transaction(
+      writes.map(({ j, idx }) => prisma.job.update({ where: { id: j.id }, data: { queue_position: idx } })),
+    );
+    if (destIndex !== -1 && destIndex !== currentIndex) {
+      console.log(`Job ${job.id} moved to index ${destIndex}`);
+    } else {
+      console.log(`Renumbered queue on GPU(s) ${job.gpu_ids} (duplicate positions healed)`);
+    }
+    // The active-jobs list is cached for 5s. Without this the client's refresh
+    // right after a reorder is served the pre-move order, the optimistic row
+    // snaps back, and the new order only appears when the entry expires — the
+    // 5-10s "lag" that looks like a slow reorder but is a stale read.
+    invalidateCache('jobs-active');
   }
 
   return NextResponse.json({ success: true });

@@ -1,3 +1,4 @@
+import path from 'path';
 import prisma from '@/server/prisma';
 import { defaultDatasetsFolder, defaultDataRoot } from '@/paths';
 import { defaultTrainFolder } from '@/paths';
@@ -24,6 +25,9 @@ export const getDatasetsRoot = async () => {
   if (row?.value && row.value !== '') {
     datasetsPath = row.value;
   }
+  // Strip trailing slashes; the routes' `root + path.sep` prefix checks 403
+  // on every file if the stored path ends with a separator.
+  datasetsPath = path.resolve(datasetsPath);
   myCache.set(key, datasetsPath);
   return datasetsPath as string;
 };
@@ -43,6 +47,7 @@ export const getTrainingFolder = async () => {
   if (row?.value && row.value !== '') {
     trainingRoot = row.value;
   }
+  trainingRoot = path.resolve(trainingRoot);
   myCache.set(key, trainingRoot);
   return trainingRoot as string;
 };
@@ -62,6 +67,27 @@ export const getGemmaApiKey = async () => {
   }
   myCache.set(key, apiKey);
   return apiKey;
+};
+
+// Local checkpoint (e.g. ltx-2.3-22b-dev.safetensors) the Gemma API reads its
+// model id from when the model actually being trained/sampled doesn't carry
+// one itself -- currently required for LTX-2.5. See
+// LTX2Model._extract_gemma_model_id for the fallback logic that consumes this.
+export const getGemmaApiModelIdSource = async () => {
+  const key = 'GEMMA_API_MODEL_ID_SOURCE';
+  let path = myCache.get(key) as string;
+  if (path) {
+    return path;
+  }
+  let row = await prisma.settings.findFirst({
+    where: { key: key },
+  });
+  path = '';
+  if (row?.value && row.value !== '') {
+    path = row.value;
+  }
+  myCache.set(key, path);
+  return path;
 };
 
 export const getHFToken = async () => {
@@ -89,6 +115,16 @@ export const getCheckConfigEnableWebSearch = async () => {
   if (val !== undefined) return val === 'true';
   const row = await prisma.settings.findFirst({ where: { key } });
   val = row?.value || 'false';
+  myCache.set(key, val);
+  return val === 'true';
+};
+
+export const getSamplePreviewEnabled = async () => {
+  const key = 'AITK_SAMPLE_PREVIEW';
+  let val = myCache.get(key) as string | undefined;
+  if (val !== undefined) return val === 'true';
+  const row = await prisma.settings.findFirst({ where: { key } });
+  val = row?.value || 'true';
   myCache.set(key, val);
   return val === 'true';
 };
@@ -155,6 +191,7 @@ export const getDataRoot = async () => {
   if (row?.value && row.value !== '') {
     dataRoot = row.value;
   }
+  dataRoot = path.resolve(dataRoot);
   myCache.set(key, dataRoot);
   return dataRoot;
 };

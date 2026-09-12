@@ -1,5 +1,6 @@
 from functools import partial
 import io
+import json
 import os
 import pickle
 import time
@@ -12,6 +13,7 @@ from transformers import Gemma3Config
 import yaml
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
+from toolkit.dto import DTO
 from toolkit.models.base_model import BaseModel
 from toolkit.basic import flush
 from toolkit.prompt_utils import PromptEmbeds
@@ -20,9 +22,14 @@ from toolkit.samplers.custom_flowmatch_sampler import (
 )
 from accelerate import init_empty_weights
 from toolkit.accelerator import unwrap_model
+from toolkit.paths import MODELS_PATH
+# still used by this fork's own load paths, which the v2 aitk_post_load
+# refactor upstream did not convert (ostris removed these imports because
+# their paths no longer need them; ours do)
 from optimum.quanto import freeze
-from toolkit.util.quantize import quantize, get_qtype, quantize_model, filter_lora_state_dict_for_quantized_model
+from toolkit.util.quantize import quantize, get_qtype, quantize_model
 from toolkit.memory_management import MemoryManager
+from toolkit.util.mixed_precision import attach_per_op_casting, pin_stored_fp32
 from safetensors.torch import load_file
 from safetensors import safe_open
 from PIL import Image
@@ -30,18 +37,22 @@ import huggingface_hub
 
 try:
     from diffusers import LTX2Pipeline, LTX2ImageToVideoPipeline
-    from diffusers.models.autoencoders import (
-        AutoencoderKLLTX2Audio,
-        AutoencoderKLLTX2Video,
-    )
-    from diffusers.models.transformers import LTX2VideoTransformer3DModel
     from diffusers.pipelines.ltx2.export_utils import encode_video
     from transformers import (
         Gemma3ForConditionalGeneration,
         GemmaTokenizerFast,
     )
-    from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder, LTX2VocoderWithBWE
-    from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
+    from toolkit.models.v2.diffusion_models.ltx2 import (
+        LTX2TextConnectors,
+        LTX2VideoTransformer3DModel,
+        LTX2Vocoder,
+        LTX2VocoderWithBWE,
+    )
+    from toolkit.models.v2.vae.ltx2 import (
+        LTX2AudioVAE as AutoencoderKLLTX2Audio,
+        LTX2VideoVAE as AutoencoderKLLTX2Video,
+    )
+    from toolkit.models.v2.text_encoders.gemma3 import Gemma3TextEncoder
     from .convert_ltx2_to_diffusers import (
         get_model_state_dict_from_combined_ckpt,
         convert_ltx2_transformer,
@@ -49,6 +60,7 @@ try:
         convert_ltx2_audio_vae,
         convert_ltx2_vocoder,
         convert_ltx2_connectors,
+        split_transformer_and_connector_state_dict,
         dequantize_state_dict,
         convert_comfy_gemma3_to_transformers,
         convert_lora_original_to_diffusers,
@@ -89,6 +101,9 @@ LTXV_API_BASE_URL = "https://api.ltx.video"
 LTXV_MODEL_ID_KEY = "encrypted_wandb_properties"
 # Read from env as fallback; model config gemma_api_key takes precedence if both are set
 _GEMMA_API_KEY_FROM_ENV = os.getenv("GEMMA_API_KEY", None)
+# Fallback source for the API model id when the checkpoint being loaded doesn't
+# carry LTXV_MODEL_ID_KEY itself -- see _extract_gemma_model_id below.
+_GEMMA_API_MODEL_ID_SOURCE_FROM_ENV = os.getenv("GEMMA_API_MODEL_ID_SOURCE", None)
 
 
 def new_save_image_function(
@@ -209,6 +224,48 @@ class AudioProcessor(torch.nn.Module):
         return mel.permute(0, 1, 3, 2).contiguous()
 
 
+class _X0Capture:
+    """Captures the fully-guided x0 estimate diffusers computes each denoise
+    step, for the sample preview (see toolkit/sample_preview.py).
+
+    pipeline_ltx2.py and pipeline_ltx2_image2video.py both call
+    ``convert_x0_to_velocity(latents, x0, i, scheduler)`` for video immediately
+    before the same call for audio, immediately before the per-step callback
+    fires -- that x0 is the pipeline's own combined CFG/STG/modality-guidance
+    result, not a re-derivation. There is no public hook for it (it is not in
+    either pipeline class's ``_callback_tensor_inputs``), so this monkeypatches
+    ``convert_x0_to_velocity`` on the pipeline's own class for the duration of
+    one generation. The first call each step is always video (checked both
+    pipeline source files); ``pop()`` clears the captured value so a later
+    call in the same step is never mistaken for the next step's video x0.
+    """
+
+    def __init__(self, pipeline):
+        self._cls = type(pipeline)
+        self._orig = self._cls.convert_x0_to_velocity
+        self.latest = None
+
+    def __enter__(self):
+        capture = self
+        orig = self._orig
+
+        def _patched(self_pipe, sample, denoised_output, step_idx, scheduler=None):
+            if capture.latest is None:
+                capture.latest = denoised_output
+            return orig(self_pipe, sample, denoised_output, step_idx, scheduler)
+
+        self._cls.convert_x0_to_velocity = _patched
+        return self
+
+    def __exit__(self, *exc):
+        self._cls.convert_x0_to_velocity = self._orig
+
+    def pop(self):
+        value = self.latest
+        self.latest = None
+        return value
+
+
 class LTX2Model(BaseModel):
     arch = "ltx2"
     ltx_version = "2.0"
@@ -273,143 +330,61 @@ class LTX2Model(BaseModel):
     def get_bucket_divisibility(self):
         return 32
 
-    def reload_text_encoder(self):
-        """Reload Gemma text encoder from disk after it was unloaded into a FakeTextEncoder stub.
 
-        Called by the persistent-process model cache (run_ui.py) when the hot model
-        is reused for a new job but the text encoder was already unloaded by the
-        previous job's embedding-caching step. Only runs in non-API mode; Gemma API
-        mode leaves text_encoder=[] and this is a no-op.
+    def _extract_gemma_model_id(self, primary_path: Optional[str]):
+        """Resolve self._gemma_model_id for the Gemma API. Called only when
+        model_config.gemma_api_key is set, before the checkpoint is loaded.
+
+        Tries `primary_path` first -- the checkpoint being loaded for
+        generation. That is the only source LTX-2 and LTX-2.3 need, since
+        their own released files carry LTXV_MODEL_ID_KEY.
+
+        Falls back to model_kwargs.gemma_api_model_id_source (or the
+        GEMMA_API_MODEL_ID_SOURCE setting) when the primary checkpoint does
+        not carry it -- every released LTX-2.5 file lacks this metadata
+        (checked dev/distilled x bf16/comfy-int8/nvfp4, all five). Lightricks'
+        own reference ComfyUI workflow for 2.5 does the same thing: it points
+        the Gemma API node's model-id lookup at a local LTX-2.3 checkpoint
+        while generating with the 2.5 transformer.
+
+        Whether embeddings sourced this way are dimensionally/semantically
+        correct for a different transformer version is NOT verified here --
+        that is whatever Lightricks' API does server-side with the id. A bad
+        pairing should surface as a connector shape mismatch downstream, not
+        silently.
         """
-        if self.model_config.gemma_api_key is not None:
-            return  # API handles encoding; nothing to reload
+        def _read_model_id(path):
+            if not path or not path.endswith(".safetensors") or not os.path.exists(path):
+                return None
+            with safe_open(path, framework="pt", device="cpu") as f:
+                metadata = f.metadata()
+            return metadata.get(LTXV_MODEL_ID_KEY) if metadata else None
 
-        dtype = self.torch_dtype
-        model_path = self.model_config.name_or_path
+        fallback_path = (
+            self.model_config.model_kwargs.get("gemma_api_model_id_source")
+            or _GEMMA_API_MODEL_ID_SOURCE_FROM_ENV
+        )
 
-        self.print_and_status_update("Reloading text encoder")
+        model_id = _read_model_id(primary_path)
+        source_used = primary_path
+        if model_id is None:
+            model_id = _read_model_id(fallback_path)
+            source_used = fallback_path
 
-        if (
-            self.model_config.te_name_or_path is not None
-            and self.model_config.te_name_or_path.endswith(".safetensors")
-        ):
-            tokenizer = GemmaTokenizerFast.from_pretrained(base_te_path)
-            with init_empty_weights():
-                text_encoder = Gemma3ForConditionalGeneration(
-                    Gemma3Config(
-                        **{
-                            "boi_token_index": 255999,
-                            "bos_token_id": 2,
-                            "eoi_token_index": 256000,
-                            "eos_token_id": 106,
-                            "image_token_index": 262144,
-                            "initializer_range": 0.02,
-                            "mm_tokens_per_image": 256,
-                            "model_type": "gemma3",
-                            "pad_token_id": 0,
-                            "text_config": {
-                                "attention_bias": False,
-                                "attention_dropout": 0.0,
-                                "attn_logit_softcapping": None,
-                                "cache_implementation": "hybrid",
-                                "final_logit_softcapping": None,
-                                "head_dim": 256,
-                                "hidden_activation": "gelu_pytorch_tanh",
-                                "hidden_size": 3840,
-                                "initializer_range": 0.02,
-                                "intermediate_size": 15360,
-                                "max_position_embeddings": 131072,
-                                "model_type": "gemma3_text",
-                                "num_attention_heads": 16,
-                                "num_hidden_layers": 48,
-                                "num_key_value_heads": 8,
-                                "query_pre_attn_scalar": 256,
-                                "rms_norm_eps": 1e-06,
-                                "rope_local_base_freq": 10000,
-                                "rope_scaling": {"factor": 8.0, "rope_type": "linear"},
-                                "rope_theta": 1000000,
-                                "sliding_window": 1024,
-                                "sliding_window_pattern": 6,
-                                "torch_dtype": "bfloat16",
-                                "use_cache": True,
-                                "vocab_size": 262208,
-                            },
-                            "torch_dtype": "bfloat16",
-                            "transformers_version": "4.51.3",
-                            "unsloth_fixed": True,
-                            "vision_config": {
-                                "attention_dropout": 0.0,
-                                "hidden_act": "gelu_pytorch_tanh",
-                                "hidden_size": 1152,
-                                "image_size": 896,
-                                "intermediate_size": 4304,
-                                "layer_norm_eps": 1e-06,
-                                "model_type": "siglip_vision_model",
-                                "num_attention_heads": 16,
-                                "num_channels": 3,
-                                "num_hidden_layers": 27,
-                                "patch_size": 14,
-                                "torch_dtype": "bfloat16",
-                                "vision_use_head": False,
-                            },
-                        }
-                    )
-                )
-            te_state_dict = load_file(self.model_config.te_name_or_path)
-            te_state_dict = convert_comfy_gemma3_to_transformers(te_state_dict)
-            for key in te_state_dict:
-                te_state_dict[key] = te_state_dict[key].to(dtype)
-            text_encoder.load_state_dict(te_state_dict, assign=True, strict=True)
-            del te_state_dict
-            flush()
-        elif self.model_config.te_name_or_path is not None:
-            tokenizer = GemmaTokenizerFast.from_pretrained(self.model_config.te_name_or_path)
-            text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
-                self.model_config.te_name_or_path, dtype=dtype
+        if model_id is None:
+            raise ValueError(
+                f"Cannot use gemma_api_key: neither the model checkpoint "
+                f"('{primary_path}') nor the fallback source ({fallback_path!r}) "
+                f"contain '{LTXV_MODEL_ID_KEY}' metadata required by the API. "
+                "Released LTX-2.5 checkpoints do not carry this metadata -- point "
+                "model_kwargs.gemma_api_model_id_source (or the "
+                "GEMMA_API_MODEL_ID_SOURCE setting) at a local LTX-2.3 checkpoint "
+                "such as ltx-2.3-22b-dev.safetensors, which does."
             )
-        elif self.ltx_te_path is not None:
-            tokenizer = GemmaTokenizerFast.from_pretrained(self.ltx_te_path)
-            text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
-                self.ltx_te_path, dtype=dtype
-            )
-        else:
-            tokenizer = GemmaTokenizerFast.from_pretrained(
-                model_path, subfolder="tokenizer"
-            )
-            text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
-                model_path, subfolder="text_encoder", dtype=dtype
-            )
-
-        text_encoder.model.vision_tower = None
-        flush()
-
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing Text Encoder")
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
-            freeze(text_encoder)
-            flush()
-
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_text_encoder_percent > 0
-        ):
-            MemoryManager.attach(
-                text_encoder,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
-                ignore_modules=[
-                    text_encoder.model.language_model.base_model.embed_tokens
-                ],
-            )
-
-        text_encoder.to(self.device_torch, dtype=dtype)
-        text_encoder.requires_grad_(False)
-        text_encoder.eval()
-        flush()
-
-        self.pipeline.text_encoder = text_encoder
-        self.text_encoder = [text_encoder]
-        self.print_and_status_update("Text encoder reloaded")
+        self._gemma_model_id = model_id
+        self.print_and_status_update(
+            f"Gemma API model id resolved from {os.path.basename(source_used)}"
+        )
 
     def load_model(self):
         dtype = self.torch_dtype
@@ -419,16 +394,8 @@ class LTX2Model(BaseModel):
         use_gemma_api = self.model_config.gemma_api_key is not None
 
         # Extract model_id from checkpoint metadata early so API calls work after load
-        if use_gemma_api and model_path.endswith(".safetensors") and os.path.exists(model_path):
-            with safe_open(model_path, framework="pt", device="cpu") as f:
-                metadata = f.metadata()
-                if metadata and LTXV_MODEL_ID_KEY in metadata:
-                    self._gemma_model_id = metadata[LTXV_MODEL_ID_KEY]
-                else:
-                    raise ValueError(
-                        f"Cannot use gemma_api_key: checkpoint '{model_path}' does not contain "
-                        f"'{LTXV_MODEL_ID_KEY}' metadata required by the API."
-                    )
+        if use_gemma_api:
+            self._extract_gemma_model_id(model_path)
 
         combined_state_dict = None
 
@@ -675,24 +642,16 @@ class LTX2Model(BaseModel):
             del combined_state_dict
             flush()
         else:
-            vae = AutoencoderKLLTX2Video.from_pretrained(
-                base_model_path, subfolder="vae", torch_dtype=dtype
-            )
-            audio_vae = AutoencoderKLLTX2Audio.from_pretrained(
-                base_model_path, subfolder="audio_vae", torch_dtype=dtype
-            )
+            vae = AutoencoderKLLTX2Video.load_model(base_model_path, dtype=dtype)
+            audio_vae = AutoencoderKLLTX2Audio.load_model(base_model_path, dtype=dtype)
 
-            connectors = LTX2TextConnectors.from_pretrained(
-                base_model_path, subfolder="connectors", torch_dtype=dtype
-            )
+            connectors = LTX2TextConnectors.load_model(base_model_path, dtype=dtype)
 
             vocoder_cls = LTX2Vocoder
-            if self.ltx_version == "2.3":
+            if self.ltx_version in ("2.3", "2.5"):
                 vocoder_cls = LTX2VocoderWithBWE
 
-            vocoder = vocoder_cls.from_pretrained(
-                base_model_path, subfolder="vocoder", torch_dtype=dtype
-            )
+            vocoder = vocoder_cls.load_model(base_model_path, dtype=dtype)
 
         self.noise_scheduler = LTX2Model.get_train_scheduler()
 
@@ -719,16 +678,12 @@ class LTX2Model(BaseModel):
             pipe.transformer = pipe.transformer.to(self.device_torch)
 
         flush()
-
-        if pipe.text_encoder is not None:
-            text_encoder = [pipe.text_encoder]
-            tokenizer = [pipe.tokenizer]
+        # low_vram: the text encoder stays on cpu; get_prompt_embeds moves it
+        # to the gpu on demand
+        if not self.low_vram:
             text_encoder[0].to(self.device_torch)
-            text_encoder[0].requires_grad_(False)
-            text_encoder[0].eval()
-        else:
-            text_encoder = []
-            tokenizer = []
+        text_encoder[0].requires_grad_(False)
+        text_encoder[0].eval()
         flush()
 
         # save it to the model class
@@ -1236,7 +1191,7 @@ class LTX2Model(BaseModel):
         conditional_embeds = self.pad_embeds(conditional_embeds)
         unconditional_embeds = self.pad_embeds(unconditional_embeds)
 
-        if self.ltx_version == "2.3":
+        if self.ltx_version in ("2.3", "2.5"):
             extra["stg_scale"] = 1.0
             extra["modality_scale"] = 3.0
             extra["guidance_rescale"] = 0.7
@@ -1249,11 +1204,49 @@ class LTX2Model(BaseModel):
                 True  # they dont set this in some examples in diffusers, but I believe it should always be true for 2.3
             )
 
+        # Live preview: captures the pipeline's own x0 estimate each step (see
+        # _X0Capture) and reports it through the same sample_step_callback
+        # hook BaseModel.generate_images sets up for MiniMax-H3. Only two-pass
+        # upscale generation (below) is not covered.
+        _x0_capture = _X0Capture(pipeline)
+
         def _stop_callback(pipe, i, t, callback_kwargs):
             self.maybe_stop()
+            step_cb = getattr(self, "sample_step_callback", None)
+            if step_cb is not None:
+                x0 = _x0_capture.pop()
+                if x0 is not None:
+                    def _preview_latents(_x0=x0, _pipe=pipe):
+                        # Mirrors the pipeline's own real-decode path (lines
+                        # around its `self.vae.decode(...)` call): unpack the
+                        # packed [B,S,D] sequence back to [B,C,F,H,W], then
+                        # denormalize the same way vae.decode's caller does.
+                        # NOT independently verified against a live LTX run --
+                        # see the note in toolkit/sample_preview.py's LTX entry.
+                        lat_f = (gen_config.num_frames - 1) // _pipe.vae_temporal_compression_ratio + 1
+                        lat_h = gen_config.height // _pipe.vae_spatial_compression_ratio
+                        lat_w = gen_config.width // _pipe.vae_spatial_compression_ratio
+                        unpacked = type(_pipe)._unpack_latents(
+                            _x0, lat_f, lat_h, lat_w,
+                            _pipe.transformer_spatial_patch_size,
+                            _pipe.transformer_temporal_patch_size,
+                        )
+                        denorm = type(_pipe)._denormalize_latents(
+                            unpacked, _pipe.vae.latents_mean, _pipe.vae.latents_std,
+                            _pipe.vae.config.scaling_factor,
+                        )
+                        return denorm.permute(0, 2, 1, 3, 4)  # (B,C,F,H,W) -> (B,F,C,H,W)
+
+                    step_cb(i + 1, gen_config.num_inference_steps, _preview_latents)
+                else:
+                    step_cb(i + 1, gen_config.num_inference_steps)
             return callback_kwargs
 
-        use_two_pass = self._has_upscaler() and is_video and self.ltx_version == "2.3"
+        # 2.5's spatial upscaler is the same LatentUpsampler architecture as 2.3's
+        # (identical key set and shapes; its embedded config matches the one
+        # _get_upsampler_model builds), and 2.5 runs on the pinned conv VAE, so the
+        # 128-channel latent space the upsampler expects is the same one.
+        use_two_pass = self._has_upscaler() and is_video and self.ltx_version in ("2.3", "2.5")
         if use_two_pass:
             video, audio = self._generate_two_pass(
                 pipeline, gen_config, conditional_embeds, unconditional_embeds, generator, extra
@@ -1278,31 +1271,32 @@ class LTX2Model(BaseModel):
                 pipeline.connectors = _GemmaAPIConnectorPassthrough()
 
             try:
-                video, audio = pipeline(
-                    prompt_embeds=conditional_embeds.text_embeds.to(
-                        self.device_torch, dtype=self.torch_dtype
-                    ),
-                    prompt_attention_mask=conditional_embeds.attention_mask.to(
-                        self.device_torch
-                    ),
-                    negative_prompt_embeds=unconditional_embeds.text_embeds.to(
-                        self.device_torch, dtype=self.torch_dtype
-                    ),
-                    negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(
-                        self.device_torch
-                    ),
-                    height=gen_config.height,
-                    width=gen_config.width,
-                    num_inference_steps=gen_config.num_inference_steps,
-                    guidance_scale=gen_config.guidance_scale,
-                    latents=gen_config.latents,
-                    num_frames=gen_config.num_frames,
-                    generator=generator,
-                    return_dict=False,
-                    output_type="np" if is_video else "pil",
-                    callback_on_step_end=_stop_callback,
-                    **extra,
-                )
+                with _x0_capture:
+                    video, audio = pipeline(
+                        prompt_embeds=conditional_embeds.text_embeds.to(
+                            self.device_torch, dtype=self.torch_dtype
+                        ),
+                        prompt_attention_mask=conditional_embeds.attention_mask.to(
+                            self.device_torch
+                        ),
+                        negative_prompt_embeds=unconditional_embeds.text_embeds.to(
+                            self.device_torch, dtype=self.torch_dtype
+                        ),
+                        negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(
+                            self.device_torch
+                        ),
+                        height=gen_config.height,
+                        width=gen_config.width,
+                        num_inference_steps=gen_config.num_inference_steps,
+                        guidance_scale=gen_config.guidance_scale,
+                        latents=gen_config.latents,
+                        num_frames=gen_config.num_frames,
+                        generator=generator,
+                        return_dict=False,
+                        output_type="np" if is_video else "pil",
+                        callback_on_step_end=_stop_callback,
+                        **extra,
+                    )
             finally:
                 if getattr(self, '_distill_lora_ready', False):
                     try:
@@ -1429,6 +1423,7 @@ class LTX2Model(BaseModel):
         batch: "DataLoaderBatchDTO" = None,
         **kwargs,
     ):
+        audio_target = None
         with torch.no_grad():
             if self.model.device == torch.device("cpu"):
                 self.model.to(self.device_torch)
@@ -1509,7 +1504,17 @@ class LTX2Model(BaseModel):
                 patch_size_t=self.pipeline.transformer_temporal_patch_size,
             )
 
-            if batch.audio_latents is not None or batch.audio_tensor is not None:
+            # audio only trains for video batches from datasets that asked for
+            # it. Cached latents can carry audio after do_audio was turned off,
+            # and image (single frame) batches must never pick up a soundtrack.
+            do_audio = (
+                batch.dataset_config is not None
+                and batch.dataset_config.do_audio
+                and getattr(batch, "num_frames", 1) > 1
+            )
+            if do_audio and (
+                batch.audio_latents is not None or batch.audio_tensor is not None
+            ):
                 if batch.audio_latents is not None:
                     # we have audio latents cached
                     raw_audio_latents = batch.audio_latents.to(
@@ -1521,9 +1526,27 @@ class LTX2Model(BaseModel):
                     raw_audio_latents = self.encode_audio(batch.audio_data)
 
                 audio_num_frames = raw_audio_latents.shape[1]
-                # add the audio targets to the batch for loss calculation later
-                audio_noise = torch.randn_like(raw_audio_latents)
-                batch.audio_target = (audio_noise - raw_audio_latents).detach()
+                # the audio noise is drawn once per step and shared by every
+                # pass (prior, primary, cfg/guidance, preservation) so they all
+                # see the same soundtrack and every pass's target matches. It
+                # rides on the latents DTO.
+                audio_noise = (
+                    batch.latents.get("audio_noise")
+                    if isinstance(batch.latents, DTO)
+                    else None
+                )
+                if (
+                    audio_noise is not None
+                    and audio_noise.shape == raw_audio_latents.shape
+                ):
+                    audio_noise = audio_noise.to(
+                        raw_audio_latents.device, dtype=raw_audio_latents.dtype
+                    )
+                else:
+                    audio_noise = torch.randn_like(raw_audio_latents)
+                    if batch.latents is not None:
+                        batch.latents = DTO(batch.latents, audio_noise=audio_noise)
+                audio_target = (audio_noise - raw_audio_latents).detach()
                 audio_latents = self.add_noise(
                     raw_audio_latents,
                     audio_noise,
@@ -1577,7 +1600,7 @@ class LTX2Model(BaseModel):
                     connector_attention_mask,
                 ) = self.pipeline.connectors(
                     text_embeddings.text_embeds,
-                    text_embeddings.attention_mask.to(self.transformer.dtype),
+                    text_embeddings.attention_mask.to(self.torch_dtype),
                     padding_side=tokenizer_padding_side,
                 )
 
@@ -1597,11 +1620,11 @@ class LTX2Model(BaseModel):
         # use_cross_timestep - Whether to use the cross modality (audio is the cross modality of video, and vice versa) sigma when
         # calculating the cross attention modulation parameters. `True` is the newer (e.g. LTX-2.3) behavior;
         # `False` is the legacy LTX-2.0 behavior.
-        use_cross_timestep = self.ltx_version == "2.3"
+        use_cross_timestep = self.ltx_version in ("2.3", "2.5")
 
         noise_pred_video, noise_pred_audio = self.transformer(
             hidden_states=packed_latents,
-            audio_hidden_states=audio_latents.to(self.transformer.dtype),
+            audio_hidden_states=audio_latents.to(self.torch_dtype),
             encoder_hidden_states=connector_prompt_embeds,
             audio_encoder_hidden_states=connector_audio_prompt_embeds,
             timestep=video_timestep,
@@ -1624,10 +1647,6 @@ class LTX2Model(BaseModel):
             return_dict=False,
         )
 
-        # add audio latent to batch if we had audio
-        if batch.audio_target is not None:
-            batch.audio_pred = noise_pred_audio
-
         unpacked_output = self.pipeline._unpack_latents(
             latents=noise_pred_video,
             num_frames=latent_num_frames,
@@ -1637,6 +1656,13 @@ class LTX2Model(BaseModel):
             patch_size_t=self.pipeline.transformer_temporal_patch_size,
         )
 
+        if audio_target is not None:
+            # every pass's DTO carries its own audio stream and target
+            return DTO(
+                unpacked_output,
+                audio=noise_pred_audio,
+                audio_target=audio_target,
+            )
         return unpacked_output
 
     # Minimum seconds between consecutive API calls to stay within rate limits
@@ -1789,26 +1815,312 @@ class LTX2Model(BaseModel):
     def get_transformer_block_names(self) -> Optional[List[str]]:
         return ["transformer_blocks"]
 
+    lora_keys_use_comfy_prefix = True
+
     def convert_lora_weights_before_save(self, state_dict):
-        new_sd = {}
-        for key, value in state_dict.items():
-            new_key = key.replace("transformer.", "diffusion_model.")
-            new_sd[new_key] = value
-        new_sd = convert_lora_diffusers_to_original(new_sd, version=self.ltx_version)
-        return new_sd
+        state_dict = super().convert_lora_weights_before_save(state_dict)
+        return convert_lora_diffusers_to_original(state_dict, version=self.ltx_version)
 
     def convert_lora_weights_before_load(self, state_dict):
         state_dict = convert_lora_original_to_diffusers(
             state_dict, version=self.ltx_version
         )
-        new_sd = {}
-        for key, value in state_dict.items():
-            new_key = key.replace("diffusion_model.", "transformer.")
-            new_sd[new_key] = value
-        return new_sd
+        return super().convert_lora_weights_before_load(state_dict)
 
 
 class LTX23Model(LTX2Model):
     arch = "ltx2.3"
     ltx_version = "2.3"
     ltx_te_path = base_te_path
+
+
+# LTX-2.5 ships as ComfyUI-style split files (no diffusers folders, no mono
+# checkpoint). Files are used in place when present under MODELS_PATH and
+# downloaded to exactly these locations only when missing, so the models
+# folder stays shareable with a ComfyUI install. The int8 ConvRot files are
+# the defaults; bf16 variants stay selectable via model_kwargs overrides.
+COMFY_LTX25_REPO = "Lightricks/LTX-2.5"
+COMFY_LTX25_FILES = {
+    "dit": "diffusion_models/ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors",
+    "text_encoder": "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+    # the "-conv-" file is the classic conv VAE; the default 2.5 vae file is a
+    # new diffusion-decoder VAE that diffusers has no class for
+    "video_vae": "vae/ltx-2.5-video-vae-conv-bf16.safetensors",
+    # bundles the BWE vocoder alongside the audio VAE
+    "audio_vae": "vae/ltx-2.5-audio-vae-bf16.safetensors",
+}
+
+
+class LTX25Model(LTX2Model):
+    arch = "ltx2.5"
+    ltx_version = "2.5"
+    ltx_te_path = None
+
+    # ------------------------------------------------------------------
+    # ComfyUI-style file resolution (toolkit/models/v2/resolver.py)
+    # ------------------------------------------------------------------
+    def _resolve_comfy_file(self, component: str) -> str:
+        from toolkit.models.v2.resolver import (
+            repo_id_from_name_or_path,
+            resolve_comfy_file,
+        )
+
+        return resolve_comfy_file(
+            COMFY_LTX25_FILES[component],
+            repo_id=repo_id_from_name_or_path(
+                self.model_config.name_or_path, COMFY_LTX25_REPO
+            ),
+            override_path=self.model_config.model_kwargs.get(
+                f"{component}_path", None
+            ),
+            hf_token=HF_TOKEN,
+            status_fn=self.print_and_status_update,
+        )
+
+    def _resolve_named_file(self, path: str, component: str) -> str:
+        from toolkit.models.v2.resolver import resolve_named_file
+
+        return resolve_named_file(path, component=component, hf_token=HF_TOKEN)
+
+    def _resolve_dit_path(self) -> str:
+        name_or_path = self.model_config.name_or_path
+        if name_or_path and name_or_path.endswith(".safetensors"):
+            return self._resolve_named_file(name_or_path, "transformer")
+        return self._resolve_comfy_file("dit")
+
+    def _resolve_te_path(self) -> str:
+        te_name_or_path = self.model_config.te_name_or_path
+        if te_name_or_path is not None:
+            return self._resolve_named_file(te_name_or_path, "text encoder")
+        return self._resolve_comfy_file("text_encoder")
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+    def _load_quantized_module(self, module, state_dict, name: str) -> int:
+        """Attach pre-quantized (int8 ConvRot) linears onto the toolkit's
+        quantization backends and load the rest of the (meta-built) module
+        from the state dict. Works unchanged for bf16 checkpoints, where no
+        quant markers exist and everything strict-loads."""
+        from toolkit.util.comfy_quant_import import import_comfy_quantized_layers
+        from toolkit.models.v2._mixin import OstrisModelMixin
+
+        state_dict, num_quantized = import_comfy_quantized_layers(
+            module, state_dict, orig_dtype=self.torch_dtype
+        )
+        if num_quantized:
+            self.print_and_status_update(
+                f" - attached {num_quantized} pre-quantized ConvRot layers to {name}"
+            )
+        # whitelist for quantized weights + leftover-meta check
+        OstrisModelMixin._load_state_dict_with_quantized(module, state_dict)
+        return num_quantized
+
+    def _load_gemma4_text_encoder(self, te_path: str, te_state_dict: dict):
+        """Build the Gemma-4 12B text stack from the single comfy file. Only
+        the text decoder is loaded — the unified checkpoint's vision/audio
+        tower pieces and the connector projections are used elsewhere or
+        dropped, matching how the Gemma-3 vision tower was discarded."""
+        from safetensors import safe_open
+        from transformers import Gemma4TextConfig
+        from toolkit.models.v2.text_encoders.gemma3 import Gemma4TextEncoder
+
+        with safe_open(te_path, framework="pt") as f:
+            metadata = f.metadata() or {}
+        gemma_config = json.loads(metadata["gemma_config"])
+        text_config = {
+            k: v for k, v in gemma_config["text_config"].items() if k != "dtype"
+        }
+
+        with init_empty_weights():
+            text_encoder = Gemma4TextEncoder(Gemma4TextConfig(**text_config))
+
+        def strip_model_prefix(key: str) -> str:
+            return key[len("model.") :] if key.startswith("model.") else key
+
+        te_sd = {
+            strip_model_prefix(k): v
+            for k, v in te_state_dict.items()
+            if k.startswith("model.")
+        }
+        num_quantized = self._load_quantized_module(text_encoder, te_sd, "text encoder")
+        return text_encoder, num_quantized
+
+    def _load_gemma4_tokenizer(self, te_path: str, te_state_dict: dict):
+        """The comfy file embeds the tokenizer and its configs as uint8
+        tensors; extract them next to the file once and load from there."""
+        from transformers import AutoTokenizer
+
+        assets_dir = os.path.splitext(te_path)[0] + "_hf_assets"
+        assets = {
+            "tokenizer.json": "tokenizer_json",
+            "tokenizer_config.json": "hf_asset__tokenizer_config.json",
+            "chat_template.jinja": "hf_asset__chat_template.jinja",
+        }
+        os.makedirs(assets_dir, exist_ok=True)
+        for filename, tensor_key in assets.items():
+            out_path = os.path.join(assets_dir, filename)
+            blob = te_state_dict.get(tensor_key, None)
+            if blob is None or os.path.exists(out_path):
+                continue
+            with open(out_path, "wb") as f:
+                f.write(bytes(blob.cpu().numpy().tobytes()))
+        # the embedded tokenizer.json has an empty post-processor (ComfyUI
+        # prepends BOS in its own wrapper); restore the standard Gemma
+        # behavior so blank prompts still yield a token
+        return AutoTokenizer.from_pretrained(assets_dir, add_bos_token=True)
+
+    def load_model(self):
+        dtype = self.torch_dtype
+        self.print_and_status_update("Loading LTX-2.5 model")
+
+        # ---- transformer + embedding connectors (one comfy file) ----
+        dit_path = self._resolve_dit_path()
+
+        # Unlike LTX2Model.load_model, this does not call super().load_model(),
+        # so the base class's extraction never ran for 2.5 -- and the 2.5
+        # transformer itself has no model id to extract anyway (see
+        # _extract_gemma_model_id's docstring). Needs the fallback source.
+        if self.model_config.gemma_api_key is not None:
+            self._extract_gemma_model_id(dit_path)
+
+        te_path = self._resolve_te_path()
+        self.print_and_status_update(
+            f"Loading transformer from {os.path.basename(dit_path)}"
+        )
+        combined = load_file(dit_path)
+        dit_sd = get_model_state_dict_from_combined_ckpt(combined, dit_prefix)
+        del combined
+
+        # the per-modality text projections ride in the text encoder file but
+        # belong to the connectors module
+        te_state_dict = load_file(te_path)
+        for key in list(te_state_dict.keys()):
+            if key.startswith("text_embedding_projection."):
+                dit_sd[key] = te_state_dict.pop(key)
+
+        transformer, transformer_sd = convert_ltx2_transformer(
+            dit_sd, version=self.ltx_version, load=False
+        )
+        num_quantized_dit = self._load_quantized_module(
+            transformer, transformer_sd, "transformer"
+        )
+        del transformer_sd
+        # dit_sd still references every transformer tensor (assign=True sharing);
+        # drop them so each block frees as it quantizes. Connector keys stay for
+        # the convert_ltx2_connectors call below.
+        trans_sd, _ = split_transformer_and_connector_state_dict(dit_sd)
+        for key in trans_sd:
+            dit_sd.pop(key, None)
+        del trans_sd
+        if num_quantized_dit == 0:
+            transformer = transformer.to(dtype)
+        else:
+            # mixed-precision comfy file (fp32 scale_shift tables next to bf16
+            # weights): comfy-style per-op input casting, with the stored-fp32
+            # pieces pinned so parent .to(dtype) casts cannot downcast them
+            attach_per_op_casting(transformer)
+            pin_stored_fp32(transformer)
+        flush()
+
+        if num_quantized_dit:
+            # pre-quantized (ConvRot) comfy file; aitk_post_load skips quantize
+            transformer.aitk_is_quantized = True
+        # quantize + offload + placement, all driven by model_config
+        transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
+        flush()
+
+        self.print_and_status_update("Loading connectors")
+        connectors, connectors_sd = convert_ltx2_connectors(
+            dit_sd, version=self.ltx_version, load=False
+        )
+        num_quantized_connectors = self._load_quantized_module(
+            connectors, connectors_sd, "connectors"
+        )
+        del connectors_sd, dit_sd
+        if num_quantized_connectors == 0:
+            connectors = connectors.to(dtype)
+        else:
+            attach_per_op_casting(connectors)
+            pin_stored_fp32(connectors)
+        flush()
+
+        # ---- text encoder (Gemma-4 12B, single comfy file) ----
+        self.print_and_status_update("Loading text encoder")
+        tokenizer = self._load_gemma4_tokenizer(te_path, te_state_dict)
+        text_encoder, num_quantized_te = self._load_gemma4_text_encoder(
+            te_path, te_state_dict
+        )
+        del te_state_dict
+        flush()
+
+        if num_quantized_te:
+            # pre-quantized (ConvRot) comfy file; aitk_post_load skips quantize
+            text_encoder.aitk_is_quantized = True
+        # quantize + offload + placement, all driven by model_config
+        text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
+
+        text_encoder.to(self.device_torch)
+        text_encoder.requires_grad_(False)
+        text_encoder.eval()
+        flush()
+
+        # ---- VAEs + vocoder ----
+        self.print_and_status_update("Loading VAEs and other components")
+        video_vae_path = self._resolve_comfy_file("video_vae")
+        vae = convert_ltx2_video_vae(
+            load_file(video_vae_path), version=self.ltx_version
+        ).to(dtype)
+        flush()
+
+        audio_vae_path = self._resolve_comfy_file("audio_vae")
+        audio_combined = load_file(audio_vae_path)
+        audio_sd = get_model_state_dict_from_combined_ckpt(
+            audio_combined, audio_vae_prefix
+        )
+        audio_vae = convert_ltx2_audio_vae(audio_sd, version=self.ltx_version).to(dtype)
+        vocoder_sd = get_model_state_dict_from_combined_ckpt(
+            audio_combined, vocoder_prefix
+        )
+        vocoder = convert_ltx2_vocoder(vocoder_sd, version=self.ltx_version).to(dtype)
+        del audio_combined, audio_sd, vocoder_sd
+        flush()
+
+        self.noise_scheduler = LTX2Model.get_train_scheduler()
+
+        self.print_and_status_update("Making pipe")
+        pipe: LTX2Pipeline = LTX2Pipeline(
+            scheduler=self.noise_scheduler,
+            vae=vae,
+            audio_vae=audio_vae,
+            text_encoder=None,
+            tokenizer=tokenizer,
+            connectors=connectors,
+            transformer=None,
+            vocoder=vocoder,
+        )
+        pipe.text_encoder = text_encoder
+        pipe.transformer = transformer
+
+        self.print_and_status_update("Preparing Model")
+        text_encoder = [pipe.text_encoder]
+        tokenizer = [pipe.tokenizer]
+
+        if not self.low_vram:
+            pipe.transformer = pipe.transformer.to(self.device_torch)
+        flush()
+
+        self.vae = ComboVae(pipe.vae, pipe.audio_vae)
+        self.text_encoder = text_encoder  # list of text encoders
+        self.tokenizer = tokenizer  # list of tokenizers
+        self.model = pipe.transformer
+        self.pipeline = pipe
+
+        self.audio_processor = AudioProcessor(
+            sample_rate=pipe.audio_sampling_rate,
+            mel_bins=audio_vae.config.mel_bins,
+            mel_hop_length=pipe.audio_hop_length,
+            n_fft=1024,  # todo get this from vae if we can, I couldnt find it.
+        ).to(self.device_torch, dtype=torch.float32)
+
+        self.print_and_status_update("Model Loaded")

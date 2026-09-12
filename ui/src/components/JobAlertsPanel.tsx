@@ -6,7 +6,7 @@ import { clearJobAlerts } from '@/utils/jobs';
 export interface JobAlert {
   timestamp: string;
   step: number;
-  type: 'loss_spike' | 'white_noise_samples' | string;
+  type: 'loss_spike' | 'loss_stalled' | 'white_noise_samples' | string;
   message: string;
   data?: Record<string, unknown>;
 }
@@ -20,11 +20,13 @@ interface JobAlertsPanelProps {
 
 const ALERT_ICONS: Record<string, string> = {
   loss_spike: '📈',
+  loss_stalled: '🚩',
   white_noise_samples: '🌫️',
 };
 
 const ALERT_LABELS: Record<string, string> = {
   loss_spike: 'Loss Spike',
+  loss_stalled: 'Loss Stalled',
   white_noise_samples: 'White Noise Samples',
 };
 

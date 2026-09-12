@@ -24,9 +24,16 @@ export default function useJobsList({
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const isFetchingRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Bumped by refreshJobs(). Anything started under an older generation is
+  // stale: its payload predates the local mutation that triggered the refresh
+  // (e.g. a queue reorder), so applying it would revert the optimistic order.
+  const generationRef = useRef(0);
 
-  const fetchJobs = () => {
-    if (isFetchingRef.current) return Promise.resolve();
+  const fetchJobs = (force = false) => {
+    // `force` is for manual refreshes, which must not be swallowed just because
+    // a background poll happens to be mid-flight
+    if (isFetchingRef.current && !force) return Promise.resolve();
+    const gen = generationRef.current;
     isFetchingRef.current = true;
     setStatus('loading');
     const params: Record<string, string> = {};
@@ -40,6 +47,8 @@ export default function useJobsList({
       .get('/api/jobs', { params })
       .then(res => res.data)
       .then(data => {
+        // a manual refresh superseded this request while it was in flight
+        if (gen !== generationRef.current) return;
         console.log('Jobs:', data);
         if (data.error) {
           console.log('Error fetching jobs:', data.error);
@@ -63,8 +72,13 @@ export default function useJobsList({
   const scheduleNext = (delay: number) => {
     if (timerRef.current) clearTimeout(timerRef.current);
     if (!reloadInterval) return;
+    const gen = generationRef.current;
     timerRef.current = setTimeout(async () => {
       await fetchJobs();
+      // A manual refresh has taken over the schedule since this poll was
+      // queued. Re-arming here would clear its fast follow-up and put the
+      // full reloadInterval back, which is what made reorders take 5s.
+      if (gen !== generationRef.current) return;
       scheduleNext(reloadInterval);
     }, delay);
   };
@@ -78,9 +92,13 @@ export default function useJobsList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // manual refresh (e.g. after reordering the queue) also fast-tracks the next poll
+  // Manual refresh (e.g. right after reordering the queue). Invalidates any
+  // in-flight poll so a pre-mutation payload can't land, fetches immediately
+  // rather than waiting out the cadence, then fast-tracks one follow-up in case
+  // the write hadn't committed server-side yet.
   const refreshJobs = () => {
-    fetchJobs();
+    generationRef.current += 1;
+    fetchJobs(true);
     scheduleNext(FAST_FOLLOWUP_INTERVAL);
   };
 

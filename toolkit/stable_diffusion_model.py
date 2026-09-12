@@ -1,5 +1,6 @@
 import copy
 import gc
+import inspect
 import json
 import random
 import shutil
@@ -38,11 +39,12 @@ from toolkit.sampler import get_sampler
 from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscreteScheduler
 from toolkit.saving import save_ldm_model_from_diffusers, get_ldm_state_dict_from_diffusers
 from toolkit.sd_device_states_presets import empty_preset
+from toolkit.ui_utils import SampleSkippedException
 from toolkit.train_tools import get_torch_dtype, apply_noise_offset
 from einops import rearrange, repeat
 import torch
 from toolkit.pipelines import CustomStableDiffusionXLPipeline, CustomStableDiffusionPipeline, \
-    StableDiffusionKDiffusionXLPipeline, StableDiffusionXLRefinerPipeline, FluxWithCFGPipeline, \
+    StableDiffusionXLRefinerPipeline, FluxWithCFGPipeline, \
     FluxAdvancedControlPipeline
 from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, T2IAdapter, DDPMScheduler, \
     StableDiffusionXLAdapterPipeline, StableDiffusionAdapterPipeline, DiffusionPipeline, PixArtTransformer2DModel, \
@@ -99,6 +101,46 @@ DO_NOT_TRAIN_WEIGHTS = [
 ]
 
 DeviceStatePreset = Literal['cache_latents', 'generate']
+
+
+# diffusers-class name -> v2 wrapper for the legacy archs' components. The
+# adoption is an in-place class swap, so pipeline-held references stay valid.
+_V2_ADOPTION_MAP = {
+    "UNet2DConditionModel": ("toolkit.models.v2.diffusion_models.unet", "UNet2DConditionModel"),
+    "AutoencoderKL": ("toolkit.models.v2.vae.autoencoder_kl", "KLVAE"),
+    "CLIPTextModel": ("toolkit.models.v2.text_encoders.clip", "CLIPTextEncoder"),
+    "CLIPTextModelWithProjection": ("toolkit.models.v2.text_encoders.clip", "CLIPTextEncoderWithProjection"),
+    "T5EncoderModel": ("toolkit.models.v2.text_encoders.t5", "T5TextEncoder"),
+    "UMT5EncoderModel": ("toolkit.models.v2.text_encoders.umt5", "UMT5TextEncoder"),
+    "SD3Transformer2DModel": ("toolkit.models.v2.diffusion_models.sd3", "SD3Transformer2DModel"),
+    "PixArtTransformer2DModel": ("toolkit.models.v2.diffusion_models.pixart", "PixArtTransformer2DModel"),
+    "Transformer2DModel": ("toolkit.models.v2.diffusion_models.pixart", "Transformer2DModel"),
+    "AuraFlowTransformer2DModel": ("toolkit.models.v2.diffusion_models.auraflow", "AuraFlowTransformer2DModel"),
+    "FluxTransformer2DModel": ("toolkit.models.v2.diffusion_models.flux", "FluxTransformer2DModel"),
+    "Lumina2Transformer2DModel": ("toolkit.models.v2.diffusion_models.lumina2", "Lumina2Transformer2DModel"),
+    "Gemma2Model": ("toolkit.models.v2.text_encoders.gemma2", "Gemma2ModelEncoder"),
+}
+
+
+def _adopt_v2(module):
+    """Rebind a loaded legacy component onto its v2 wrapper class so every
+    resident component is an OstrisModelMixin instance the inference engine
+    can pool and hot-swap. No-op for unknown or already-adopted classes."""
+    import importlib
+
+    from toolkit.models.v2._mixin import OstrisModelMixin, adopt_component
+
+    if module is None or isinstance(module, OstrisModelMixin):
+        return module
+    entry = _V2_ADOPTION_MAP.get(type(module).__name__)
+    if entry is None:
+        return module
+    try:
+        wrapper = getattr(importlib.import_module(entry[0]), entry[1])
+        return adopt_component(module, wrapper)
+    except (ImportError, TypeError):
+        return module
+
 
 
 class BlankNetwork:
@@ -203,6 +245,9 @@ class StableDiffusion:
         self._after_sample_img_hooks = []
         self._status_update_hooks = []
         self._maybe_stop_hooks = []
+        # skip: abandon only the image currently rendering, not the whole batch
+        # -- see add_maybe_skip_hook / maybe_skip_sample below
+        self._maybe_skip_hooks = []
         # todo update this based on the model
         self.is_transformer = False
         
@@ -216,6 +261,15 @@ class StableDiffusion:
         
         # set true for models that encode control image into text embeddings
         self.encode_control_in_text_embeddings = False
+        # control files may be VIDEOS (paths exposed on the batch as
+        # control_video_paths_list); see minimax_h3 ref2va
+        self.supports_video_control_images = False
+        # D-OPSD: cache per-item teacher text embeds (item's own media as reference 1)
+        self.dopsd_self_ref = False
+        # weight of the normal-target loss added alongside the D-OPSD teacher loss
+        self.dopsd_bleed_strength = 1.0
+        # forces cache_tensors_to_disk on latent-caching datasets (BaseSDTrainProcess)
+        self.require_pixel_tensor_cache = False
         # control images will come in as a list for encoding some things if true
         self.has_multiple_control_images = False
         # do not resize control images
@@ -235,6 +289,9 @@ class StableDiffusion:
         
         # if a mask is passed, do the loss with the mask. May be set false for models that use a mask for other reasons.
         self.do_masked_loss = True
+        
+        # if the model outputs an x0 prediction (clean latent)
+        self.x0_pred = False
         
     # properties for old arch for backwards compatibility
     @property
@@ -302,7 +359,20 @@ class StableDiffusion:
         if self.is_flux or self.is_v3:
             divisibility = divisibility * 2
         return divisibility * 2 # todo remove this
-        
+
+    def get_frame_count_snapper(self):
+        """Optional hook for video models whose VAE accepts frame counts on a
+        grid other than the default ``temporal_compression * n + 1``. Return a
+        MODULE-LEVEL function ``(num_frames) -> int`` (picklable — file items
+        travel into dataloader workers) that snaps a frame count DOWN to a
+        valid count, or None for the default auto_frame_count math."""
+        return None
+
+    def prepare_sample_prompt_context(self, gen_config):
+        """Optional hook called right before a sample prompt is encoded, with
+        the sample's GenerateImageConfig, for models whose control conditioning
+        in the text embeds depends on sample settings."""
+        return None
 
     def load_model(self):
         if self.is_loaded:
@@ -1038,6 +1108,16 @@ class StableDiffusion:
         self.unet.requires_grad_(False)
         self.unet.eval()
 
+        # every resident component joins the v2 mixin system (in-place class
+        # adoption for components the pipeline loaders built directly)
+        _adopt_v2(self.unet)
+        _adopt_v2(self.vae)
+        if isinstance(text_encoder, list):
+            for te in text_encoder:
+                _adopt_v2(te)
+        elif text_encoder is not None:
+            _adopt_v2(text_encoder)
+
         # load any loras we have
         if self.model_config.lora_path is not None and not self.is_flux and not self.is_lumina2:
             pipe.load_lora_weights(self.model_config.lora_path, adapter_name="lora1")
@@ -1152,6 +1232,17 @@ class StableDiffusion:
         for hook in self._maybe_stop_hooks:
             hook()
 
+    def add_maybe_skip_hook(self, func):
+        self._maybe_skip_hooks.append(func)
+
+    def maybe_skip_sample(self):
+        """Mirrors BaseModel.maybe_skip_sample for the legacy (sd/sdxl) model
+        class. A hook raises SampleSkippedException to abandon the image
+        currently rendering; generate_images catches it and moves on to the
+        next prompt."""
+        for hook in self._maybe_skip_hooks:
+            hook()
+
     @torch.no_grad()
     def generate_images(
             self,
@@ -1229,10 +1320,7 @@ class StableDiffusion:
                 except:
                     pass
 
-            if sampler.startswith("sample_") and self.is_xl:
-                # using kdiffusion
-                Pipe = StableDiffusionKDiffusionXLPipeline
-            elif self.is_xl:
+            if self.is_xl:
                 Pipe = StableDiffusionXLPipeline
             elif self.is_v3:
                 Pipe = StableDiffusion3Pipeline
@@ -1365,9 +1453,6 @@ class StableDiffusion:
             # disable progress bar
             pipeline.set_progress_bar_config(disable=True)
 
-            if sampler.startswith("sample_"):
-                pipeline.set_scheduler(sampler)
-
         refiner_pipeline = None
         if self.refiner_unet:
             # build refiner pipeline
@@ -1400,6 +1485,12 @@ class StableDiffusion:
 
                 for i in tqdm(range(len(image_configs)), desc=f"Generating Images", leave=False):
                     self.maybe_stop()
+                    try:
+                        # a skip requested while the previous image was saving
+                        # lands here, before we start work on this one
+                        self.maybe_skip_sample()
+                    except SampleSkippedException:
+                        continue
                     gen_config = image_configs[i]
 
                     extra = {}
@@ -1577,24 +1668,39 @@ class StableDiffusion:
                                 **gen_config.extra_kwargs,
                             }
 
-                        img = pipeline(
-                            # prompt=gen_config.prompt,
-                            # prompt_2=gen_config.prompt_2,
-                            prompt_embeds=conditional_embeds.text_embeds,
-                            pooled_prompt_embeds=conditional_embeds.pooled_embeds,
-                            negative_prompt_embeds=unconditional_embeds.text_embeds,
-                            negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
-                            # negative_prompt=gen_config.negative_prompt,
-                            # negative_prompt_2=gen_config.negative_prompt_2,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            guidance_rescale=grs,
-                            latents=gen_config.latents,
-                            generator=generator,
-                            **extra
-                        ).images[0]
+                        # checked every denoise step so a skip lands within one
+                        # step of being clicked, not after this image finishes
+                        def _skip_callback(pipe, step, t, callback_kwargs):
+                            self.maybe_skip_sample()
+                            return {}
+
+                        # some samplers swap in a pipeline that has no
+                        # step callback; fall back to the per-image check
+                        if 'callback_on_step_end' in inspect.signature(pipeline.__call__).parameters:
+                            extra['callback_on_step_end'] = _skip_callback
+
+                        try:
+                            img = pipeline(
+                                # prompt=gen_config.prompt,
+                                # prompt_2=gen_config.prompt_2,
+                                prompt_embeds=conditional_embeds.text_embeds,
+                                pooled_prompt_embeds=conditional_embeds.pooled_embeds,
+                                negative_prompt_embeds=unconditional_embeds.text_embeds,
+                                negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
+                                # negative_prompt=gen_config.negative_prompt,
+                                # negative_prompt_2=gen_config.negative_prompt_2,
+                                height=gen_config.height,
+                                width=gen_config.width,
+                                num_inference_steps=gen_config.num_inference_steps,
+                                guidance_scale=gen_config.guidance_scale,
+                                guidance_rescale=grs,
+                                latents=gen_config.latents,
+                                generator=generator,
+                                **extra
+                            ).images[0]
+                        except SampleSkippedException:
+                            flush()
+                            continue
                     elif self.is_v3:
                         img = pipeline(
                             prompt_embeds=conditional_embeds.text_embeds,
@@ -1705,19 +1811,32 @@ class StableDiffusion:
                             **extra
                         ).images[0]
                     else:
-                        img = pipeline(
-                            # prompt=gen_config.prompt,
-                            prompt_embeds=conditional_embeds.text_embeds,
-                            negative_prompt_embeds=unconditional_embeds.text_embeds,
-                            # negative_prompt=gen_config.negative_prompt,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            latents=gen_config.latents,
-                            generator=generator,
-                            **extra
-                        ).images[0]
+                        # checked every denoise step so a skip lands within one
+                        # step of being clicked, not after this image finishes
+                        def _skip_callback(pipe, step, t, callback_kwargs):
+                            self.maybe_skip_sample()
+                            return {}
+
+                        if 'callback_on_step_end' in inspect.signature(pipeline.__call__).parameters:
+                            extra['callback_on_step_end'] = _skip_callback
+
+                        try:
+                            img = pipeline(
+                                # prompt=gen_config.prompt,
+                                prompt_embeds=conditional_embeds.text_embeds,
+                                negative_prompt_embeds=unconditional_embeds.text_embeds,
+                                # negative_prompt=gen_config.negative_prompt,
+                                height=gen_config.height,
+                                width=gen_config.width,
+                                num_inference_steps=gen_config.num_inference_steps,
+                                guidance_scale=gen_config.guidance_scale,
+                                latents=gen_config.latents,
+                                generator=generator,
+                                **extra
+                            ).images[0]
+                        except SampleSkippedException:
+                            flush()
+                            continue
 
                     if self.refiner_unet is not None and gen_config.refiner_start_at < 1.0:
                         # slide off just the last 1280 on the last dim as refiner does not use first text encoder
@@ -1745,7 +1864,7 @@ class StableDiffusion:
                             generator=generator,
                         ).images[0]
 
-                    gen_config.save_image(img, i)
+                    gen_config.save_image_atomic(img, i)
                     gen_config.log_image(img, i)
                     self._after_sample_image(i, len(image_configs))
                     flush()

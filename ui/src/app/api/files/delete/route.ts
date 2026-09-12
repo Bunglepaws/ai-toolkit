@@ -49,11 +49,12 @@ export async function POST(request: NextRequest) {
     await fs.promises.unlink(resolvedFilePath);
 
     // If deleting a step's .safetensors checkpoint, also remove the matching
-    // optimizer archive: optimizer_{step:09d}.pt (not same-basename — a separate
+    // optimizer archive: optimizer_{step:05d}.pt (not same-basename — a separate
     // naming pattern). Handles WAN 2.2's _high_noise/_low_noise suffix too.
+    // \d{5,} covers both the current 5-digit padding and legacy 9-digit files.
     const stepMatch = path
       .basename(resolvedFilePath)
-      .match(/_(\d{9})(?:_(?:high|low)_noise)?\.safetensors$/);
+      .match(/_(\d{5,})(?:_(?:high|low)_noise)?\.safetensors$/);
     if (stepMatch) {
       const optimizerArchive = path.join(path.dirname(resolvedFilePath), `optimizer_${stepMatch[1]}.pt`);
       try {
