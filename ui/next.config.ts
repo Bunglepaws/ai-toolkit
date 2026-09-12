@@ -10,7 +10,16 @@ const nextConfig: NextConfig = {
   env: {
     NEXT_PUBLIC_APP_VERSION: appVersion,
   },
-  serverExternalPackages: ['macstats', 'osx-temperature-sensor'],
+  // systeminformation optionally requires a macOS-only native addon
+  // (osx-temperature-sensor on Intel, macos-temperature-sensor on Apple
+  // Silicon). We leave those uninstalled on Linux/Windows; Next must not
+  // bundle the require or the build fails with "Can't resolve".
+  serverExternalPackages: [
+    'macstats',
+    'systeminformation',
+    'osx-temperature-sensor',
+    'macos-temperature-sensor',
+  ],
   async rewrites() {
     return [
       {
@@ -21,7 +30,12 @@ const nextConfig: NextConfig = {
   },
   webpack: (config, { isServer }) => {
     if (isServer) {
-      config.externals.push('osx-temperature-sensor', 'macstats');
+      config.externals.push(
+        'osx-temperature-sensor',
+        'macos-temperature-sensor',
+        'macstats',
+        'systeminformation',
+      );
     }
     return config;
   },
